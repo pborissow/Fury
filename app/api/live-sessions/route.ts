@@ -169,7 +169,7 @@ async function getUnixLiveSessions() {
       if (seen.has(dir)) continue;
       seen.add(dir);
 
-      const slug = dir.replace(/[/]/g, '-').replace(/^-/, '');
+      const slug = dir.replace(/[:\\/]/g, '-');
       const slugDir = join(projectsDir, slug);
 
       try {
