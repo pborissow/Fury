@@ -1,0 +1,29 @@
+# dependencies
+node_modules/
+
+# next.js
+.next/
+next-env.d.ts
+
+# env files
+.env
+.env.local
+.env*.local
+
+# debug logs
+npm-debug.log*
+
+# runtime data (persisted sessions, workflows, prompts, ui state)
+.claude-chat-sessions/
+.claude-workflows/
+.claude-prompts/
+.claude-ui-state/
+
+# claude code
+.claude/
+
+# misc
+nul
+*.zip
+.DS_Store
+*.tsbuildinfo
