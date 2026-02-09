@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { projectPathToSlug } from '@/lib/utils';
 
 export const runtime = 'nodejs';
 
@@ -12,27 +13,59 @@ interface TranscriptMessage {
 }
 
 /**
- * Convert an absolute project path to the slug used in ~/.claude/projects/
- * e.g. /Users/peter/myproject -> -Users-peter-myproject
- */
-function projectPathToSlug(projectPath: string): string {
-  // Replace colons, forward slashes, and backslashes with hyphens
-  // e.g. U:\petya\Documents -> U--petya-Documents (matches Claude's slug format)
-  // e.g. /Users/peter/myproject -> -Users-peter-myproject
-  return projectPath.replace(/[:\\/]/g, '-');
-}
-
-/**
- * Check if a user message content string is internal/meta and should be skipped
+ * Check if a user message content string is internal/meta and should be skipped.
+ * This covers XML system tags and Claude CLI slash commands.
  */
 function isInternalContent(content: string): boolean {
   const trimmed = content.trim();
-  return (
+  if (trimmed === '') return true;
+  if (
     trimmed.startsWith('<command-name>') ||
     trimmed.startsWith('<local-command') ||
-    trimmed.startsWith('<system-reminder>') ||
-    trimmed === ''
-  );
+    trimmed.startsWith('<system-reminder>')
+  ) return true;
+  // Skip Claude CLI slash commands
+  if (/^\/[a-z]/.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * When no JSONL transcript exists (pre-persistence sessions), extract
+ * whatever user prompts were saved in history.jsonl for this session.
+ */
+async function getHistoryPrompts(sessionId: string): Promise<TranscriptMessage[]> {
+  try {
+    const historyPath = join(homedir(), '.claude', 'history.jsonl');
+    const content = await fs.readFile(historyPath, 'utf-8');
+    const lines = content.trim().split('\n');
+    const messages: TranscriptMessage[] = [];
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.sessionId !== sessionId) continue;
+        if (!entry.display || !entry.display.trim()) continue;
+        // Skip slash commands and bare "exit"
+        const trimmed = entry.display.trim();
+        if (/^\/[a-z]/i.test(trimmed)) continue;
+        if (trimmed.toLowerCase() === 'exit') continue;
+
+        messages.push({
+          role: 'user',
+          content: entry.display,
+          timestamp: typeof entry.timestamp === 'number'
+            ? new Date(entry.timestamp).toISOString()
+            : entry.timestamp,
+        });
+      } catch {
+        // Skip unparseable lines
+      }
+    }
+
+    return messages;
+  } catch {
+    return [];
+  }
 }
 
 export async function GET(request: NextRequest) {
@@ -59,10 +92,12 @@ export async function GET(request: NextRequest) {
       content = await fs.readFile(jsonlPath, 'utf-8');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return NextResponse.json(
-          { error: 'Transcript not found', messages: [] },
-          { status: 404 }
-        );
+        // No JSONL transcript file — fall back to user prompts from history.jsonl
+        const historyMessages = await getHistoryPrompts(sanitizedSessionId);
+        return NextResponse.json({
+          messages: historyMessages,
+          partial: true,
+        });
       }
       throw error;
     }

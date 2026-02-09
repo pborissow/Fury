@@ -3,6 +3,20 @@ import { sessionManager } from '@/lib/sessionManager';
 
 export const runtime = 'nodejs';
 
+/**
+ * POST /api/claude
+ *
+ * Sends a message to a Claude CLI session and streams the response via SSE.
+ * This route handles the real-time conversation flow — spawning a `claude --print`
+ * process, piping the prompt via stdin, and streaming JSON events back to the client.
+ *
+ * Session lifecycle management (delete, etc.) lives in /api/session instead,
+ * since it involves filesystem operations (removing JSONL files, updating
+ * history.jsonl) that are unrelated to the streaming conversation flow.
+ *
+ * Body: { prompt: string, sessionId: string, projectPath?: string }
+ * Response: SSE stream of `data: { text?, error?, tool_use?, tool_result? }` events
+ */
 export async function POST(req: NextRequest) {
   try {
     const { prompt, sessionId, projectPath } = await req.json();

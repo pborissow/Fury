@@ -34,7 +34,7 @@ import DrawflowCanvas from '@/components/DrawflowCanvas';
 import WorkflowsPanel from '@/components/WorkflowsPanel';
 import NodeChatModal from '@/components/NodeChatModal';
 import AskUserQuestionDialog from '@/components/AskUserQuestionDialog';
-import { Plus, AlertTriangle, Sun, Moon, FolderTree, FileText, Activity } from 'lucide-react';
+import { Plus, AlertTriangle, Sun, Moon, FolderTree, FileText, Activity, Trash2 } from 'lucide-react';
 import { getRecentDirectories } from '@/lib/recent-directories';
 
 // Client-side only timestamp component to avoid hydration mismatch
@@ -165,8 +165,35 @@ export default function Home() {
   // specific position in the transcript (not at the end). null = append at end (live sends).
   const [overlayInsertPoint, setOverlayInsertPoint] = useState<number | null>(null);
 
+  // True when the transcript was reconstructed from history.jsonl (user prompts only, no responses)
+  const [transcriptPartial, setTranscriptPartial] = useState(false);
+
   // AskUserQuestion dialog state
   const [askUserQuestion, setAskUserQuestion] = useState<AskUserQuestionState | null>(null);
+
+  // Context menu state
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    sessionId: string;
+    project: string;
+    display: string;
+    isLive: boolean;
+  } | null>(null);
+
+  // Delete confirmation state
+  const [deleteConfirm, setDeleteConfirm] = useState<{
+    sessionId: string;
+    project: string;
+    display: string;
+    isLive: boolean;
+  } | null>(null);
+
+  // Error dialog state
+  const [errorDialog, setErrorDialog] = useState<{
+    title: string;
+    message: string;
+  } | null>(null);
 
   const scrollTranscriptToBottom = () => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -272,12 +299,14 @@ export default function Home() {
     setOverlayInsertPoint(null);
     setTranscriptStreaming('');
     setTranscriptLoading(false);
+    setTranscriptPartial(false);
     try {
       const res = await fetch(`/api/transcript?sessionId=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(project)}`);
       let transcriptMessages: { role: 'user' | 'assistant'; content: string; timestamp: string }[] = [];
       if (res.ok) {
         const data = await res.json();
         transcriptMessages = data.messages || [];
+        setTranscriptPartial(!!data.partial);
       }
       setHistoryTranscript(transcriptMessages);
     } catch (error) {
@@ -473,6 +502,7 @@ export default function Home() {
     setOverlayInsertPoint(null);
     setTranscriptStreaming('');
     setTranscriptLoading(false);
+    setTranscriptPartial(false);
   };
 
   const handleKillStuckSession = async () => {
@@ -698,6 +728,54 @@ export default function Home() {
     setAskUserQuestion(null);
   };
 
+  // Close context menu on click-outside or Escape
+  useEffect(() => {
+    if (!contextMenu) return;
+    const handleClick = () => setContextMenu(null);
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setContextMenu(null);
+    };
+    window.addEventListener('click', handleClick);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('click', handleClick);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [contextMenu]);
+
+  const handleDeleteSession = async (sessionId: string, project: string) => {
+    setDeleteConfirm(null);
+    try {
+      const res = await fetch(
+        `/api/session?sessionId=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(project)}`,
+        { method: 'DELETE' }
+      );
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setErrorDialog({
+          title: 'Failed to delete session',
+          message: data.error || `Server returned ${res.status}`,
+        });
+        return;
+      }
+      // If we're currently viewing this session, close it
+      if (viewingTranscriptId === sessionId) {
+        setViewingTranscriptId(null);
+        setHistoryTranscript([]);
+        setTranscriptOverlayMessages([]);
+        setTranscriptStreaming('');
+        setTranscriptLoading(false);
+      }
+      // Refresh history list
+      fetchHistory();
+    } catch (error) {
+      setErrorDialog({
+        title: 'Failed to delete session',
+        message: error instanceof Error ? error.message : 'An unexpected error occurred',
+      });
+    }
+  };
+
   return (
     <div className="h-screen w-screen bg-background flex flex-col">
       {/* Toolbar */}
@@ -814,6 +892,17 @@ export default function Home() {
                             : 'bg-muted border-border hover:border-ring'
                         } ${isClickable ? 'cursor-pointer' : ''}`}
                         onClick={isClickable ? () => fetchTranscript(entry.sessionId!, entry.project, entry.display) : undefined}
+                        onContextMenu={entry.sessionId ? (e) => {
+                          e.preventDefault();
+                          setContextMenu({
+                            x: e.clientX,
+                            y: e.clientY,
+                            sessionId: entry.sessionId!,
+                            project: entry.project,
+                            display: entry.display,
+                            isLive,
+                          });
+                        } : undefined}
                       >
                         <div className="flex justify-between items-start mb-1">
                           <HistoryTimestamp timestamp={entry.timestamp} />
@@ -916,11 +1005,28 @@ export default function Home() {
                         </div>
                       </div>
                     ) : historyTranscript.length === 0 && transcriptOverlayMessages.length === 0 ? (
-                      <div className="text-center text-muted-foreground mt-8">
-                        No messages found for this session
+                      <div className="text-center text-muted-foreground mt-8 space-y-2">
+                        {history.some(h => h.sessionId === viewingTranscriptId) ? (
+                          <>
+                            <p>Transcript unavailable for this session.</p>
+                            <p className="text-xs">The session data may have been created before Claude CLI began persisting transcripts, or the files were removed.</p>
+                          </>
+                        ) : (
+                          <p>Send a message to start the conversation.</p>
+                        )}
                       </div>
                     ) : (
                       <>
+                        {/* Partial transcript warning */}
+                        {transcriptPartial && (
+                          <div className="rounded-md border border-yellow-600/50 bg-yellow-950/30 px-4 py-3 text-sm text-yellow-200 mb-4">
+                            <p className="font-medium">Partial transcript</p>
+                            <p className="text-xs text-yellow-300/70 mt-1">
+                              Only your prompts are available for this session. Full conversation transcripts were not persisted by Claude CLI at the time this session was created.
+                            </p>
+                          </div>
+                        )}
+
                         {/* Transcript turns with intermediary grouping, overlay merged at correct position */}
                         {(() => {
                           type TranscriptMsg = { role: 'user' | 'assistant'; content: string; timestamp: string };
@@ -1368,6 +1474,77 @@ export default function Home() {
           onSkip={handleAskUserQuestionSkip}
         />
       )}
+
+      {/* Session Context Menu */}
+      {contextMenu && (
+        <div
+          className="fixed z-50 min-w-[160px] bg-popover border border-border rounded-md shadow-md py-1"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <button
+            className="w-full px-3 py-2 text-sm text-left flex items-center gap-2 hover:bg-muted text-destructive"
+            onClick={() => {
+              setDeleteConfirm({
+                sessionId: contextMenu.sessionId,
+                project: contextMenu.project,
+                display: contextMenu.display,
+                isLive: contextMenu.isLive,
+              });
+              setContextMenu(null);
+            }}
+          >
+            <Trash2 className="h-4 w-4" />
+            Delete Session
+          </button>
+        </div>
+      )}
+
+      {/* Delete Session Confirmation */}
+      <AlertDialog open={!!deleteConfirm} onOpenChange={(open) => { if (!open) setDeleteConfirm(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete session?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleteConfirm?.isLive && (
+                <>
+                  <span className="text-yellow-500 font-semibold">This session is currently live.</span> The running process will be terminated.
+                  <br /><br />
+                </>
+              )}
+              This will permanently delete the session transcript and remove it from history. This action cannot be undone.
+              <br /><br />
+              <span className="text-muted-foreground text-xs font-mono break-all">{deleteConfirm?.display}</span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() => {
+                if (deleteConfirm) {
+                  handleDeleteSession(deleteConfirm.sessionId, deleteConfirm.project);
+                }
+              }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Error Dialog */}
+      <AlertDialog open={!!errorDialog} onOpenChange={(open) => { if (!open) setErrorDialog(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{errorDialog?.title}</AlertDialogTitle>
+            <AlertDialogDescription>{errorDialog?.message}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogAction onClick={() => setErrorDialog(null)}>OK</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

@@ -4,6 +4,7 @@ import { promisify } from 'util';
 import { readFile, readdir, stat } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
+import { projectPathToSlug } from '@/lib/utils';
 
 const execAsync = promisify(exec);
 
@@ -86,7 +87,7 @@ async function getWindowsLiveSessions() {
 
     for (const { project } of projectsFromHistory) {
       // Convert project path to slug
-      const slug = project.replace(/[:\\/]/g, '-');
+      const slug = projectPathToSlug(project);
       const slugDir = join(projectsDir, slug);
 
       // Find the most recently modified JSONL in this project
@@ -170,7 +171,7 @@ async function getUnixLiveSessions() {
     }
 
     for (const [dir, count] of Object.entries(processCounts)) {
-      const slug = dir.replace(/[:\\/]/g, '-');
+      const slug = projectPathToSlug(dir);
       const slugDir = join(projectsDir, slug);
 
       try {

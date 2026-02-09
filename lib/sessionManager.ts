@@ -3,6 +3,7 @@ import { existsSync } from 'fs';
 import { appendFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
+import { projectPathToSlug } from './utils';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -14,13 +15,6 @@ interface QueuedMessage {
   resolve: (value: void | PromiseLike<void>) => void;
   reject: (error: Error) => void;
   controller: ReadableStreamDefaultController;
-}
-
-/**
- * Convert a project path to the slug format used in ~/.claude/projects/
- */
-function projectPathToSlug(projectPath: string): string {
-  return projectPath.replace(/[:\\/]/g, '-');
 }
 
 /**

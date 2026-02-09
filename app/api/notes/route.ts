@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
+import { projectPathToSlug } from '@/lib/utils';
 
 const NOTES_DIR = path.join(os.homedir(), '.claude-session-notes');
 
@@ -12,11 +13,6 @@ async function ensureNotesDirectory() {
   } catch (error) {
     console.error('Failed to create notes directory:', error);
   }
-}
-
-function projectPathToSlug(projectPath: string): string {
-  // Replace path separators and colons with hyphens (matches Claude's slug format)
-  return projectPath.replace(/[:\\/]/g, '-');
 }
 
 function getNotesPath(projectPath: string): string {
