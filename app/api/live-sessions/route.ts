@@ -161,36 +161,37 @@ async function getUnixLiveSessions() {
       }
     }
 
-    // Step 3: For each project directory, find the most recently modified JSONL
+    // Step 3: Count processes per project directory, then find the N most
+    // recently modified JSONLs per project (where N = process count).
     const projectsDir = join(homedir(), '.claude', 'projects');
-    const seen = new Set<string>();
-
+    const processCounts: Record<string, number> = {};
     for (const dir of projectDirs) {
-      if (seen.has(dir)) continue;
-      seen.add(dir);
+      processCounts[dir] = (processCounts[dir] || 0) + 1;
+    }
 
+    for (const [dir, count] of Object.entries(processCounts)) {
       const slug = dir.replace(/[:\\/]/g, '-');
       const slugDir = join(projectsDir, slug);
 
       try {
         const files = await readdir(slugDir);
-        let bestSession: { sessionId: string; mtime: number } | null = null;
+        const sessions: { sessionId: string; mtime: number }[] = [];
 
         for (const file of files) {
           if (!file.endsWith('.jsonl')) continue;
           try {
             const fileStat = await stat(join(slugDir, file));
-            if (!bestSession || fileStat.mtimeMs > bestSession.mtime) {
-              bestSession = {
-                sessionId: file.replace('.jsonl', ''),
-                mtime: fileStat.mtimeMs,
-              };
-            }
+            sessions.push({
+              sessionId: file.replace('.jsonl', ''),
+              mtime: fileStat.mtimeMs,
+            });
           } catch { /* skip */ }
         }
 
-        if (bestSession) {
-          liveSessionIds.push(bestSession.sessionId);
+        // Take the N most recently modified sessions
+        sessions.sort((a, b) => b.mtime - a.mtime);
+        for (let i = 0; i < Math.min(count, sessions.length); i++) {
+          liveSessionIds.push(sessions[i].sessionId);
         }
       } catch { /* skip unreadable dirs */ }
     }
