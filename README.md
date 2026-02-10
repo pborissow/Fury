@@ -95,6 +95,20 @@ components/
 | Session notes | `~/.claude-session-notes/*.md` (user home) |
 | Theme | `localStorage` (browser) |
 
+## Session Lifecycle
+
+Fury does **not** maintain long-running Claude processes. Sessions are stateless on the server between messages:
+
+1. **Creating a session** — Purely a frontend operation. A UUID is generated and stored in React state. No Claude process is spawned, no server-side state is created. The session only materialises on disk when the first message is sent.
+
+2. **Sending a message** — A `claude --print --session-id <uuid>` process is spawned (or `--resume <uuid>` for subsequent messages). It handles **one prompt**, streams the response back via SSE, writes to the JSONL transcript file, and exits. There is no persistent process per session.
+
+3. **Switching sessions** — Purely a frontend operation. The UI swaps which transcript is displayed by loading the target session's JSONL from disk. No processes are spawned or terminated. If a Claude process is mid-response when you switch away, it continues running to completion in the background — its SSE handler simply stops updating the display, and the data is persisted to JSONL for when you return.
+
+4. **Conversation continuity** — Managed entirely by the Claude CLI via `--resume <uuid>`. On each message, the CLI re-reads the session's JSONL file to reconstruct conversation context. Fury itself does not track conversation history.
+
+5. **Parallel sessions** — Multiple sessions can process messages concurrently. Each spawns its own short-lived Claude process with a distinct session UUID. The `activeSessionRef` mechanism ensures only the currently-viewed session's SSE handler updates the display, preventing cross-session contamination.
+
 ## Getting Started
 
 ### Prerequisites

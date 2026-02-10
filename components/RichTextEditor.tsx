@@ -23,6 +23,7 @@ interface RichTextEditorProps {
 
 export interface RichTextEditorHandle {
   setContent: (content: string) => void;
+  getContent: () => string;
 }
 
 const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(function RichTextEditor({
@@ -42,10 +43,15 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
   const [isSupported, setIsSupported] = useState(true);
   const recognitionRef = useRef<any>(null);
   const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const pendingContentRef = useRef<string | null>(null);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
 
   // Debounced onChange handler using useCallback for stable reference
   const debouncedOnChange = useCallback((content: string) => {
     if (!onChange) return;
+
+    pendingContentRef.current = content;
 
     // Clear existing timeout
     if (debounceTimeoutRef.current) {
@@ -54,6 +60,7 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
 
     // Set new timeout
     debounceTimeoutRef.current = setTimeout(() => {
+      pendingContentRef.current = null;
       onChange(content);
     }, debounceMs);
   }, [onChange, debounceMs]);
@@ -76,8 +83,8 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
         class: 'max-w-none focus:outline-none min-h-[80px] p-3 text-foreground',
       },
       handleKeyDown: (view, event) => {
-        // Submit on Enter, new line on Shift+Enter
-        if (event.key === 'Enter' && !event.shiftKey) {
+        // Submit on Enter, new line on Shift+Enter (chat prompt only)
+        if (showButtonBar && event.key === 'Enter' && !event.shiftKey) {
           event.preventDefault();
           handleSubmit();
           return true;
@@ -88,8 +95,9 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
     editable: !disabled,
     onUpdate: ({ editor }) => {
       // Call debounced onChange callback if provided
+      // Use getHTML() to preserve formatting (line breaks, bold, etc.)
       if (onChange) {
-        const content = editor.getText();
+        const content = editor.getHTML();
         debouncedOnChange(content);
       }
     },
@@ -101,6 +109,9 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
         editor.commands.setContent(content);
         editor.commands.focus('end');
       }
+    },
+    getContent: () => {
+      return editor?.getText() || '';
     },
   }), [editor]);
 
@@ -193,11 +204,14 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
     }
   }, [editor, disabled]);
 
-  // Cleanup debounce timeout on unmount
+  // Flush any pending debounced save on unmount (e.g. when switching sessions)
   useEffect(() => {
     return () => {
       if (debounceTimeoutRef.current) {
         clearTimeout(debounceTimeoutRef.current);
+      }
+      if (pendingContentRef.current !== null && onChangeRef.current) {
+        onChangeRef.current(pendingContentRef.current);
       }
     };
   }, []);

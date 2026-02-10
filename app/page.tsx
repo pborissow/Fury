@@ -166,8 +166,10 @@ export default function Home() {
   const [transcriptStreaming, setTranscriptStreaming] = useState('');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
   const transcriptAbortRef = useRef<AbortController | null>(null);
+  const activeSessionRef = useRef<string | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const chatEditorRef = useRef<RichTextEditorHandle>(null);
+  const sessionDraftsRef = useRef<Map<string, string>>(new Map());
 
   // When overlay messages are restored from a previous session, they belong at a
   // specific position in the transcript (not at the end). null = append at end (live sends).
@@ -312,6 +314,12 @@ export default function Home() {
     }
   }, [theme]);
 
+  // Track the currently-viewed session so in-flight SSE handlers can detect
+  // when the user has switched away and skip state updates accordingly.
+  useEffect(() => {
+    activeSessionRef.current = viewingTranscriptId;
+  }, [viewingTranscriptId]);
+
   // Auto-scroll transcript viewer during streaming
   useEffect(() => {
     if (transcriptStreaming) {
@@ -335,6 +343,16 @@ export default function Home() {
   };
 
   const fetchTranscript = async (sessionId: string, project: string, displayTitle: string) => {
+    // Save current editor draft before switching
+    if (viewingTranscriptId && chatEditorRef.current) {
+      const draft = chatEditorRef.current.getContent().trim();
+      if (draft) {
+        sessionDraftsRef.current.set(viewingTranscriptId, draft);
+      } else {
+        sessionDraftsRef.current.delete(viewingTranscriptId);
+      }
+    }
+
     setHistoryTranscriptLoading(true);
     setHistoryTranscript([]);
     setHistoryTranscriptTitle(displayTitle);
@@ -343,8 +361,13 @@ export default function Home() {
     setTranscriptOverlayMessages([]);
     setOverlayInsertPoint(null);
     setTranscriptStreaming('');
+    setStreamEvents([]);
     setTranscriptLoading(false);
     setTranscriptPartial(false);
+
+    // Restore draft for the target session (or clear)
+    const savedDraft = sessionDraftsRef.current.get(sessionId) || '';
+    setTimeout(() => chatEditorRef.current?.setContent(savedDraft), 50);
     try {
       const res = await fetch(`/api/transcript?sessionId=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(project)}`);
       let transcriptMessages: { role: 'user' | 'assistant'; content: string; timestamp: string }[] = [];
@@ -537,6 +560,16 @@ export default function Home() {
   };
 
   const handleDirectorySelected = (path: string) => {
+    // Save current editor draft before switching
+    if (viewingTranscriptId && chatEditorRef.current) {
+      const draft = chatEditorRef.current.getContent().trim();
+      if (draft) {
+        sessionDraftsRef.current.set(viewingTranscriptId, draft);
+      } else {
+        sessionDraftsRef.current.delete(viewingTranscriptId);
+      }
+    }
+
     const newId = generateUUID();
     // Go directly to transcript view for a new empty session
     setViewingTranscriptId(newId);
@@ -546,8 +579,12 @@ export default function Home() {
     setTranscriptOverlayMessages([]);
     setOverlayInsertPoint(null);
     setTranscriptStreaming('');
+    setStreamEvents([]);
     setTranscriptLoading(false);
     setTranscriptPartial(false);
+
+    // New session starts with an empty editor
+    setTimeout(() => chatEditorRef.current?.setContent(''), 50);
   };
 
   const handleKillStuckSession = async () => {
@@ -626,6 +663,28 @@ export default function Home() {
   const handleTranscriptSend = async (userMessage: string) => {
     if (!userMessage || transcriptLoading || !viewingTranscriptId) return;
 
+    // Capture the session this handler belongs to. If the user switches sessions
+    // while we're streaming, we skip state updates so we don't contaminate the
+    // new session's display. The data still lands in JSONL via the CLI.
+    const mySessionId = viewingTranscriptId;
+    const myProject = historyTranscriptProject;
+    const isStillActive = () => activeSessionRef.current === mySessionId;
+
+    // Clear the draft for this session since the message is being sent
+    sessionDraftsRef.current.delete(mySessionId);
+
+    // If this session isn't in the history sidebar yet, add it optimistically
+    // so it stays visible even if the user switches to another session.
+    if (!history.some(h => h.sessionId === mySessionId)) {
+      setHistory(prev => [{
+        display: userMessage.length > 200 ? userMessage.substring(0, 200) + '...' : userMessage,
+        timestamp: Date.now(),
+        project: myProject || '',
+        sessionId: mySessionId,
+        messageCount: 1,
+      }, ...prev]);
+    }
+
     // Add user message to overlay immediately for instant feedback
     setTranscriptOverlayMessages(prev => [...prev, { role: 'user' as const, content: userMessage }]);
     setTimeout(() => scrollTranscriptToBottom(), 50);
@@ -647,8 +706,8 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt: userMessage,
-          sessionId: viewingTranscriptId,
-          projectPath: historyTranscriptProject,
+          sessionId: mySessionId,
+          projectPath: myProject,
         }),
         signal: abortController.signal,
       });
@@ -675,32 +734,39 @@ export default function Home() {
               const data = JSON.parse(line.slice(6));
               if (data.text) {
                 accumulatedText += data.text;
-                setTranscriptStreaming(accumulatedText);
-                setStreamEvents(prev => {
-                  const last = prev[prev.length - 1];
-                  if (last && last.type === 'text') {
-                    return [...prev.slice(0, -1), { ...last, content: last.content + data.text }];
-                  }
-                  return [...prev, { type: 'text', content: data.text, ts: Date.now() }];
-                });
+                if (isStillActive()) {
+                  setTranscriptStreaming(accumulatedText);
+                  setStreamEvents(prev => {
+                    const last = prev[prev.length - 1];
+                    if (last && last.type === 'text') {
+                      return [...prev.slice(0, -1), { ...last, content: last.content + data.text }];
+                    }
+                    return [...prev, { type: 'text', content: data.text, ts: Date.now() }];
+                  });
+                }
               } else if (data.error) {
                 accumulatedText = `Error: ${data.error}`;
-                setTranscriptStreaming(accumulatedText);
-                setStreamEvents(prev => [...prev, { type: 'error', content: data.error, ts: Date.now() }]);
+                if (isStillActive()) {
+                  setTranscriptStreaming(accumulatedText);
+                  setStreamEvents(prev => [...prev, { type: 'error', content: data.error, ts: Date.now() }]);
+                }
               } else if (data.tool_use) {
                 const tool = data.tool_use;
-                if (tool.status === 'starting') {
-                  setStreamEvents(prev => [...prev, { type: 'tool_start', name: tool.name, ts: Date.now() }]);
-                } else if (tool.status === 'complete') {
-                  setStreamEvents(prev => [...prev, { type: 'tool_complete', name: tool.name, input: tool.input, ts: Date.now() }]);
-
-                  // Capture AskUserQuestion for interactive prompt dialog
-                  if (tool.name === 'AskUserQuestion' && tool.input?.questions) {
-                    pendingAskUserQuestion = tool.input as AskUserQuestionState['input'];
+                if (isStillActive()) {
+                  if (tool.status === 'starting') {
+                    setStreamEvents(prev => [...prev, { type: 'tool_start', name: tool.name, ts: Date.now() }]);
+                  } else if (tool.status === 'complete') {
+                    setStreamEvents(prev => [...prev, { type: 'tool_complete', name: tool.name, input: tool.input, ts: Date.now() }]);
                   }
                 }
+                // Capture AskUserQuestion regardless of active state
+                if (tool.status === 'complete' && tool.name === 'AskUserQuestion' && tool.input?.questions) {
+                  pendingAskUserQuestion = tool.input as AskUserQuestionState['input'];
+                }
               } else if (data.tool_result) {
-                setStreamEvents(prev => [...prev, { type: 'tool_result', preview: data.tool_result.preview, ts: Date.now() }]);
+                if (isStillActive()) {
+                  setStreamEvents(prev => [...prev, { type: 'tool_result', preview: data.tool_result.preview, ts: Date.now() }]);
+                }
               }
             } catch (e) {
               // skip unparseable
@@ -708,6 +774,10 @@ export default function Home() {
           }
         }
       }
+
+      // If user switched away, skip all post-completion state updates.
+      // The data is in JSONL — fetchTranscript will pick it up when they switch back.
+      if (!isStillActive()) return;
 
       // If AskUserQuestion was detected, save text and open the dialog
       if (pendingAskUserQuestion) {
@@ -727,11 +797,11 @@ export default function Home() {
         // This clears overlay messages since they're now in the JSONL.
         try {
           const refreshRes = await fetch(
-            `/api/transcript?sessionId=${encodeURIComponent(viewingTranscriptId)}&project=${encodeURIComponent(historyTranscriptProject || '')}`
+            `/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject || '')}`
           );
           if (refreshRes.ok) {
             const refreshData = await refreshRes.json();
-            if (refreshData.messages && refreshData.messages.length > 0) {
+            if (refreshData.messages && refreshData.messages.length > 0 && isStillActive()) {
               setHistoryTranscript(refreshData.messages);
               setTranscriptOverlayMessages([]);
               setOverlayInsertPoint(null);
@@ -742,15 +812,22 @@ export default function Home() {
         }
       }
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        setTranscriptOverlayMessages(prev => [...prev, { role: 'assistant' as const, content: '_Processing stopped by user._' }]);
-      } else {
-        const errorMessage = `Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
-        setTranscriptOverlayMessages(prev => [...prev, { role: 'assistant' as const, content: errorMessage }]);
+      if (isStillActive()) {
+        if (error instanceof Error && error.name === 'AbortError') {
+          setTranscriptOverlayMessages(prev => [...prev, { role: 'assistant' as const, content: '_Processing stopped by user._' }]);
+        } else {
+          const errorMessage = `Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
+          setTranscriptOverlayMessages(prev => [...prev, { role: 'assistant' as const, content: errorMessage }]);
+        }
       }
     } finally {
-      setTranscriptLoading(false);
-      transcriptAbortRef.current = null;
+      if (isStillActive()) {
+        setTranscriptLoading(false);
+      }
+      // Only clear the abort ref if it's still ours (not overwritten by a new session)
+      if (transcriptAbortRef.current === abortController) {
+        transcriptAbortRef.current = null;
+      }
     }
   };
 

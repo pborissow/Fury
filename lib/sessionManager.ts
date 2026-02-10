@@ -221,6 +221,24 @@ class SessionManager {
         claude.stdin.write(prompt);
         claude.stdin.end();
 
+        // Write history entry immediately so the session appears in the sidebar
+        // right away, not after the process completes.
+        try {
+          const historyEntry = JSON.stringify({
+            display: prompt.length > 200 ? prompt.substring(0, 200) + '...' : prompt,
+            pastedContents: {},
+            timestamp: Date.now(),
+            project: cwd,
+            sessionId: session.sessionId,
+          });
+          const historyPath = join(homedir(), '.claude', 'history.jsonl');
+          appendFile(historyPath, historyEntry + '\n', 'utf-8').catch(error => {
+            console.error('[SessionManager] Failed to append to history.jsonl:', error);
+          });
+        } catch (error) {
+          console.error('[SessionManager] Failed to build history entry:', error);
+        }
+
         session.currentProcess = claude;
         console.log(`[SessionManager] Claude CLI process spawned with PID: ${claude.pid}`);
 
@@ -332,23 +350,6 @@ class SessionManager {
             safeEnqueue(chunk);
             reject(new Error(`Claude CLI exited with code ${code}`));
           } else {
-            // Append an entry to history.jsonl so the session appears in Fury's session list.
-            // (--print mode doesn't write to history.jsonl by itself)
-            if (assistantResponse.trim()) {
-              try {
-                const historyEntry = JSON.stringify({
-                  display: prompt.length > 200 ? prompt.substring(0, 200) + '...' : prompt,
-                  pastedContents: {},
-                  timestamp: Date.now(),
-                  project: cwd,
-                  sessionId: session.sessionId,
-                });
-                const historyPath = join(homedir(), '.claude', 'history.jsonl');
-                await appendFile(historyPath, historyEntry + '\n', 'utf-8');
-              } catch (error) {
-                console.error('[SessionManager] Failed to append to history.jsonl:', error);
-              }
-            }
             resolve();
           }
           safeClose();
