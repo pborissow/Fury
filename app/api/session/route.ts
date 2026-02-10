@@ -5,6 +5,21 @@ import { join } from 'path';
 import { sessionManager } from '@/lib/sessionManager';
 import { projectPathToSlug } from '@/lib/utils';
 
+/**
+ * Check if a user message content string is internal/meta and should be skipped.
+ */
+function isInternalContent(content: string): boolean {
+  const trimmed = content.trim();
+  if (!trimmed) return true;
+  if (
+    trimmed.startsWith('<command-name>') ||
+    trimmed.startsWith('<local-command') ||
+    trimmed.startsWith('<system-reminder>')
+  ) return true;
+  if (/^\/[a-z]/.test(trimmed)) return true;
+  return false;
+}
+
 export const runtime = 'nodejs';
 
 /**
@@ -76,4 +91,101 @@ export async function DELETE(request: NextRequest) {
   }
 
   return NextResponse.json({ success: true, results });
+}
+
+/**
+ * PATCH /api/session - Rewind a session to before a given user turn index.
+ * Truncates the JSONL file, keeping only entries before the Nth user message turn.
+ */
+export async function PATCH(request: NextRequest) {
+  try {
+    const { sessionId, project, turnIndex, removeLastHistoryEntry } = await request.json();
+
+    if (!sessionId || !project || turnIndex == null) {
+      return NextResponse.json(
+        { error: 'sessionId, project, and turnIndex are required' },
+        { status: 400 }
+      );
+    }
+
+    const sanitizedSessionId = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
+    const slug = projectPathToSlug(project);
+    const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sanitizedSessionId}.jsonl`);
+
+    const content = await readFile(jsonlPath, 'utf-8');
+    const lines = content.split('\n').filter(line => line.trim());
+
+    // Count visible user turns and find the JSONL line where the target turn starts
+    let userTurnCount = 0;
+    let cutLineIndex = lines.length;
+
+    for (let i = 0; i < lines.length; i++) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry.type !== 'user' || entry.isMeta) continue;
+
+        const msg = entry.message;
+        if (!msg || typeof msg.content !== 'string') continue;
+        if (isInternalContent(msg.content)) continue;
+
+        if (userTurnCount === turnIndex) {
+          cutLineIndex = i;
+          break;
+        }
+        userTurnCount++;
+      } catch {
+        // Skip unparseable lines
+      }
+    }
+
+    if (cutLineIndex >= lines.length) {
+      return NextResponse.json(
+        { error: 'Turn index not found' },
+        { status: 400 }
+      );
+    }
+
+    const truncatedLines = lines.slice(0, cutLineIndex);
+    await writeFile(jsonlPath, truncatedLines.join('\n') + '\n', 'utf-8');
+
+    console.log(`[Session/Rewind] Truncated session ${sanitizedSessionId} at turn ${turnIndex} (removed ${lines.length - cutLineIndex} lines)`);
+
+    // Optionally remove the most recent history.jsonl entry for this session
+    // (used when "Conversation + Code" rewind sends an undo prompt that pollutes history)
+    if (removeLastHistoryEntry) {
+      const historyPath = join(homedir(), '.claude', 'history.jsonl');
+      try {
+        const histContent = await readFile(historyPath, 'utf-8');
+        const histLines = histContent.trim().split('\n');
+        // Find the last line matching this sessionId and remove it
+        let lastMatchIdx = -1;
+        for (let i = histLines.length - 1; i >= 0; i--) {
+          try {
+            const entry = JSON.parse(histLines[i]);
+            if (entry.sessionId === sessionId) {
+              lastMatchIdx = i;
+              break;
+            }
+          } catch { /* skip */ }
+        }
+        if (lastMatchIdx >= 0) {
+          histLines.splice(lastMatchIdx, 1);
+          await writeFile(historyPath, histLines.join('\n') + '\n', 'utf-8');
+          console.log(`[Session/Rewind] Removed latest history entry for session ${sanitizedSessionId}`);
+        }
+      } catch (err: any) {
+        if (err.code !== 'ENOENT') {
+          console.error('[Session/Rewind] Failed to clean up history:', err);
+        }
+      }
+    }
+
+    return NextResponse.json({ success: true, linesRemoved: lines.length - cutLineIndex });
+  } catch (error) {
+    console.error('[Session/Rewind] Error:', error);
+    return NextResponse.json(
+      { error: 'Failed to rewind session' },
+      { status: 500 }
+    );
+  }
 }

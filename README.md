@@ -34,7 +34,7 @@ A prototype IDE for AI-assisted development built with Next.js and Claude Code. 
 
 ## Tech Stack
 
-- **Framework**: Next.js 15.5 (App Router, Turbopack)
+- **Framework**: Next.js 16 (App Router, Turbopack)
 - **Language**: TypeScript
 - **Styling**: Tailwind CSS 4, shadcn/ui components (Radix UI primitives)
 - **Editor**: TipTap (rich text input + notes)
@@ -105,7 +105,7 @@ components/
 ### Install & Run
 
 ```bash
-cd claude-code-ui
+cd Fury
 npm install
 npm run dev
 ```

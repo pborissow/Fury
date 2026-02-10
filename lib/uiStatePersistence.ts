@@ -4,6 +4,9 @@ import path from 'path';
 interface UIState {
   activeTab: 'chat' | 'canvas';
   activeWorkflowId: string | null;
+  chatHorizontalLayout: number[] | null;
+  chatVerticalLayout: number[] | null;
+  canvasHorizontalLayout: number[] | null;
   lastUpdated: number;
 }
 
@@ -59,6 +62,9 @@ class UIStatePersistence {
       const newState: UIState = {
         activeTab: state.activeTab ?? existingState?.activeTab ?? 'chat',
         activeWorkflowId: state.activeWorkflowId ?? existingState?.activeWorkflowId ?? null,
+        chatHorizontalLayout: state.chatHorizontalLayout ?? existingState?.chatHorizontalLayout ?? null,
+        chatVerticalLayout: state.chatVerticalLayout ?? existingState?.chatVerticalLayout ?? null,
+        canvasHorizontalLayout: state.canvasHorizontalLayout ?? existingState?.canvasHorizontalLayout ?? null,
         lastUpdated: Date.now(),
       };
 

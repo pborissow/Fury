@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { useEffect, useState, useRef, useCallback, useImperativeHandle, forwardRef } from 'react';
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import CodeBlock from '@tiptap/extension-code-block';
@@ -21,7 +21,11 @@ interface RichTextEditorProps {
   debounceMs?: number; // Debounce delay for onChange callback (default: 300ms)
 }
 
-export default function RichTextEditor({
+export interface RichTextEditorHandle {
+  setContent: (content: string) => void;
+}
+
+const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(function RichTextEditor({
   onSubmit,
   placeholder = '',
   disabled = false,
@@ -33,7 +37,7 @@ export default function RichTextEditor({
   persistContent = false,
   showButtonBar = true,
   debounceMs = 300,
-}: RichTextEditorProps) {
+}, ref) {
   const [isRecording, setIsRecording] = useState(false);
   const [isSupported, setIsSupported] = useState(true);
   const recognitionRef = useRef<any>(null);
@@ -90,6 +94,15 @@ export default function RichTextEditor({
       }
     },
   });
+
+  useImperativeHandle(ref, () => ({
+    setContent: (content: string) => {
+      if (editor) {
+        editor.commands.setContent(content);
+        editor.commands.focus('end');
+      }
+    },
+  }), [editor]);
 
   // Initialize speech recognition
   useEffect(() => {
@@ -312,4 +325,6 @@ export default function RichTextEditor({
       )}
     </div>
   );
-}
+});
+
+export default RichTextEditor;

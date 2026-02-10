@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -27,14 +27,14 @@ import {
   TooltipProvider,
 } from '@/components/ui/tooltip';
 import { Button } from '@/components/ui/button';
-import RichTextEditor from '@/components/RichTextEditor';
+import RichTextEditor, { type RichTextEditorHandle } from '@/components/RichTextEditor';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
 import FileTree from '@/components/FileTree';
 import DrawflowCanvas from '@/components/DrawflowCanvas';
 import WorkflowsPanel from '@/components/WorkflowsPanel';
 import NodeChatModal from '@/components/NodeChatModal';
 import AskUserQuestionDialog from '@/components/AskUserQuestionDialog';
-import { Plus, AlertTriangle, Sun, Moon, FolderTree, FileText, Activity, Trash2 } from 'lucide-react';
+import { Plus, AlertTriangle, Sun, Moon, FolderTree, FileText, Activity, Trash2, RotateCcw } from 'lucide-react';
 import { getRecentDirectories } from '@/lib/recent-directories';
 
 // Client-side only timestamp component to avoid hydration mismatch
@@ -143,6 +143,13 @@ export default function Home() {
   const importFlowDataRef = useRef<((data: any, id?: string) => void) | null>(null);
   const updateNodeDataRef = useRef<((nodeId: string, chatSession: any) => void) | null>(null);
 
+  // Panel layout state
+  const [chatHorizontalLayout, setChatHorizontalLayout] = useState<number[]>([20, 45, 35]);
+  const [chatVerticalLayout, setChatVerticalLayout] = useState<number[]>([70, 30]);
+  const [canvasHorizontalLayout, setCanvasHorizontalLayout] = useState<number[]>([20, 80]);
+  const [layoutsLoaded, setLayoutsLoaded] = useState(false);
+  const layoutSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
+
   // Node chat modal state
   const [nodeChatModalOpen, setNodeChatModalOpen] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -160,6 +167,7 @@ export default function Home() {
   const [transcriptLoading, setTranscriptLoading] = useState(false);
   const transcriptAbortRef = useRef<AbortController | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const chatEditorRef = useRef<RichTextEditorHandle>(null);
 
   // When overlay messages are restored from a previous session, they belong at a
   // specific position in the transcript (not at the end). null = append at end (live sends).
@@ -187,6 +195,14 @@ export default function Home() {
     project: string;
     display: string;
     isLive: boolean;
+  } | null>(null);
+
+  // Rewind confirmation state
+  const [rewindConfirm, setRewindConfirm] = useState<{
+    turnIndex: number;
+    userMessage: string;
+    fullMessage: string;
+    timestamp: string;
   } | null>(null);
 
   // Error dialog state
@@ -218,11 +234,22 @@ export default function Home() {
             if (state.activeWorkflowId) {
               setActiveWorkflowId(state.activeWorkflowId);
             }
+            if (state.chatHorizontalLayout) {
+              setChatHorizontalLayout(state.chatHorizontalLayout);
+            }
+            if (state.chatVerticalLayout) {
+              setChatVerticalLayout(state.chatVerticalLayout);
+            }
+            if (state.canvasHorizontalLayout) {
+              setCanvasHorizontalLayout(state.canvasHorizontalLayout);
+            }
             console.log('[App] Loaded UI state from server');
           }
         }
       } catch (error) {
         console.error('[App] Failed to load UI state:', error);
+      } finally {
+        setLayoutsLoaded(true);
       }
     };
     loadUIState();
@@ -248,6 +275,24 @@ export default function Home() {
     };
     saveUIState();
   }, [activeTab, activeWorkflowId]);
+
+  // Debounced save for panel layout changes
+  const saveLayoutState = useCallback((updates: Record<string, number[]>) => {
+    if (layoutSaveTimerRef.current) {
+      clearTimeout(layoutSaveTimerRef.current);
+    }
+    layoutSaveTimerRef.current = setTimeout(async () => {
+      try {
+        await fetch('/api/ui-state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updates),
+        });
+      } catch (error) {
+        console.error('[App] Failed to save panel layout:', error);
+      }
+    }, 500);
+  }, []);
 
   // Load theme preference on mount
   useEffect(() => {
@@ -709,6 +754,124 @@ export default function Home() {
     }
   };
 
+  const handleRewind = async (mode: 'conversation' | 'both') => {
+    if (!viewingTranscriptId || !historyTranscriptProject || !rewindConfirm) return;
+
+    const { turnIndex, fullMessage } = rewindConfirm;
+    setRewindConfirm(null);
+
+    // Immediately truncate the UI: remove all messages from the rewind point onward
+    let userCount = 0;
+    const cutIdx = historyTranscript.findIndex(msg => {
+      if (msg.role === 'user') {
+        if (userCount === turnIndex) return true;
+        userCount++;
+      }
+      return false;
+    });
+    if (cutIdx >= 0) {
+      setHistoryTranscript(prev => prev.slice(0, cutIdx));
+    }
+    setTranscriptOverlayMessages([]);
+    setOverlayInsertPoint(null);
+    setTranscriptLoading(true);
+    setTranscriptStreaming('');
+    setStreamEvents([]);
+
+    try {
+      // Step 1: If "both", prompt Claude to undo code changes BEFORE truncating
+      // (so it still has context of what it did)
+      if (mode === 'both') {
+
+        const abortController = new AbortController();
+        transcriptAbortRef.current = abortController;
+
+        try {
+          const res = await fetch('/api/claude', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              prompt: `Undo all file changes you made starting from the message shown below. Restore every modified file to its state before that point. Do not explain, just revert the files.\n\nMessage to rewind to (${rewindConfirm.timestamp ? new Date(rewindConfirm.timestamp).toISOString() : 'unknown time'}):\n> ${rewindConfirm.userMessage}`,
+              sessionId: viewingTranscriptId,
+              projectPath: historyTranscriptProject,
+            }),
+            signal: abortController.signal,
+          });
+
+          if (res.ok) {
+            const reader = res.body?.getReader();
+            if (reader) {
+              const decoder = new TextDecoder();
+              let accumulatedText = '';
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const chunk = decoder.decode(value);
+                for (const line of chunk.split('\n')) {
+                  if (line.startsWith('data: ')) {
+                    try {
+                      const data = JSON.parse(line.slice(6));
+                      if (data.text) {
+                        accumulatedText += data.text;
+                        setTranscriptStreaming(accumulatedText);
+                      } else if (data.tool_use) {
+                        const tool = data.tool_use;
+                        if (tool.status === 'starting') {
+                          setStreamEvents(prev => [...prev, { type: 'tool_start', name: tool.name, ts: Date.now() }]);
+                        } else if (tool.status === 'complete') {
+                          setStreamEvents(prev => [...prev, { type: 'tool_complete', name: tool.name, input: tool.input, ts: Date.now() }]);
+                        }
+                      } else if (data.tool_result) {
+                        setStreamEvents(prev => [...prev, { type: 'tool_result', preview: data.tool_result.preview, ts: Date.now() }]);
+                      }
+                    } catch { /* skip */ }
+                  }
+                }
+              }
+            }
+          }
+        } finally {
+          transcriptAbortRef.current = null;
+        }
+      }
+
+      // Step 2: Truncate the JSONL (removes original turns + the undo prompt)
+      const res = await fetch('/api/session', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: viewingTranscriptId,
+          project: historyTranscriptProject,
+          turnIndex,
+          removeLastHistoryEntry: mode === 'both',
+        }),
+      });
+
+      if (!res.ok) throw new Error(`Rewind failed: ${res.status}`);
+
+      // Step 3: Reload transcript from the truncated JSONL
+      const refreshRes = await fetch(
+        `/api/transcript?sessionId=${encodeURIComponent(viewingTranscriptId)}&project=${encodeURIComponent(historyTranscriptProject)}`
+      );
+      if (refreshRes.ok) {
+        const refreshData = await refreshRes.json();
+        if (refreshData.messages) {
+          setHistoryTranscript(refreshData.messages);
+          setTranscriptOverlayMessages([]);
+          setOverlayInsertPoint(null);
+        }
+      }
+
+      // Pre-fill the editor with the rewound message
+      chatEditorRef.current?.setContent(fullMessage);
+    } catch (error) {
+      console.error('[App] Rewind failed:', error);
+    } finally {
+      setTranscriptLoading(false);
+      setTranscriptStreaming('');
+    }
+  };
+
   const handleTranscriptStop = () => {
     if (transcriptAbortRef.current) {
       transcriptAbortRef.current.abort();
@@ -834,10 +997,13 @@ export default function Home() {
         {/* Tab Content */}
         <div className="flex-1 overflow-hidden">
           {/* Chat Tab */}
-          {activeTab === 'chat' && (
-        <PanelGroup direction="horizontal">
+          {activeTab === 'chat' && layoutsLoaded && (
+        <PanelGroup direction="horizontal" onLayout={(sizes) => {
+          setChatHorizontalLayout(sizes);
+          saveLayoutState({ chatHorizontalLayout: sizes });
+        }}>
           {/* Left Panel - Unified Session List */}
-          <Panel defaultSize={20} minSize={15}>
+          <Panel defaultSize={chatHorizontalLayout[0]} minSize={15}>
             <div className="h-full bg-card border-r border-border flex flex-col">
               {/* Header */}
               <div className="p-4 border-b border-border flex justify-between items-center">
@@ -950,7 +1116,7 @@ export default function Home() {
           <PanelResizeHandle className="w-2 bg-border hover:bg-primary transition-colors" />
 
           {/* Middle Panel - Chat Interface / Transcript Viewer */}
-          <Panel defaultSize={45} minSize={30}>
+          <Panel defaultSize={chatHorizontalLayout[1]} minSize={30}>
             <div className="h-full bg-card border-r border-border flex flex-col">
 
               {/* === Transcript View (interactive) === */}
@@ -991,9 +1157,12 @@ export default function Home() {
 
                   {/* Transcript + Input with Vertical Resizer */}
                   <div className="flex-1 overflow-hidden">
-                    <PanelGroup direction="vertical">
+                    <PanelGroup direction="vertical" onLayout={(sizes) => {
+                      setChatVerticalLayout(sizes);
+                      saveLayoutState({ chatVerticalLayout: sizes });
+                    }}>
                       {/* Messages Area Panel */}
-                      <Panel defaultSize={70} minSize={30}>
+                      <Panel defaultSize={chatVerticalLayout[0]} minSize={30}>
                         <div className="h-full overflow-y-auto p-4 space-y-4">
                     {historyTranscriptLoading ? (
                       <div className="flex items-center justify-center h-full text-muted-foreground">
@@ -1069,7 +1238,23 @@ export default function Home() {
                           return turns.map((turn, i) => (
                             <div key={`turn-${i}`} className="space-y-3">
                               {turn.user && (
-                                <div className="flex justify-end">
+                                <div className="flex justify-end items-center group/rewind">
+                                  {i > 0 && !transcriptLoading && (
+                                    <button
+                                      onClick={() => setRewindConfirm({
+                                        turnIndex: i,
+                                        userMessage: turn.user!.content.length > 80
+                                          ? turn.user!.content.substring(0, 80) + '...'
+                                          : turn.user!.content,
+                                        fullMessage: turn.user!.content,
+                                        timestamp: turn.user!.timestamp,
+                                      })}
+                                      className="opacity-0 group-hover/rewind:opacity-100 transition-opacity mr-2 p-1 rounded hover:bg-muted"
+                                      title="Rewind to before this message"
+                                    >
+                                      <RotateCcw className="h-3.5 w-3.5 text-muted-foreground" />
+                                    </button>
+                                  )}
                                   <div className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-blue-900 text-white border-blue-700">
                                     <div className="text-xs opacity-70 mb-1">You</div>
                                     <div className="whitespace-pre-wrap break-words text-sm">
@@ -1079,15 +1264,15 @@ export default function Home() {
                                 </div>
                               )}
                               {turn.assistant && (
-                                <div
-                                  className={`flex justify-start ${turn.intermediaries.length > 0 ? 'cursor-pointer' : ''}`}
-                                  onClick={turn.intermediaries.length > 0 ? () => setIntermediaryMessages(turn.intermediaries) : undefined}
-                                >
-                                  <div className={`max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border ${turn.intermediaries.length > 0 ? 'hover:border-ring' : ''} transition-colors`}>
+                                <div className="flex justify-start">
+                                  <div className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border transition-colors">
                                     <div className="text-xs opacity-70 mb-1 flex items-center gap-2">
                                       Claude
                                       {turn.intermediaries.length > 0 && (
-                                        <span className="text-[10px] text-muted-foreground bg-background border border-border rounded px-1.5 py-0.5">
+                                        <span
+                                          className="text-[10px] text-muted-foreground bg-background border border-border rounded px-1.5 py-0.5 cursor-pointer hover:border-ring hover:text-foreground transition-colors"
+                                          onClick={() => setIntermediaryMessages(turn.intermediaries)}
+                                        >
                                           +{turn.intermediaries.length} intermediary
                                         </span>
                                       )}
@@ -1144,9 +1329,10 @@ export default function Home() {
                       <PanelResizeHandle className="h-2 bg-border hover:bg-primary transition-colors" />
 
                       {/* Input Area Panel */}
-                      <Panel defaultSize={30} minSize={20}>
+                      <Panel defaultSize={chatVerticalLayout[1]} minSize={20}>
                         <div className="h-full p-4">
                           <RichTextEditor
+                            ref={chatEditorRef}
                             onSubmit={handleTranscriptSend}
                             placeholder="Continue this conversation... (Enter to send, Shift+Enter for new line)"
                             disabled={historyTranscriptLoading}
@@ -1182,7 +1368,7 @@ export default function Home() {
           <PanelResizeHandle className="w-2 bg-border hover:bg-primary transition-colors" />
 
           {/* Right Panel - Multi-View */}
-          <Panel defaultSize={35} minSize={20}>
+          <Panel defaultSize={chatHorizontalLayout[2]} minSize={20}>
             <div className="h-full bg-card flex flex-col">
               {/* Toolbar */}
               <div className="p-2 border-b border-border flex items-center gap-2">
@@ -1355,10 +1541,13 @@ export default function Home() {
           )}
 
           {/* Canvas Tab */}
-          {activeTab === 'canvas' && (
-            <PanelGroup direction="horizontal">
+          {activeTab === 'canvas' && layoutsLoaded && (
+            <PanelGroup direction="horizontal" onLayout={(sizes) => {
+              setCanvasHorizontalLayout(sizes);
+              saveLayoutState({ canvasHorizontalLayout: sizes });
+            }}>
               {/* Left Panel - Workflows */}
-              <Panel defaultSize={20} minSize={15}>
+              <Panel defaultSize={canvasHorizontalLayout[0]} minSize={15}>
                 <WorkflowsPanel
                   activeWorkflowId={activeWorkflowId}
                   onWorkflowSelect={setActiveWorkflowId}
@@ -1389,7 +1578,7 @@ export default function Home() {
               <PanelResizeHandle className="w-2 bg-border hover:bg-primary transition-colors" />
 
               {/* Middle Panel - Canvas */}
-              <Panel defaultSize={80} minSize={50}>
+              <Panel defaultSize={canvasHorizontalLayout[1]} minSize={50}>
                 <DrawflowCanvas
                   className="h-full"
                   activeWorkflowId={activeWorkflowId}
@@ -1499,6 +1688,32 @@ export default function Home() {
           </button>
         </div>
       )}
+
+      {/* Rewind Confirmation */}
+      <AlertDialog open={!!rewindConfirm} onOpenChange={(open) => { if (!open) setRewindConfirm(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Rewind conversation?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Rewind the conversation to before this message:
+              <br /><br />
+              <span className="text-muted-foreground text-xs font-mono break-all">&ldquo;{rewindConfirm?.userMessage}&rdquo;</span>
+              {rewindConfirm?.timestamp && (
+                <><br /><span className="text-muted-foreground text-xs">{new Date(rewindConfirm.timestamp).toLocaleString()}</span></>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction className="bg-secondary text-secondary-foreground hover:bg-secondary/80" onClick={() => handleRewind('conversation')}>
+              Conversation only
+            </AlertDialogAction>
+            <AlertDialogAction onClick={() => handleRewind('both')}>
+              Conversation + Code
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Delete Session Confirmation */}
       <AlertDialog open={!!deleteConfirm} onOpenChange={(open) => { if (!open) setDeleteConfirm(null); }}>
