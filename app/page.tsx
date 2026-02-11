@@ -30,6 +30,7 @@ import { Button } from '@/components/ui/button';
 import RichTextEditor, { type RichTextEditorHandle } from '@/components/RichTextEditor';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
 import FileTree from '@/components/FileTree';
+import CodeViewerDialog, { isCodeFile } from '@/components/CodeViewerDialog';
 import DrawflowCanvas from '@/components/DrawflowCanvas';
 import WorkflowsPanel from '@/components/WorkflowsPanel';
 import NodeChatModal from '@/components/NodeChatModal';
@@ -127,6 +128,16 @@ export default function Home() {
   // Right panel view state
   type RightPanelView = 'files' | 'notes' | 'stream';
   const [rightPanelView, setRightPanelView] = useState<RightPanelView>('stream');
+
+  // Code viewer state
+  const [codeViewerPath, setCodeViewerPath] = useState<string | null>(null);
+
+  const handleFileDoubleClick = useCallback((filePath: string) => {
+    const fileName = filePath.replace(/\\/g, '/').split('/').pop() || '';
+    if (isCodeFile(fileName)) {
+      setCodeViewerPath(filePath);
+    }
+  }, []);
 
   // Tab control state
   const [activeTab, setActiveTab] = useState<'chat' | 'canvas'>('chat');
@@ -1484,7 +1495,7 @@ export default function Home() {
               {/* Files View */}
               {rightPanelView === 'files' && (
                 <div className="flex-1 overflow-hidden">
-                  <FileTree projectPath={historyTranscriptProject} />
+                  <FileTree projectPath={historyTranscriptProject} onFileDoubleClick={handleFileDoubleClick} />
                 </div>
               )}
 
@@ -1695,6 +1706,9 @@ export default function Home() {
       />
 
       {/* Intermediary Messages Dialog */}
+      {/* Code Viewer Dialog */}
+      <CodeViewerDialog filePath={codeViewerPath} onClose={() => setCodeViewerPath(null)} />
+
       <Dialog open={intermediaryMessages.length > 0} onOpenChange={(open) => { if (!open) setIntermediaryMessages([]); }}>
         <DialogContent className="max-w-3xl h-[80vh] flex flex-col p-0">
           <DialogHeader className="px-6 pt-6 pb-2 shrink-0">

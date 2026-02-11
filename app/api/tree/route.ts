@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import path from 'path';
+import { execFile } from 'child_process';
 
 export interface FileTreeNode {
   name: string;
@@ -72,6 +73,59 @@ async function buildFileTree(dirPath: string, maxDepth: number = 5, currentDepth
   }
 }
 
+// Git status codes: M=modified, A=added, D=deleted, R=renamed, ?=untracked
+type GitFileStatus = 'M' | 'A' | 'D' | 'R' | '?';
+
+async function getGitStatus(dirPath: string): Promise<Record<string, GitFileStatus> | null> {
+  return new Promise((resolve) => {
+    execFile('git', ['status', '--porcelain', '-uall'], { cwd: dirPath, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+      if (err) {
+        // Not a git repo or git not available
+        resolve(null);
+        return;
+      }
+
+      const statuses: Record<string, GitFileStatus> = {};
+      const lines = stdout.trim().split('\n').filter(Boolean);
+
+      for (const line of lines) {
+        // Porcelain format: XY filename
+        // X = index status, Y = working tree status
+        const indexStatus = line[0];
+        const workTreeStatus = line[1];
+        let filePath = line.slice(3);
+
+        // Handle renamed files: "R  old -> new"
+        if (filePath.includes(' -> ')) {
+          filePath = filePath.split(' -> ')[1];
+        }
+
+        // Remove any quotes from filenames with special characters
+        if (filePath.startsWith('"') && filePath.endsWith('"')) {
+          filePath = filePath.slice(1, -1);
+        }
+
+        const absPath = path.join(dirPath, filePath);
+
+        // Determine the most relevant status
+        if (indexStatus === '?' || workTreeStatus === '?') {
+          statuses[absPath] = '?';
+        } else if (indexStatus === 'A' || workTreeStatus === 'A') {
+          statuses[absPath] = 'A';
+        } else if (indexStatus === 'D' || workTreeStatus === 'D') {
+          statuses[absPath] = 'D';
+        } else if (indexStatus === 'R' || workTreeStatus === 'R') {
+          statuses[absPath] = 'R';
+        } else if (indexStatus === 'M' || workTreeStatus === 'M') {
+          statuses[absPath] = 'M';
+        }
+      }
+
+      resolve(statuses);
+    });
+  });
+}
+
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
@@ -100,12 +154,16 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const tree = await buildFileTree(dirPath);
+    const [tree, gitStatus] = await Promise.all([
+      buildFileTree(dirPath),
+      getGitStatus(dirPath),
+    ]);
 
     return NextResponse.json({
       success: true,
       tree,
       root: dirPath,
+      gitStatus,
     });
   } catch (error) {
     console.error('Error in /api/tree:', error);
