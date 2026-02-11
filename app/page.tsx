@@ -35,7 +35,7 @@ import DrawflowCanvas from '@/components/DrawflowCanvas';
 import WorkflowsPanel from '@/components/WorkflowsPanel';
 import NodeChatModal from '@/components/NodeChatModal';
 import AskUserQuestionDialog from '@/components/AskUserQuestionDialog';
-import { Plus, AlertTriangle, Sun, Moon, FolderTree, FileText, Activity, Trash2, RotateCcw } from 'lucide-react';
+import { Plus, AlertTriangle, Sun, Moon, FolderTree, FileText, Activity, Trash2, RotateCcw, Copy, Check } from 'lucide-react';
 import { getRecentDirectories } from '@/lib/recent-directories';
 
 // Client-side only timestamp component to avoid hydration mismatch
@@ -64,6 +64,77 @@ const HistoryTimestamp = ({ timestamp }: { timestamp: number }) => {
     <span className="text-xs text-muted-foreground">
       {dateStr} {timeStr}
     </span>
+  );
+};
+
+// Convert plain text to HTML paragraphs so TipTap can parse line breaks
+const textToHtml = (text: string) =>
+  text.split('\n').map(line => `<p>${line || '<br>'}</p>`).join('');
+
+// Chat bubble wrapper with hover-to-copy button
+const ChatBubble = ({ label, children, headerExtra, className, rawContent, isMarkdown }: {
+  label: string;
+  children: React.ReactNode;
+  headerExtra?: React.ReactNode;
+  className: string;
+  rawContent: string;
+  isMarkdown?: boolean;
+}) => {
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const el = contentRef.current;
+    if (!el) return;
+
+    // For markdown (assistant) bubbles, use the rendered HTML from the DOM.
+    // For plain text (user) bubbles, convert newlines to <p> tags so TipTap
+    // preserves line breaks on paste.
+    const html = isMarkdown ? el.innerHTML : textToHtml(rawContent);
+    const text = rawContent;
+
+    try {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          'text/html': new Blob([html], { type: 'text/html' }),
+          'text/plain': new Blob([text], { type: 'text/plain' }),
+        }),
+      ]);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      try {
+        await navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      } catch (err) {
+        console.error('Failed to copy:', err);
+      }
+    }
+  };
+
+  return (
+    <div className={`group/bubble relative ${className}`}>
+      <div className="flex items-center justify-between mb-1">
+        <div className="text-xs opacity-70 flex items-center gap-2">
+          {label}
+          {headerExtra}
+        </div>
+        <button
+          onClick={handleCopy}
+          className="opacity-0 group-hover/bubble:opacity-100 transition-opacity p-1 rounded hover:bg-black/10 dark:hover:bg-white/10"
+          title="Copy to clipboard"
+        >
+          {copied ? (
+            <Check className="h-3.5 w-3.5 text-green-500" />
+          ) : (
+            <Copy className="h-3.5 w-3.5 opacity-70" />
+          )}
+        </button>
+      </div>
+      <div ref={contentRef}>{children}</div>
+    </div>
   );
 };
 
@@ -1162,15 +1233,24 @@ export default function Home() {
                       >
                         <div className="flex justify-between items-start mb-1">
                           <HistoryTimestamp timestamp={entry.timestamp} />
-                          {isLive && (
-                            <span className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-green-400 bg-green-950/60 border border-green-700/50 rounded px-1.5 py-0.5">
-                              <span className="relative flex h-1.5 w-1.5">
-                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-400"></span>
+                          <div className="flex items-center gap-1.5">
+                            {isViewing && transcriptLoading && (
+                              <div className="flex items-center gap-0.5">
+                                <div className="dot w-1.5 h-1.5 bg-primary rounded-full"></div>
+                                <div className="dot w-1.5 h-1.5 bg-primary rounded-full"></div>
+                                <div className="dot w-1.5 h-1.5 bg-primary rounded-full"></div>
+                              </div>
+                            )}
+                            {isLive && (
+                              <span className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-green-400 bg-green-950/60 border border-green-700/50 rounded px-1.5 py-0.5">
+                                <span className="relative flex h-1.5 w-1.5">
+                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-400"></span>
+                                </span>
+                                Live
                               </span>
-                              Live
-                            </span>
-                          )}
+                            )}
+                          </div>
                         </div>
                         <div className="text-sm text-foreground break-words line-clamp-2">
                           {entry.display}
@@ -1185,7 +1265,7 @@ export default function Home() {
                             )}
                           </div>
                         )}
-                        <div className="mt-1 text-xs text-muted-foreground font-mono truncate">
+                        <div className="mt-1 text-xs text-muted-foreground font-mono truncate" title={entry.project}>
                           {entry.project}
                         </div>
                       </div>
@@ -1345,28 +1425,29 @@ export default function Home() {
                                       <RotateCcw className="h-3.5 w-3.5 text-muted-foreground" />
                                     </button>
                                   )}
-                                  <div className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-blue-900 text-white border-blue-700">
-                                    <div className="text-xs opacity-70 mb-1">You</div>
+                                  <ChatBubble label="You" className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-blue-900 text-white border-blue-700" rawContent={turn.user.content}>
                                     <div className="whitespace-pre-wrap break-words text-sm">
                                       {turn.user.content}
                                     </div>
-                                  </div>
+                                  </ChatBubble>
                                 </div>
                               )}
                               {turn.assistant && (
                                 <div className="flex justify-start">
-                                  <div className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border transition-colors">
-                                    <div className="text-xs opacity-70 mb-1 flex items-center gap-2">
-                                      Claude
-                                      {turn.intermediaries.length > 0 && (
-                                        <span
-                                          className="text-[10px] text-muted-foreground bg-background border border-border rounded px-1.5 py-0.5 cursor-pointer hover:border-ring hover:text-foreground transition-colors"
-                                          onClick={() => setIntermediaryMessages(turn.intermediaries)}
-                                        >
-                                          +{turn.intermediaries.length} intermediary
-                                        </span>
-                                      )}
-                                    </div>
+                                  <ChatBubble
+                                    label="Claude"
+                                    className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border transition-colors"
+                                    rawContent={turn.assistant.content}
+                                    isMarkdown
+                                    headerExtra={turn.intermediaries.length > 0 ? (
+                                      <span
+                                        className="text-[10px] text-muted-foreground bg-background border border-border rounded px-1.5 py-0.5 cursor-pointer hover:border-ring hover:text-foreground transition-colors"
+                                        onClick={() => setIntermediaryMessages(turn.intermediaries)}
+                                      >
+                                        +{turn.intermediaries.length} intermediary
+                                      </span>
+                                    ) : undefined}
+                                  >
                                     <div className="prose-chat max-w-none">
                                       <ReactMarkdown
                                         remarkPlugins={[remarkGfm]}
@@ -1375,38 +1456,28 @@ export default function Home() {
                                         {turn.assistant.content}
                                       </ReactMarkdown>
                                     </div>
-                                  </div>
+                                  </ChatBubble>
                                 </div>
                               )}
                             </div>
                           ));
                         })()}
 
-                        {/* Streaming message */}
-                        {transcriptStreaming && (
+                        {/* Processing indicator - click to open Stream tab */}
+                        {transcriptLoading && (
                           <div className="flex justify-start">
-                            <div className="max-w-[80%] rounded-lg pl-4 pr-2 py-2 bg-muted text-foreground border border-border">
-                              <div className="text-xs opacity-70 mb-1">Claude</div>
-                              <div className="prose-chat max-w-none">
-                                <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-                                  {transcriptStreaming}
-                                </ReactMarkdown>
-                              </div>
-                            </div>
-                          </div>
-                        )}
-
-                        {/* Loading indicator */}
-                        {transcriptLoading && !transcriptStreaming && (
-                          <div className="flex justify-start">
-                            <div className="max-w-[80%] rounded-lg pl-4 pr-2 py-2 bg-muted text-foreground border border-border">
+                            <button
+                              onClick={() => setRightPanelView('stream')}
+                              className="max-w-[80%] rounded-lg pl-4 pr-2 py-2 bg-muted text-foreground border border-border cursor-pointer hover:border-ring transition-colors text-left"
+                              title="View live stream"
+                            >
                               <div className="text-xs opacity-70 mb-1">Claude</div>
                               <div className="flex items-center gap-1 py-2">
                                 <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
                                 <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
                                 <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
                               </div>
-                            </div>
+                            </button>
                           </div>
                         )}
 
