@@ -262,7 +262,7 @@ export default function FileTree({ projectPath, onFileDoubleClick }: FileTreePro
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full select-none">
       {/* Search bar */}
       <div className="px-2 pt-2 pb-1 shrink-0">
         <div className="relative">
@@ -286,7 +286,7 @@ export default function FileTree({ projectPath, onFileDoubleClick }: FileTreePro
       </div>
 
       {/* Tree or search results */}
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1 overflow-hidden">
         {filteredFiles !== null ? (
           <div className="py-1">
             {filteredFiles.length === 0 ? (

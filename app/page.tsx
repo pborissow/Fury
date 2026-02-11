@@ -139,6 +139,8 @@ export default function Home() {
     }
   }, []);
 
+  const closeCodeViewer = useCallback(() => setCodeViewerPath(null), []);
+
   // Tab control state
   const [activeTab, setActiveTab] = useState<'chat' | 'canvas'>('chat');
 
@@ -1707,7 +1709,7 @@ export default function Home() {
 
       {/* Intermediary Messages Dialog */}
       {/* Code Viewer Dialog */}
-      <CodeViewerDialog filePath={codeViewerPath} onClose={() => setCodeViewerPath(null)} />
+      <CodeViewerDialog filePath={codeViewerPath} onClose={closeCodeViewer} />
 
       <Dialog open={intermediaryMessages.length > 0} onOpenChange={(open) => { if (!open) setIntermediaryMessages([]); }}>
         <DialogContent className="max-w-3xl h-[80vh] flex flex-col p-0">

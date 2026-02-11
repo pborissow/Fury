@@ -219,19 +219,20 @@ function buildDiffRows(rawOriginal: string, rawCurrent: string, fileName: string
         leftIdx++;
       }
     } else if (change.added) {
-      let fillIndex = rows.length - count;
+      // Find the start of trailing empty right-side rows (from a preceding removed block)
+      let fillStart = rows.length;
+      while (fillStart > 0 && rows[fillStart - 1].rightType === 'empty') {
+        fillStart--;
+      }
+      const emptyCount = rows.length - fillStart;
       let filled = 0;
-      for (let i = 0; i < count; i++) {
-        const targetIdx = fillIndex + i;
-        if (targetIdx >= 0 && targetIdx < rows.length && rows[targetIdx].rightType === 'empty') {
-          rows[targetIdx].rightNum = rightIdx + 1;
-          rows[targetIdx].rightHtml = currentLines[rightIdx] || '';
-          rows[targetIdx].rightType = 'added';
-          filled++;
-          rightIdx++;
-        } else {
-          break;
-        }
+      for (let i = 0; i < Math.min(count, emptyCount); i++) {
+        const targetIdx = fillStart + i;
+        rows[targetIdx].rightNum = rightIdx + 1;
+        rows[targetIdx].rightHtml = currentLines[rightIdx] || '';
+        rows[targetIdx].rightType = 'added';
+        filled++;
+        rightIdx++;
       }
       for (let i = filled; i < count; i++) {
         rows.push({
@@ -260,7 +261,7 @@ interface CodeViewerDialogProps {
   onClose: () => void;
 }
 
-export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialogProps) {
+export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeViewerDialogProps) {
   const [content, setContent] = useState<string | null>(null);
   const [originalContent, setOriginalContent] = useState<string | null>(null);
   const [hasOriginal, setHasOriginal] = useState(false);
@@ -269,16 +270,47 @@ export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialog
   const [error, setError] = useState<string | null>(null);
   const codeRef = useRef<HTMLPreElement>(null);
 
-  // Drag state
+  // Persisted size & position
+  const [size, setSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
   const [position, setPosition] = useState({ x: 0, y: 0 });
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
   const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
+  const savePrefTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fileName = filePath ? filePath.replace(/\\/g, '/').split('/').pop() || '' : '';
 
-  // Reset state when a new file is opened
+  // Load saved dialog preferences once
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/ui-state');
+        if (res.ok) {
+          const { state } = await res.json();
+          if (state?.codeViewerSize) setSize(state.codeViewerSize);
+          if (state?.codeViewerPosition) setPosition(state.codeViewerPosition);
+        }
+      } catch { /* ignore */ }
+      setPrefsLoaded(true);
+    })();
+  }, []);
+
+  // Debounced save helper
+  const saveDialogPrefs = useCallback((updates: Record<string, unknown>) => {
+    if (savePrefTimer.current) clearTimeout(savePrefTimer.current);
+    savePrefTimer.current = setTimeout(async () => {
+      try {
+        await fetch('/api/ui-state', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(updates),
+        });
+      } catch { /* ignore */ }
+    }, 500);
+  }, []);
+
+  // Reset diff state when a new file is opened (but keep size/position)
   useEffect(() => {
     if (filePath) {
-      setPosition({ x: 0, y: 0 });
       setShowDiff(false);
     }
   }, [filePath]);
@@ -369,8 +401,14 @@ export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialog
   }, []);
 
   const handleDragEnd = useCallback(() => {
-    dragRef.current = null;
-  }, []);
+    if (dragRef.current) {
+      dragRef.current = null;
+      setPosition(pos => {
+        saveDialogPrefs({ codeViewerPosition: pos });
+        return pos;
+      });
+    }
+  }, [saveDialogPrefs]);
 
   const lines = content?.split('\n') || [];
 
@@ -388,7 +426,12 @@ export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialog
           onOpenAutoFocus={(e) => e.preventDefault()}
         >
           <Resizable
-            defaultSize={{ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT }}
+            size={size}
+            onResizeStop={(_e, _dir, _ref, delta) => {
+              const newSize = { width: size.width + delta.width, height: size.height + delta.height };
+              setSize(newSize);
+              saveDialogPrefs({ codeViewerSize: newSize });
+            }}
             minWidth={MIN_WIDTH}
             minHeight={MIN_HEIGHT}
             maxWidth="95vw"
@@ -497,11 +540,12 @@ export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialog
       </DialogPrimitive.Portal>
     </DialogPrimitive.Root>
   );
-}
+});
 
 // Side-by-side diff rendering
 function DiffView({ rows }: { rows: DiffRow[] }) {
   const isDark = typeof document !== 'undefined' && document.documentElement.classList.contains('dark');
+  const containerRef = useRef<HTMLDivElement>(null);
 
   const ROW_BG: Record<string, string> = {
     removed: isDark ? '#582a2b' : '#fce8e8',
@@ -510,14 +554,26 @@ function DiffView({ rows }: { rows: DiffRow[] }) {
     unchanged: 'transparent',
   };
 
+  const firstDiffIndex = rows.findIndex(r => r.leftType !== 'unchanged' || r.rightType !== 'unchanged');
+
+  useEffect(() => {
+    if (firstDiffIndex < 0) return;
+    const el = containerRef.current?.querySelector('[data-first-diff]');
+    if (el) {
+      el.scrollIntoView({ block: 'center' });
+    }
+  }, [firstDiffIndex]);
+
   return (
-    <div className="flex text-sm font-mono min-w-0">
+    <div ref={containerRef} className="flex text-sm font-mono min-w-0">
       {/* Left side (original) */}
       <div className="flex flex-1 min-w-0 border-r border-border overflow-x-auto">
         {/* Line numbers */}
         <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0 bg-background z-10">
           {rows.map((row, i) => (
-            <div key={i} className="leading-6" style={{ backgroundColor: ROW_BG[row.leftType] }}>
+            <div key={i} className="leading-6" style={{ backgroundColor: ROW_BG[row.leftType] }}
+              {...(i === firstDiffIndex ? { 'data-first-diff': true } : {})}
+            >
               {row.leftNum ?? ' '}
             </div>
           ))}

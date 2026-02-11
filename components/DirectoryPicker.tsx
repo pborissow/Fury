@@ -11,12 +11,13 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Folder, Home, ChevronRight, ChevronUp, Loader2 } from 'lucide-react';
+import { Folder, Home, ChevronRight, ChevronUp, Loader2, HardDrive, Link2 } from 'lucide-react';
 
 interface Directory {
   name: string;
   path: string;
   isDirectory: boolean;
+  isSymlink?: boolean;
 }
 
 interface DirectoryData {
@@ -24,6 +25,7 @@ interface DirectoryData {
   parentPath: string | null;
   directories: Directory[];
   homeDir: string;
+  drives?: string[];
 }
 
 interface DirectoryPickerProps {
@@ -40,6 +42,7 @@ export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectorie
   const [homeDir, setHomeDir] = useState<string>('');
   const [loading, setLoading] = useState(false);
   const [selectedPath, setSelectedPath] = useState<string>('');
+  const [drives, setDrives] = useState<string[]>([]);
 
   // Load initial directory when dialog opens
   useEffect(() => {
@@ -64,6 +67,7 @@ export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectorie
       setParentPath(data.parentPath);
       setHomeDir(data.homeDir);
       setSelectedPath(data.currentPath);
+      if (data.drives) setDrives(data.drives);
     } catch (error) {
       console.error('Error loading directory:', error);
     } finally {
@@ -166,6 +170,28 @@ export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectorie
             </div>
           </div>
 
+          {/* Windows drive selector */}
+          {drives.length > 0 && (
+            <div className="flex items-center gap-1 flex-wrap">
+              <HardDrive className="h-3.5 w-3.5 text-muted-foreground mr-1" />
+              {drives.map((drive) => {
+                const isActive = currentPath.toUpperCase().startsWith(drive.charAt(0).toUpperCase());
+                return (
+                  <Button
+                    key={drive}
+                    variant={isActive ? 'default' : 'outline'}
+                    size="sm"
+                    className="h-7 px-2 text-xs font-mono"
+                    onClick={() => loadDirectory(drive)}
+                    disabled={loading}
+                  >
+                    {drive.substring(0, 2)}
+                  </Button>
+                );
+              })}
+            </div>
+          )}
+
           {/* Directory list */}
           <ScrollArea className="h-[400px] border rounded">
             {loading ? (
@@ -186,6 +212,9 @@ export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectorie
                   >
                     <Folder className="h-4 w-4 text-blue-500 flex-shrink-0" />
                     <span className="flex-1 truncate text-sm">{dir.name}</span>
+                    {dir.isSymlink && (
+                      <span title="Symbolic link"><Link2 className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" /></span>
+                    )}
                     <ChevronRight className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                   </button>
                 ))}

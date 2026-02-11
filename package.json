@@ -41,7 +41,6 @@
     "@eslint/eslintrc": "^3",
     "@playwright/test": "^1.56.0",
     "@tailwindcss/postcss": "^4",
-    "@types/diff": "^8.0.0",
     "@types/node": "^20",
     "@types/react": "^19.2.13",
     "@types/react-dom": "^19.2.3",

@@ -114,9 +114,10 @@ async function getGitStatus(dirPath: string): Promise<Record<string, VcsFileStat
       for (const line of lines) {
         // Porcelain format: XY filename
         // X = index status, Y = working tree status
-        const indexStatus = line[0];
-        const workTreeStatus = line[1];
-        let filePath = line.slice(3);
+        const match = line.match(/^(.)(.)\s?(.+)$/);
+        if (!match) continue;
+        const [, indexStatus, workTreeStatus, rawPath] = match;
+        let filePath = rawPath;
 
         // Handle renamed files: "R  old -> new"
         if (filePath.includes(' -> ')) {
