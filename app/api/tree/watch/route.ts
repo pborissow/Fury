@@ -6,6 +6,7 @@ const IGNORED_ITEMS = new Set([
   'node_modules',
   '.next',
   '.git',
+  '.svn',
   'dist',
   'build',
   'out',

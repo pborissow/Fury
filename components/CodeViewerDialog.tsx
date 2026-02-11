@@ -1,10 +1,11 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Loader2, GripHorizontal, XIcon } from 'lucide-react';
+import { Loader2, GripHorizontal, XIcon, GitCompareArrows } from 'lucide-react';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { Resizable } from 're-resizable';
 import hljs from 'highlight.js';
+import { diffLines } from 'diff';
 
 // File extensions that should open in the code viewer
 const CODE_EXTENSIONS = new Set([
@@ -108,6 +109,147 @@ function getLanguage(fileName: string): string | undefined {
   return EXTENSION_TO_LANGUAGE[ext] || ext;
 }
 
+function highlightCode(code: string, fileName: string): string {
+  const lang = getLanguage(fileName);
+  if (lang && hljs.getLanguage(lang)) {
+    return hljs.highlight(code, { language: lang }).value;
+  }
+  return hljs.highlightAuto(code).value;
+}
+
+// Highlight a full file and split into per-line HTML strings.
+// hljs produces span tags that can wrap across lines, so we need to
+// track open spans and re-open them on each new line.
+function highlightLines(code: string, fileName: string): string[] {
+  const html = highlightCode(code, fileName);
+  return html.split('\n');
+}
+
+// Heuristic limits — based on what the diff actually produces, not raw file size
+const MAX_DIFF_ROWS = 10000;    // max rows we'll render in the side-by-side view
+const MAX_CHANGED_LINES = 3000; // max added+removed lines before we bail
+
+// Build side-by-side diff rows from diff changes
+interface DiffRow {
+  leftNum: number | null;
+  leftHtml: string;
+  leftType: 'unchanged' | 'removed' | 'empty';
+  rightNum: number | null;
+  rightHtml: string;
+  rightType: 'unchanged' | 'added' | 'empty';
+}
+
+interface DiffResult {
+  rows: DiffRow[];
+  tooLarge?: boolean;
+  stats?: { added: number; removed: number; unchanged: number };
+}
+
+function countLines(value: string): number {
+  const v = value.endsWith('\n') ? value.slice(0, -1) : value;
+  return v.split('\n').length;
+}
+
+function normalizeLineEndings(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function buildDiffRows(rawOriginal: string, rawCurrent: string, fileName: string): DiffResult {
+  // Normalize line endings so \r\n vs \n doesn't cause every line to diff
+  const original = normalizeLineEndings(rawOriginal);
+  const current = normalizeLineEndings(rawCurrent);
+
+  // Step 1: compute the diff (this is cheap — just string comparison)
+  const changes = diffLines(original, current);
+
+  // Step 2: count what the diff would produce before doing any heavy work
+  let changedLines = 0;
+  let totalRows = 0;
+  for (const change of changes) {
+    const count = countLines(change.value);
+    if (change.added || change.removed) {
+      changedLines += count;
+    }
+    totalRows += count;
+  }
+
+  if (changedLines > MAX_CHANGED_LINES || totalRows > MAX_DIFF_ROWS) {
+    return {
+      rows: [],
+      tooLarge: true,
+      stats: { added: 0, removed: changedLines, unchanged: totalRows - changedLines },
+    };
+  }
+
+  // Step 3: only now do the expensive highlighting
+  const originalLines = highlightLines(original, fileName);
+  const currentLines = highlightLines(current, fileName);
+
+  // Step 4: build aligned rows
+  const rows: DiffRow[] = [];
+  let leftIdx = 0;
+  let rightIdx = 0;
+
+  for (const change of changes) {
+    const count = countLines(change.value);
+
+    if (!change.added && !change.removed) {
+      for (let i = 0; i < count; i++) {
+        rows.push({
+          leftNum: leftIdx + 1,
+          leftHtml: originalLines[leftIdx] || '',
+          leftType: 'unchanged',
+          rightNum: rightIdx + 1,
+          rightHtml: currentLines[rightIdx] || '',
+          rightType: 'unchanged',
+        });
+        leftIdx++;
+        rightIdx++;
+      }
+    } else if (change.removed) {
+      for (let i = 0; i < count; i++) {
+        rows.push({
+          leftNum: leftIdx + 1,
+          leftHtml: originalLines[leftIdx] || '',
+          leftType: 'removed',
+          rightNum: null,
+          rightHtml: '',
+          rightType: 'empty',
+        });
+        leftIdx++;
+      }
+    } else if (change.added) {
+      let fillIndex = rows.length - count;
+      let filled = 0;
+      for (let i = 0; i < count; i++) {
+        const targetIdx = fillIndex + i;
+        if (targetIdx >= 0 && targetIdx < rows.length && rows[targetIdx].rightType === 'empty') {
+          rows[targetIdx].rightNum = rightIdx + 1;
+          rows[targetIdx].rightHtml = currentLines[rightIdx] || '';
+          rows[targetIdx].rightType = 'added';
+          filled++;
+          rightIdx++;
+        } else {
+          break;
+        }
+      }
+      for (let i = filled; i < count; i++) {
+        rows.push({
+          leftNum: null,
+          leftHtml: '',
+          leftType: 'empty',
+          rightNum: rightIdx + 1,
+          rightHtml: currentLines[rightIdx] || '',
+          rightType: 'added',
+        });
+        rightIdx++;
+      }
+    }
+  }
+
+  return { rows };
+}
+
 const DEFAULT_WIDTH = 900;
 const DEFAULT_HEIGHT = 600;
 const MIN_WIDTH = 400;
@@ -120,6 +262,9 @@ interface CodeViewerDialogProps {
 
 export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialogProps) {
   const [content, setContent] = useState<string | null>(null);
+  const [originalContent, setOriginalContent] = useState<string | null>(null);
+  const [hasOriginal, setHasOriginal] = useState(false);
+  const [showDiff, setShowDiff] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const codeRef = useRef<HTMLPreElement>(null);
@@ -130,16 +275,20 @@ export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialog
 
   const fileName = filePath ? filePath.replace(/\\/g, '/').split('/').pop() || '' : '';
 
-  // Reset position when a new file is opened
+  // Reset state when a new file is opened
   useEffect(() => {
     if (filePath) {
       setPosition({ x: 0, y: 0 });
+      setShowDiff(false);
     }
   }, [filePath]);
 
+  // Fetch current file content
   useEffect(() => {
     if (!filePath) {
       setContent(null);
+      setOriginalContent(null);
+      setHasOriginal(false);
       return;
     }
 
@@ -147,16 +296,31 @@ export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialog
       setLoading(true);
       setError(null);
       setContent(null);
+      setOriginalContent(null);
+      setHasOriginal(false);
 
       try {
-        const response = await fetch(`/api/file?path=${encodeURIComponent(filePath)}`);
-        const data = await response.json();
+        // Fetch current and original in parallel
+        const [currentRes, originalRes] = await Promise.all([
+          fetch(`/api/file?path=${encodeURIComponent(filePath)}`),
+          fetch(`/api/file/original?path=${encodeURIComponent(filePath)}`),
+        ]);
 
-        if (!response.ok) {
-          throw new Error(data.error || 'Failed to read file');
+        const currentData = await currentRes.json();
+        if (!currentRes.ok) {
+          throw new Error(currentData.error || 'Failed to read file');
         }
+        setContent(currentData.content);
 
-        setContent(data.content);
+        // Original is optional — file might not be in VCS or might be new
+        if (originalRes.ok) {
+          const originalData = await originalRes.json();
+          if (originalData.content !== currentData.content) {
+            setOriginalContent(originalData.content);
+            setHasOriginal(true);
+          }
+          // If original === current, there's no diff to show
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load file');
       } finally {
@@ -170,16 +334,17 @@ export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialog
   // Highlight content using the programmatic API
   const highlightedHtml = useMemo(() => {
     if (content === null) return '';
-    const lang = getLanguage(fileName);
-    if (lang && hljs.getLanguage(lang)) {
-      return hljs.highlight(content, { language: lang }).value;
-    }
-    return hljs.highlightAuto(content).value;
+    return highlightCode(content, fileName);
   }, [content, fileName]);
+
+  // Compute diff rows
+  const diffResult = useMemo(() => {
+    if (!showDiff || originalContent === null || content === null) return null;
+    return buildDiffRows(originalContent, content, fileName);
+  }, [showDiff, originalContent, content, fileName]);
 
   // Drag handlers
   const handleDragStart = useCallback((e: React.PointerEvent) => {
-    // Only drag from the header area itself, not buttons
     if ((e.target as HTMLElement).closest('button')) return;
 
     e.preventDefault();
@@ -259,6 +424,23 @@ export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialog
                   {filePath}
                 </span>
               </DialogPrimitive.Title>
+
+              {/* Diff toggle */}
+              {hasOriginal && (
+                <button
+                  onClick={() => setShowDiff(!showDiff)}
+                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
+                    showDiff
+                      ? 'bg-primary text-primary-foreground'
+                      : 'bg-muted text-muted-foreground hover:text-foreground'
+                  }`}
+                  title="Toggle diff view"
+                >
+                  <GitCompareArrows className="h-3.5 w-3.5" />
+                  Diff
+                </button>
+              )}
+
               <DialogPrimitive.Close className="ring-offset-background focus:ring-ring rounded-xs opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4">
                 <XIcon />
                 <span className="sr-only">Close</span>
@@ -280,7 +462,7 @@ export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialog
                 </div>
               )}
 
-              {content !== null && !loading && (
+              {content !== null && !loading && !showDiff && (
                 <div className="flex text-sm font-mono">
                   {/* Line numbers */}
                   <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0 bg-background">
@@ -299,10 +481,102 @@ export default function CodeViewerDialog({ filePath, onClose }: CodeViewerDialog
                   </div>
                 </div>
               )}
+
+              {content !== null && !loading && showDiff && diffResult && (
+                diffResult.tooLarge ? (
+                  <div className="flex items-center justify-center h-full text-muted-foreground text-sm p-4">
+                    Too many changes to display in diff view
+                  </div>
+                ) : (
+                  <DiffView rows={diffResult.rows} />
+                )
+              )}
             </div>
           </Resizable>
         </DialogPrimitive.Content>
       </DialogPrimitive.Portal>
     </DialogPrimitive.Root>
+  );
+}
+
+// Side-by-side diff rendering
+function DiffView({ rows }: { rows: DiffRow[] }) {
+  const isDark = typeof document !== 'undefined' && document.documentElement.classList.contains('dark');
+
+  const ROW_BG: Record<string, string> = {
+    removed: isDark ? '#582a2b' : '#fce8e8',
+    added: isDark ? '#304f35' : '#e6f6e8',
+    empty: isDark ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.03)',
+    unchanged: 'transparent',
+  };
+
+  return (
+    <div className="flex text-sm font-mono min-w-0">
+      {/* Left side (original) */}
+      <div className="flex flex-1 min-w-0 border-r border-border overflow-x-auto">
+        {/* Line numbers */}
+        <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0 bg-background z-10">
+          {rows.map((row, i) => (
+            <div key={i} className="leading-6" style={{ backgroundColor: ROW_BG[row.leftType] }}>
+              {row.leftNum ?? ' '}
+            </div>
+          ))}
+        </div>
+        {/* Code */}
+        <div className="shrink-0">
+          <div className="py-4 px-4">
+            {rows.map((row, i) => (
+              <div
+                key={i}
+                className="leading-6 whitespace-pre"
+                style={{ backgroundColor: ROW_BG[row.leftType] }}
+              >
+                {row.leftType === 'empty' ? (
+                  <span className="opacity-0">.</span>
+                ) : (
+                  <span
+                    className="hljs"
+                    dangerouslySetInnerHTML={{ __html: row.leftHtml || '&nbsp;' }}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Right side (current) */}
+      <div className="flex flex-1 min-w-0 overflow-x-auto">
+        {/* Line numbers */}
+        <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0 bg-background z-10">
+          {rows.map((row, i) => (
+            <div key={i} className="leading-6" style={{ backgroundColor: ROW_BG[row.rightType] }}>
+              {row.rightNum ?? ' '}
+            </div>
+          ))}
+        </div>
+        {/* Code */}
+        <div className="shrink-0">
+          <div className="py-4 px-4">
+            {rows.map((row, i) => (
+              <div
+                key={i}
+                className="leading-6 whitespace-pre"
+                style={{ backgroundColor: ROW_BG[row.rightType] }}
+              >
+                {row.rightType === 'empty' ? (
+                  <span className="opacity-0">.</span>
+                ) : (
+                  <span
+                    className="hljs"
+                    dangerouslySetInnerHTML={{ __html: row.rightHtml || '&nbsp;' }}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }

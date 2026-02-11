@@ -11,30 +11,34 @@ export interface FileTreeNode {
   children?: FileTreeNode[];
 }
 
-type GitFileStatus = 'M' | 'A' | 'D' | 'R' | '?';
-type GitStatusMap = Record<string, GitFileStatus>;
+type VcsFileStatus = 'M' | 'A' | 'D' | 'R' | '?' | 'C' | '!';
+type VcsStatusMap = Record<string, VcsFileStatus>;
 
-const GIT_STATUS_COLORS: Record<GitFileStatus, string> = {
+const VCS_STATUS_COLORS: Record<VcsFileStatus, string> = {
   'M': 'text-yellow-500',
   'A': 'text-green-500',
   'D': 'text-red-500',
   'R': 'text-blue-500',
   '?': 'text-green-500',
+  'C': 'text-orange-500',
+  '!': 'text-red-500',
 };
 
-const GIT_STATUS_LABELS: Record<GitFileStatus, string> = {
+const VCS_STATUS_LABELS: Record<VcsFileStatus, string> = {
   'M': 'M',
   'A': 'A',
   'D': 'D',
   'R': 'R',
   '?': 'U',
+  'C': 'C',
+  '!': '!',
 };
 
-function GitStatusBadge({ status }: { status?: GitFileStatus }) {
+function VcsStatusBadge({ status }: { status?: VcsFileStatus }) {
   if (!status) return null;
   return (
-    <span className={`ml-auto shrink-0 text-xs font-mono font-semibold ${GIT_STATUS_COLORS[status]}`}>
-      {GIT_STATUS_LABELS[status]}
+    <span className={`ml-auto shrink-0 text-xs font-mono font-semibold ${VCS_STATUS_COLORS[status]}`}>
+      {VCS_STATUS_LABELS[status]}
     </span>
   );
 }
@@ -43,10 +47,10 @@ interface FileTreeItemProps {
   node: FileTreeNode;
   depth: number;
   onFileDoubleClick?: (filePath: string) => void;
-  gitStatus: GitStatusMap | null;
+  fileStatuses: VcsStatusMap | null;
 }
 
-function FileTreeItem({ node, depth, onFileDoubleClick, gitStatus }: FileTreeItemProps) {
+function FileTreeItem({ node, depth, onFileDoubleClick, fileStatuses }: FileTreeItemProps) {
   const [isExpanded, setIsExpanded] = useState(false);
   const isDirectory = node.type === 'directory';
   const hasChildren = isDirectory && node.children && node.children.length > 0;
@@ -63,11 +67,11 @@ function FileTreeItem({ node, depth, onFileDoubleClick, gitStatus }: FileTreeIte
     }
   };
 
-  const fileStatus = !isDirectory && gitStatus ? gitStatus[node.path] : undefined;
+  const fileStatus = !isDirectory && fileStatuses ? fileStatuses[node.path] : undefined;
 
   // Check if a directory contains any changed files
-  const dirHasChanges = isDirectory && gitStatus && hasChildren
-    ? hasChangedDescendant(node, gitStatus)
+  const dirHasChanges = isDirectory && fileStatuses && hasChildren
+    ? hasChangedDescendant(node, fileStatuses)
     : false;
 
   return (
@@ -98,17 +102,17 @@ function FileTreeItem({ node, depth, onFileDoubleClick, gitStatus }: FileTreeIte
         ) : (
           <>
             <div className="w-4" />
-            <File className={`h-4 w-4 ${fileStatus ? GIT_STATUS_COLORS[fileStatus] : 'text-muted-foreground'}`} />
+            <File className={`h-4 w-4 ${fileStatus ? VCS_STATUS_COLORS[fileStatus] : 'text-muted-foreground'}`} />
           </>
         )}
-        <span className={`truncate ${fileStatus ? GIT_STATUS_COLORS[fileStatus] : ''}`}>{node.name}</span>
-        <GitStatusBadge status={fileStatus} />
+        <span className={`truncate ${fileStatus ? VCS_STATUS_COLORS[fileStatus] : ''}`}>{node.name}</span>
+        <VcsStatusBadge status={fileStatus} />
       </div>
 
       {isDirectory && isExpanded && hasChildren && (
         <div>
           {node.children!.map((child) => (
-            <FileTreeItem key={child.path} node={child} depth={depth + 1} onFileDoubleClick={onFileDoubleClick} gitStatus={gitStatus} />
+            <FileTreeItem key={child.path} node={child} depth={depth + 1} onFileDoubleClick={onFileDoubleClick} fileStatuses={fileStatuses} />
           ))}
         </div>
       )}
@@ -116,11 +120,11 @@ function FileTreeItem({ node, depth, onFileDoubleClick, gitStatus }: FileTreeIte
   );
 }
 
-function hasChangedDescendant(node: FileTreeNode, gitStatus: GitStatusMap): boolean {
+function hasChangedDescendant(node: FileTreeNode, fileStatuses: VcsStatusMap): boolean {
   if (!node.children) return false;
   for (const child of node.children) {
-    if (child.type === 'file' && gitStatus[child.path]) return true;
-    if (child.type === 'directory' && hasChangedDescendant(child, gitStatus)) return true;
+    if (child.type === 'file' && fileStatuses[child.path]) return true;
+    if (child.type === 'directory' && hasChangedDescendant(child, fileStatuses)) return true;
   }
   return false;
 }
@@ -145,7 +149,7 @@ interface FileTreeProps {
 
 export default function FileTree({ projectPath, onFileDoubleClick }: FileTreeProps) {
   const [tree, setTree] = useState<FileTreeNode[]>([]);
-  const [gitStatus, setGitStatus] = useState<GitStatusMap | null>(null);
+  const [fileStatuses, setFileStatuses] = useState<VcsStatusMap | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
@@ -165,7 +169,7 @@ export default function FileTree({ projectPath, onFileDoubleClick }: FileTreePro
       }
 
       setTree(data.tree);
-      setGitStatus(data.gitStatus || null);
+      setFileStatuses(data.fileStatuses || null);
     } catch (err) {
       console.error('Error fetching file tree:', err);
       setError(err instanceof Error ? err.message : 'Failed to load directory tree');
@@ -179,7 +183,7 @@ export default function FileTree({ projectPath, onFileDoubleClick }: FileTreePro
     initialLoadDone.current = false;
     if (!projectPath) {
       setTree([]);
-      setGitStatus(null);
+      setFileStatuses(null);
       return;
     }
 
@@ -291,19 +295,19 @@ export default function FileTree({ projectPath, onFileDoubleClick }: FileTreePro
               </div>
             ) : (
               filteredFiles.map((file) => {
-                const fileStatus = gitStatus ? gitStatus[file.path] : undefined;
+                const fileStatus = fileStatuses ? fileStatuses[file.path] : undefined;
                 return (
                   <div
                     key={file.path}
                     className="flex items-center gap-2 px-3 py-1 cursor-pointer hover:bg-accent rounded-sm text-sm transition-colors"
                     onDoubleClick={() => onFileDoubleClick?.(file.path)}
                   >
-                    <File className={`h-4 w-4 shrink-0 ${fileStatus ? GIT_STATUS_COLORS[fileStatus] : 'text-muted-foreground'}`} />
-                    <span className={`truncate ${fileStatus ? GIT_STATUS_COLORS[fileStatus] : ''}`}>{file.name}</span>
+                    <File className={`h-4 w-4 shrink-0 ${fileStatus ? VCS_STATUS_COLORS[fileStatus] : 'text-muted-foreground'}`} />
+                    <span className={`truncate ${fileStatus ? VCS_STATUS_COLORS[fileStatus] : ''}`}>{file.name}</span>
                     <span className="text-xs text-muted-foreground/60 truncate ml-auto">
                       {file.path.replace(/\\/g, '/').split('/').slice(-2, -1)[0]}
                     </span>
-                    <GitStatusBadge status={fileStatus} />
+                    <VcsStatusBadge status={fileStatus} />
                   </div>
                 );
               })
@@ -312,7 +316,7 @@ export default function FileTree({ projectPath, onFileDoubleClick }: FileTreePro
         ) : (
           <div className="py-2">
             {tree.map((node) => (
-              <FileTreeItem key={node.path} node={node} depth={0} onFileDoubleClick={onFileDoubleClick} gitStatus={gitStatus} />
+              <FileTreeItem key={node.path} node={node} depth={0} onFileDoubleClick={onFileDoubleClick} fileStatuses={fileStatuses} />
             ))}
           </div>
         )}

@@ -15,6 +15,7 @@ const IGNORED_ITEMS = new Set([
   'node_modules',
   '.next',
   '.git',
+  '.svn',
   'dist',
   'build',
   'out',
@@ -73,19 +74,41 @@ async function buildFileTree(dirPath: string, maxDepth: number = 5, currentDepth
   }
 }
 
-// Git status codes: M=modified, A=added, D=deleted, R=renamed, ?=untracked
-type GitFileStatus = 'M' | 'A' | 'D' | 'R' | '?';
+// VCS status codes: M=modified, A=added, D=deleted, R=renamed, ?=untracked, C=conflict, !=missing
+type VcsFileStatus = 'M' | 'A' | 'D' | 'R' | '?' | 'C' | '!';
+type VcsType = 'git' | 'svn';
 
-async function getGitStatus(dirPath: string): Promise<Record<string, GitFileStatus> | null> {
+interface VcsResult {
+  vcs: VcsType;
+  statuses: Record<string, VcsFileStatus>;
+}
+
+async function detectVcs(dirPath: string): Promise<VcsType | null> {
+  // Check for .git first (more common), then .svn
+  try {
+    await fs.stat(path.join(dirPath, '.git'));
+    return 'git';
+  } catch {
+    // Not git
+  }
+  try {
+    await fs.stat(path.join(dirPath, '.svn'));
+    return 'svn';
+  } catch {
+    // Not svn
+  }
+  return null;
+}
+
+async function getGitStatus(dirPath: string): Promise<Record<string, VcsFileStatus>> {
   return new Promise((resolve) => {
     execFile('git', ['status', '--porcelain', '-uall'], { cwd: dirPath, maxBuffer: 1024 * 1024 }, (err, stdout) => {
       if (err) {
-        // Not a git repo or git not available
-        resolve(null);
+        resolve({});
         return;
       }
 
-      const statuses: Record<string, GitFileStatus> = {};
+      const statuses: Record<string, VcsFileStatus> = {};
       const lines = stdout.trim().split('\n').filter(Boolean);
 
       for (const line of lines) {
@@ -126,6 +149,53 @@ async function getGitStatus(dirPath: string): Promise<Record<string, GitFileStat
   });
 }
 
+async function getSvnStatus(dirPath: string): Promise<Record<string, VcsFileStatus>> {
+  return new Promise((resolve) => {
+    execFile('svn', ['status'], { cwd: dirPath, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+      if (err) {
+        resolve({});
+        return;
+      }
+
+      const statuses: Record<string, VcsFileStatus> = {};
+      const lines = stdout.trim().split('\n').filter(Boolean);
+
+      for (const line of lines) {
+        // SVN status format: "X       filename"
+        // First column is the status character
+        const statusChar = line[0];
+        const filePath = line.slice(8).trim();
+        if (!filePath) continue;
+
+        const absPath = path.join(dirPath, filePath);
+
+        switch (statusChar) {
+          case 'M': statuses[absPath] = 'M'; break;
+          case 'A': statuses[absPath] = 'A'; break;
+          case 'D': statuses[absPath] = 'D'; break;
+          case '?': statuses[absPath] = '?'; break;
+          case '!': statuses[absPath] = '!'; break;
+          case 'C': statuses[absPath] = 'C'; break;
+          case 'R': statuses[absPath] = 'R'; break;
+        }
+      }
+
+      resolve(statuses);
+    });
+  });
+}
+
+async function getVcsStatus(dirPath: string): Promise<VcsResult | null> {
+  const vcs = await detectVcs(dirPath);
+  if (!vcs) return null;
+
+  const statuses = vcs === 'git'
+    ? await getGitStatus(dirPath)
+    : await getSvnStatus(dirPath);
+
+  return { vcs, statuses };
+}
+
 export async function GET(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
@@ -154,16 +224,17 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const [tree, gitStatus] = await Promise.all([
+    const [tree, vcsResult] = await Promise.all([
       buildFileTree(dirPath),
-      getGitStatus(dirPath),
+      getVcsStatus(dirPath),
     ]);
 
     return NextResponse.json({
       success: true,
       tree,
       root: dirPath,
-      gitStatus,
+      vcs: vcsResult?.vcs || null,
+      fileStatuses: vcsResult?.statuses || null,
     });
   } catch (error) {
     console.error('Error in /api/tree:', error);
