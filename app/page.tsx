@@ -461,6 +461,23 @@ export default function Home() {
         setTranscriptPartial(!!data.partial);
       }
       setHistoryTranscript(transcriptMessages);
+
+      // Check if this session has an active stream buffer (e.g. the user
+      // switched away while it was processing). If so, restore stream state.
+      try {
+        const bufRes = await fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(sessionId)}`);
+        if (bufRes.ok) {
+          const bufData = await bufRes.json();
+          if (bufData.hasBuffer) {
+            setTranscriptOverlayMessages([{ role: 'user' as const, content: bufData.userPrompt }]);
+            setTranscriptStreaming(bufData.accumulatedText || '');
+            setStreamEvents(bufData.events || []);
+            setTranscriptLoading(bufData.isActive);
+          }
+        }
+      } catch {
+        // Buffer fetch is best-effort; transcript is already loaded
+      }
     } catch (error) {
       console.error('Failed to fetch transcript:', error);
       setHistoryTranscript([]);
@@ -526,6 +543,56 @@ export default function Home() {
     const interval = setInterval(refreshTranscript, 5000);
     return () => clearInterval(interval);
   }, [viewingTranscriptId, historyTranscriptProject, liveSessionIds, transcriptLoading]);
+
+  // Poll stream buffer for sessions where we're showing a loading state but
+  // have no active SSE reader (i.e. the user switched away and back).
+  useEffect(() => {
+    if (!viewingTranscriptId || !transcriptLoading || transcriptAbortRef.current) return;
+
+    const pollBuffer = async () => {
+      try {
+        const res = await fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(viewingTranscriptId!)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+
+        // Guard: user may have switched away during the fetch
+        if (activeSessionRef.current !== viewingTranscriptId) return;
+
+        if (!data.hasBuffer || !data.isActive) {
+          // Stream finished — refresh from JSONL
+          setTranscriptLoading(false);
+          setTranscriptStreaming('');
+          try {
+            const refreshRes = await fetch(
+              `/api/transcript?sessionId=${encodeURIComponent(viewingTranscriptId!)}&project=${encodeURIComponent(historyTranscriptProject || '')}`
+            );
+            if (refreshRes.ok) {
+              const refreshData = await refreshRes.json();
+              if (refreshData.messages && activeSessionRef.current === viewingTranscriptId) {
+                setHistoryTranscript(refreshData.messages);
+                setTranscriptOverlayMessages([]);
+                setOverlayInsertPoint(null);
+              }
+            }
+          } catch {
+            // Will pick up on next auto-refresh
+          }
+          return;
+        }
+
+        // Still active — update stream state
+        setTranscriptStreaming(data.accumulatedText || '');
+        setStreamEvents(data.events || []);
+      } catch {
+        // Network error — will retry on next poll
+      }
+    };
+
+    // Poll immediately, then every 1 second
+    pollBuffer();
+    const interval = setInterval(pollBuffer, 1000);
+    return () => clearInterval(interval);
+  }, [viewingTranscriptId, transcriptLoading, historyTranscriptProject]);
 
   // Load workflows and compute recent directories
   useEffect(() => {

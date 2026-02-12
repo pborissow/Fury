@@ -26,6 +26,23 @@ function sessionJsonlExists(sessionId: string, projectPath: string): boolean {
   return existsSync(jsonlPath);
 }
 
+export interface StreamBufferEvent {
+  type: 'tool_start' | 'tool_complete' | 'tool_result' | 'text' | 'error';
+  name?: string;
+  input?: any;
+  preview?: string;
+  content?: string;
+  ts: number;
+}
+
+export interface StreamBuffer {
+  userPrompt: string;
+  accumulatedText: string;
+  events: StreamBufferEvent[];
+  isActive: boolean;
+  startedAt: number;
+}
+
 interface SessionInfo {
   sessionId: string;
   isProcessing: boolean;
@@ -35,6 +52,7 @@ interface SessionInfo {
   lastActivity: number; // Timestamp of last activity
   startedAt?: number; // When current process started
   stuckCheckInterval?: NodeJS.Timeout; // Interval for checking if stuck
+  streamBuffer?: StreamBuffer;
 }
 
 interface SessionHealth {
@@ -120,6 +138,16 @@ class SessionManager {
 
     const message = session.queue.shift()!;
 
+    // Initialize stream buffer so the frontend can restore state if the user
+    // switches away and back while this message is being processed.
+    session.streamBuffer = {
+      userPrompt: message.prompt,
+      accumulatedText: '',
+      events: [],
+      isActive: true,
+      startedAt: Date.now(),
+    };
+
     console.log(`[SessionManager] Processing message from queue. Remaining: ${session.queue.length}`);
 
     try {
@@ -136,6 +164,7 @@ class SessionManager {
       message.reject(error as Error);
     } finally {
       session.currentProcess = null;
+      session.streamBuffer = undefined;
 
       console.log(`[SessionManager] Finished processing. Queue length: ${session.queue.length}`);
 
@@ -180,6 +209,25 @@ class SessionManager {
             isClosed = true;
           }
         }
+      };
+
+      const buf = session.streamBuffer;
+
+      const bufferText = (text: string) => {
+        if (!buf) return;
+        buf.accumulatedText += text;
+        // Coalesce consecutive text events
+        const last = buf.events[buf.events.length - 1];
+        if (last && last.type === 'text') {
+          last.content = (last.content || '') + text;
+        } else {
+          buf.events.push({ type: 'text', content: text, ts: Date.now() });
+        }
+      };
+
+      const bufferEvent = (evt: StreamBufferEvent) => {
+        if (!buf) return;
+        buf.events.push(evt);
       };
 
       try {
@@ -267,6 +315,7 @@ class SessionManager {
                   if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
                     const text = event.delta.text;
                     assistantResponse += text; // Accumulate response
+                    bufferText(text);
                     const chunk = encoder.encode(`data: ${JSON.stringify({ text })}\n\n`);
                     safeEnqueue(chunk);
                   }
@@ -275,6 +324,7 @@ class SessionManager {
                     if (event.content_block?.type === 'text' && event.index !== lastTextBlockIndex && lastTextBlockIndex !== -1) {
                       // New text block starting - add a separator
                       assistantResponse += '\n\n'; // Accumulate separator
+                      bufferText('\n\n');
                       const chunk = encoder.encode(`data: ${JSON.stringify({ text: '\n\n' })}\n\n`);
                       safeEnqueue(chunk);
                     }
@@ -284,6 +334,7 @@ class SessionManager {
                     // Handle tool use start
                     else if (event.content_block?.type === 'tool_use') {
                       const toolName = event.content_block.name;
+                      bufferEvent({ type: 'tool_start', name: toolName, ts: Date.now() });
                       const chunk = encoder.encode(`data: ${JSON.stringify({ tool_use: { name: toolName, status: 'starting' } })}\n\n`);
                       safeEnqueue(chunk);
                     }
@@ -297,15 +348,18 @@ class SessionManager {
                       // Add separator between text blocks if this isn't the first one
                       if (i > 0 && json.message.content[i - 1]?.type === 'text') {
                         assistantResponse += '\n\n'; // Accumulate separator
+                        bufferText('\n\n');
                         const separator = encoder.encode(`data: ${JSON.stringify({ text: '\n\n' })}\n\n`);
                         safeEnqueue(separator);
                       }
                       assistantResponse += block.text; // Accumulate response
+                      bufferText(block.text);
                       const chunk = encoder.encode(`data: ${JSON.stringify({ text: block.text })}\n\n`);
                       safeEnqueue(chunk);
                     }
                     // Handle tool use in complete message
                     else if (block.type === 'tool_use') {
+                      bufferEvent({ type: 'tool_complete', name: block.name, input: block.input, ts: Date.now() });
                       const chunk = encoder.encode(`data: ${JSON.stringify({ tool_use: { name: block.name, input: block.input, status: 'complete' } })}\n\n`);
                       safeEnqueue(chunk);
                     }
@@ -318,6 +372,7 @@ class SessionManager {
                       const resultPreview = typeof block.content === 'string'
                         ? block.content.substring(0, 100) + (block.content.length > 100 ? '...' : '')
                         : JSON.stringify(block.content).substring(0, 100);
+                      bufferEvent({ type: 'tool_result', preview: resultPreview, ts: Date.now() });
                       const chunk = encoder.encode(`data: ${JSON.stringify({ tool_result: { preview: resultPreview } })}\n\n`);
                       safeEnqueue(chunk);
                     }
@@ -343,7 +398,11 @@ class SessionManager {
           // Clear start time when process ends
           session.startedAt = undefined;
           session.lastActivity = Date.now();
+          if (session.streamBuffer) {
+            session.streamBuffer.isActive = false;
+          }
           if (code !== 0 && !isClosed) {
+            bufferEvent({ type: 'error', content: `Claude CLI exited with code ${code}`, ts: Date.now() });
             const chunk = encoder.encode(
               `data: ${JSON.stringify({ error: `Claude CLI exited with code ${code}` })}\n\n`
             );
@@ -424,14 +483,21 @@ class SessionManager {
     };
   }
 
+  getStreamBuffer(sessionId: string): StreamBuffer | null {
+    return this.sessions.get(sessionId)?.streamBuffer ?? null;
+  }
+
   killSession(sessionId: string): void {
     const session = this.sessions.get(sessionId);
-    if (session?.currentProcess) {
-      session.currentProcess.kill();
-      session.currentProcess = null;
-    }
-    if (session?.stuckCheckInterval) {
-      clearInterval(session.stuckCheckInterval);
+    if (session) {
+      session.streamBuffer = undefined;
+      if (session.currentProcess) {
+        session.currentProcess.kill();
+        session.currentProcess = null;
+      }
+      if (session.stuckCheckInterval) {
+        clearInterval(session.stuckCheckInterval);
+      }
     }
     this.sessions.delete(sessionId);
   }
