@@ -259,10 +259,15 @@ class SessionManager {
           console.log(`[SessionManager] Working directory: ${session.projectPath}`);
         }
 
-        // Pass prompt via stdin to avoid OS command-line length limits
+        // Pass prompt via stdin to avoid OS command-line length limits.
+        // Strip CLAUDECODE env var so the child process doesn't think it's
+        // nested inside another Claude Code session (which would cause it to
+        // refuse to start).
+        const { CLAUDECODE, ...cleanEnv } = process.env;
         const claude = spawn('claude', args, {
           stdio: ['pipe', 'pipe', 'pipe'],
           cwd,
+          env: cleanEnv,
         });
 
         // Write prompt to stdin and close it so claude reads it
