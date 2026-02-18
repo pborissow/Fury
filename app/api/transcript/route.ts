@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { realpath } from 'fs/promises';
 import { projectPathToSlug } from '@/lib/utils';
 
 export const runtime = 'nodejs';
@@ -84,22 +85,52 @@ export async function GET(request: NextRequest) {
     // Sanitize sessionId to prevent path traversal
     const sanitizedSessionId = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
 
+    const projectsBase = join(homedir(), '.claude', 'projects');
     const slug = projectPathToSlug(project);
-    const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sanitizedSessionId}.jsonl`);
+    const jsonlPath = join(projectsBase, slug, `${sanitizedSessionId}.jsonl`);
 
     let content: string;
     try {
       content = await fs.readFile(jsonlPath, 'utf-8');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        // No JSONL transcript file — fall back to user prompts from history.jsonl
-        const historyMessages = await getHistoryPrompts(sanitizedSessionId);
-        return NextResponse.json({
-          messages: historyMessages,
-          partial: true,
-        });
+        // The project path may be a symlink or mapped drive that resolves to a
+        // different real path. Try the resolved path before giving up.
+        try {
+          const resolvedProject = await realpath(project);
+          if (resolvedProject !== project) {
+            const altSlug = projectPathToSlug(resolvedProject);
+            if (altSlug !== slug) {
+              const altPath = join(projectsBase, altSlug, `${sanitizedSessionId}.jsonl`);
+              content = await fs.readFile(altPath, 'utf-8');
+            } else {
+              throw error; // same slug, won't help
+            }
+          } else {
+            // realpath didn't change it — try scanning project dirs for the file
+            const dirs = await fs.readdir(projectsBase);
+            let found = false;
+            for (const dir of dirs) {
+              try {
+                const candidate = join(projectsBase, dir, `${sanitizedSessionId}.jsonl`);
+                content = await fs.readFile(candidate, 'utf-8');
+                found = true;
+                break;
+              } catch { /* try next */ }
+            }
+            if (!found) throw error;
+          }
+        } catch {
+          // All attempts failed — fall back to user prompts from history.jsonl
+          const historyMessages = await getHistoryPrompts(sanitizedSessionId);
+          return NextResponse.json({
+            messages: historyMessages,
+            partial: true,
+          });
+        }
+      } else {
+        throw error;
       }
-      throw error;
     }
 
     const messages: TranscriptMessage[] = [];
