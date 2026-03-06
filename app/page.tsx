@@ -196,6 +196,9 @@ export default function Home() {
   const [streamEvents, setStreamEvents] = useState<StreamEvent[]>([]);
   const streamEndRef = useRef<HTMLDivElement>(null);
 
+  // Smart prompt suggestion for incomplete responses
+  const [suggestedPrompt, setSuggestedPrompt] = useState<{ text: string; context: string } | null>(null);
+
   // Right panel view state
   type RightPanelView = 'files' | 'notes' | 'stream';
   const [rightPanelView, setRightPanelView] = useState<RightPanelView>('stream');
@@ -448,6 +451,7 @@ export default function Home() {
     setStreamEvents([]);
     setTranscriptLoading(false);
     setTranscriptPartial(false);
+    setSuggestedPrompt(null);
 
     // Restore draft for the target session (or clear)
     const savedDraft = sessionDraftsRef.current.get(sessionId) || '';
@@ -459,6 +463,14 @@ export default function Home() {
         const data = await res.json();
         transcriptMessages = data.messages || [];
         setTranscriptPartial(!!data.partial);
+        setSuggestedPrompt(data.suggestedPrompt || null);
+
+        // If the API found a prompt that was sent but never processed
+        // (e.g. Claude was interrupted), pre-fill the editor so the user
+        // can review and re-send it.
+        if (data.unprocessedPrompt) {
+          setTimeout(() => chatEditorRef.current?.setContent(data.unprocessedPrompt), 100);
+        }
       }
       setHistoryTranscript(transcriptMessages);
 
@@ -842,6 +854,7 @@ export default function Home() {
     setTranscriptLoading(true);
     setTranscriptStreaming('');
     setStreamEvents([]);
+    setSuggestedPrompt(null);
 
     // Scroll to bottom after loading indicator renders so bouncing dots are visible
     setTimeout(() => scrollTranscriptToBottom(), 150);
@@ -1548,6 +1561,20 @@ export default function Home() {
                           </div>
                         )}
 
+                        {/* Smart continuation suggestion for incomplete responses */}
+                        {suggestedPrompt && !transcriptLoading && (
+                          <div className="flex justify-start">
+                            <button
+                              onClick={() => chatEditorRef.current?.setContent(suggestedPrompt.text)}
+                              className="max-w-[80%] rounded-lg px-4 py-2 bg-muted border border-amber-600/40 text-sm hover:border-amber-500 transition-colors text-left"
+                              title="Click to fill editor with this prompt"
+                            >
+                              <div className="text-xs text-amber-500 mb-1">{suggestedPrompt.context}</div>
+                              <div className="text-foreground">{suggestedPrompt.text}</div>
+                            </button>
+                          </div>
+                        )}
+
                         <div ref={transcriptEndRef} />
                       </>
                     )}
@@ -1649,11 +1676,24 @@ export default function Home() {
                   )}
                   {streamEvents.map((evt, i) => {
                     if (evt.type === 'tool_start') {
+                      // Check if a matching tool_complete follows — if so, skip this
+                      // start event since the complete event shows all the details.
+                      const hasComplete = streamEvents.slice(i + 1).some(
+                        e => e.type === 'tool_complete' && e.name === evt.name
+                      );
+                      if (hasComplete) return null;
+                      // Unresolved tool_start — show as active if streaming, muted if not
                       return (
                         <div key={i} className="px-3 py-1.5 border-b border-border/50 flex items-center gap-2">
-                          <span className="text-yellow-500">{'▶'}</span>
-                          <span className="text-primary font-semibold">{evt.name}</span>
-                          <span className="text-muted-foreground">starting...</span>
+                          {transcriptLoading ? (
+                            <span className="text-yellow-500 animate-pulse">{'▶'}</span>
+                          ) : (
+                            <span className="text-muted-foreground">{'▶'}</span>
+                          )}
+                          <span className={transcriptLoading ? "text-primary font-semibold" : "text-muted-foreground font-semibold"}>{evt.name}</span>
+                          {transcriptLoading && (
+                            <span className="text-muted-foreground animate-pulse">running...</span>
+                          )}
                         </div>
                       );
                     }

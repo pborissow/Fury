@@ -13,10 +13,76 @@ interface TranscriptMessage {
   timestamp: string;
 }
 
-/**
- * Check if a user message content string is internal/meta and should be skipped.
- * This covers XML system tags and Claude CLI slash commands.
- */
+// How long (ms) since the JSONL was last modified before we consider
+// the response "stale" and eligible for an incomplete-response suggestion.
+// Claude API delays and conversation compaction can cause gaps of 1+ min.
+const STALE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
+
+interface SuggestedPrompt {
+  text: string;
+  context: string;
+}
+
+function generateToolSuggestion(toolName: string, input: any): string {
+  const fileName = input?.file_path?.split(/[/\\]/).pop();
+  switch (toolName) {
+    case 'Edit':
+      return `Please continue — you were about to edit ${fileName || 'a file'}.`;
+    case 'Write':
+      return `Please continue — you were about to create ${fileName || 'a file'}.`;
+    case 'Read':
+      return `Please continue — you were about to read ${fileName || 'a file'}.`;
+    case 'Bash': {
+      const cmd = input?.command;
+      const preview = cmd
+        ? ` (${cmd.length > 40 ? cmd.substring(0, 40) + '...' : cmd})`
+        : '';
+      return `Please continue — you were about to run a command${preview}.`;
+    }
+    case 'Glob':
+    case 'Grep':
+      return `Please continue — you were about to search the codebase.`;
+    default:
+      return `Please continue — you were about to use the ${toolName} tool.`;
+  }
+}
+
+function detectIntentLanguage(text: string): string | null {
+  // Only look at the LAST paragraph — intent phrases deeper in the text
+  // (e.g. "First null check" in a bullet list) are normal prose, not
+  // signals that the response was interrupted.
+  const paragraphs = text.split(/\n\n/);
+  const lastPara = (paragraphs[paragraphs.length - 1] || '').trim();
+  if (!lastPara) return null;
+
+  // Intent phrases that signal Claude was about to do something.
+  // "Now" + modal (I'll, let me, etc.) is a strong signal.
+  // "Now" + bare verb is allowed but we exclude "Now" followed by
+  // articles/pronouns/determiners which indicate explanatory prose
+  // (e.g. "Now the service handles…" vs "Now slim down the method").
+  // "First" / "Next" ALWAYS require a modal — they appear too often in content.
+  const intentPattern =
+    /(?:^|\n)(?:Now (?:I'll |I will |let me |let's |(?!the |this |that |it |we |they |there |here |our |my |your |its |a |an |is |was |are |has |have |had ))|Let me (?:now )?|Next,? (?:I'll |I will |let me )|I'll (?:now )?|First,? (?:I'll |let me ))(.{10,120}?)(?:\.|$)/im;
+  const match = lastPara.match(intentPattern);
+  if (match) {
+    const intent = match[1].trim().replace(/\.$/, '');
+    return `Please continue — ${intent}.`;
+  }
+
+  // Check if text ends mid-sentence.  Only flag when it clearly looks
+  // truncated — e.g. trailing comma, conjunction, article, or preposition.
+  // Markdown lists / code blocks commonly end without terminal punctuation
+  // and should NOT be flagged.
+  if (
+    lastPara.length > 50 &&
+    /(?:,|:|\band\b|\bor\b|\bbut\b|\bthe\b|\ba\b|\ban\b|\bto\b|\bfor\b|\bin\b|\bof\b|\bwith\b|\bthat\b|\bwhich\b|\bwhere\b|\bwhen\b)\s*$/i.test(lastPara)
+  ) {
+    return 'Please continue — your response appears to have been cut short.';
+  }
+
+  return null;
+}
+
 function isInternalContent(content: string): boolean {
   const trimmed = content.trim();
   if (trimmed === '') return true;
@@ -90,6 +156,7 @@ export async function GET(request: NextRequest) {
     const jsonlPath = join(projectsBase, slug, `${sanitizedSessionId}.jsonl`);
 
     let content: string;
+    let resolvedJsonlPath = jsonlPath;
     try {
       content = await fs.readFile(jsonlPath, 'utf-8');
     } catch (error) {
@@ -103,6 +170,7 @@ export async function GET(request: NextRequest) {
             if (altSlug !== slug) {
               const altPath = join(projectsBase, altSlug, `${sanitizedSessionId}.jsonl`);
               content = await fs.readFile(altPath, 'utf-8');
+              resolvedJsonlPath = altPath;
             } else {
               throw error; // same slug, won't help
             }
@@ -114,6 +182,7 @@ export async function GET(request: NextRequest) {
               try {
                 const candidate = join(projectsBase, dir, `${sanitizedSessionId}.jsonl`);
                 content = await fs.readFile(candidate, 'utf-8');
+                resolvedJsonlPath = candidate;
                 found = true;
                 break;
               } catch { /* try next */ }
@@ -134,6 +203,9 @@ export async function GET(request: NextRequest) {
     }
 
     const messages: TranscriptMessage[] = [];
+    // Also collect raw entries for incomplete-response detection.
+    // We need the full content arrays (including tool_use blocks).
+    const rawEntries: any[] = [];
     const lines = content.split('\n').filter(line => line.trim());
 
     // Buffer the latest assistant message per turn.
@@ -145,6 +217,7 @@ export async function GET(request: NextRequest) {
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
+        rawEntries.push(entry);
 
         // Skip non-message types
         if (entry.type !== 'user' && entry.type !== 'assistant') continue;
@@ -206,7 +279,95 @@ export async function GET(request: NextRequest) {
       messages.push(pendingAssistant);
     }
 
-    return NextResponse.json({ messages });
+    // --- Unprocessed prompts detection ---
+    // history.jsonl entries are written the instant the user hits send,
+    // but the JSONL transcript only contains messages that Claude actually
+    // processed.  If Claude was interrupted (or the process never started),
+    // trailing history prompts won't appear in the JSONL.  Return them
+    // separately so the frontend can pre-fill the editor for re-sending.
+    //
+    // We can't compare counts because the JSONL may contain auto-injected
+    // user messages (e.g. "This session is being continued...") that never
+    // appear in history.jsonl.  Instead, match by content prefix.
+    let unprocessedPrompt: string | undefined;
+    const historyPrompts = await getHistoryPrompts(sanitizedSessionId);
+    if (historyPrompts.length > 0) {
+      const jsonlUserPrefixes = new Set(
+        messages
+          .filter(m => m.role === 'user')
+          .map(m => m.content.substring(0, 150))
+      );
+
+      // Walk backwards from the end of history to find the contiguous
+      // block of trailing prompts that have no match in the JSONL.
+      // Use the last one as the prompt to pre-fill in the editor.
+      for (let i = historyPrompts.length - 1; i >= 0; i--) {
+        const prefix = historyPrompts[i].content.substring(0, 150);
+        if (!jsonlUserPrefixes.has(prefix)) {
+          unprocessedPrompt = historyPrompts[i].content;
+        } else {
+          break;
+        }
+      }
+    }
+
+    // --- Incomplete response detection ---
+    let suggestedPrompt: SuggestedPrompt | undefined;
+
+    const lastMsg = messages[messages.length - 1];
+    if (lastMsg?.role === 'assistant') {
+      // Time gate: only suggest if the JSONL hasn't been modified recently.
+      // Claude API delays and conversation compaction can cause gaps of 1+ min.
+      try {
+        const fileStat = await fs.stat(resolvedJsonlPath);
+        const age = Date.now() - fileStat.mtimeMs;
+
+        if (age >= STALE_THRESHOLD_MS) {
+          // Find the last raw assistant entry with a content array
+          const lastAssistant = [...rawEntries]
+            .reverse()
+            .find(e => e.type === 'assistant' && Array.isArray(e.message?.content));
+
+          if (lastAssistant) {
+            const contentBlocks = lastAssistant.message.content;
+            const lastBlock = contentBlocks[contentBlocks.length - 1];
+
+            // Case 1: unresolved tool_use (no matching tool_result)
+            if (lastBlock?.type === 'tool_use') {
+              const toolUseId = lastBlock.id;
+              const hasResult = rawEntries.some(e =>
+                e.type === 'user' &&
+                Array.isArray(e.message?.content) &&
+                e.message.content.some(
+                  (b: any) => b.type === 'tool_result' && b.tool_use_id === toolUseId
+                )
+              );
+              if (!hasResult) {
+                suggestedPrompt = {
+                  context: 'Interrupted',
+                  text: generateToolSuggestion(lastBlock.name, lastBlock.input),
+                };
+              }
+            }
+
+            // Case 2: trailing intent language with no tool_use follow-through
+            if (!suggestedPrompt && lastBlock?.type === 'text') {
+              const suggestion = detectIntentLanguage(lastBlock.text);
+              if (suggestion) {
+                suggestedPrompt = {
+                  context: 'Incomplete response',
+                  text: suggestion,
+                };
+              }
+            }
+          }
+        }
+      } catch {
+        // stat failed — skip suggestion
+      }
+    }
+
+    return NextResponse.json({ messages, suggestedPrompt, unprocessedPrompt });
   } catch (error) {
     console.error('[Transcript API] Error:', error);
     return NextResponse.json(
