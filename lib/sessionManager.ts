@@ -439,15 +439,19 @@ class SessionManager {
           console.error('Claude CLI error:', errorMessage);
         });
 
-        // Close stream when process ends
-        claude.on('close', async (code) => {
+        // Use 'exit' instead of 'close' for process lifecycle management.
+        // 'close' waits for all stdio pipes to close, which may never happen
+        // if Claude spawned subprocesses (e.g. Bash tool running mvn/npm) that
+        // inherited the pipe handles and outlive the main process.
+        // 'exit' fires as soon as the process itself exits.
+        claude.on('exit', (code) => {
           // Clear start time when process ends
           session.startedAt = undefined;
           session.lastActivity = Date.now();
           if (session.streamBuffer) {
             session.streamBuffer.isActive = false;
           }
-          if (code !== 0 && !isClosed) {
+          if (code !== 0 && code !== null && !isClosed) {
             bufferEvent({ type: 'error', content: `Claude CLI exited with code ${code}`, ts: Date.now() });
             const chunk = encoder.encode(
               `data: ${JSON.stringify({ error: `Claude CLI exited with code ${code}` })}\n\n`
@@ -549,5 +553,16 @@ class SessionManager {
   }
 }
 
-// Singleton instance
-export const sessionManager = new SessionManager();
+// Persist the singleton across Next.js HMR reloads in dev mode.
+// Without this, every hot-module replacement creates a new SessionManager,
+// orphaning any running Claude CLI processes and losing queue state.
+const globalForSessionManager = globalThis as unknown as {
+  __sessionManager: SessionManager | undefined;
+};
+
+export const sessionManager =
+  globalForSessionManager.__sessionManager ?? new SessionManager();
+
+if (process.env.NODE_ENV !== 'production') {
+  globalForSessionManager.__sessionManager = sessionManager;
+}
