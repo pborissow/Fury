@@ -180,11 +180,16 @@ export default function Home() {
   // Health check state
   const [isStuck, setIsStuck] = useState(false);
   const [stuckReason, setStuckReason] = useState<string | undefined>();
-  const healthCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [liveSessionIds, setLiveSessionIds] = useState<Set<string>>(new Set());
+
+  // New sessions that haven't been submitted yet — persisted in the sidebar so
+  // the user can switch away and come back without losing them.
+  const [pendingNewSessions, setPendingNewSessions] = useState<
+    { sessionId: string; project: string; title: string; createdAt: number }[]
+  >([]);
 
   // Stream events for the right-panel Stream tab
   type StreamEvent =
@@ -252,7 +257,8 @@ export default function Home() {
   const [transcriptOverlayMessages, setTranscriptOverlayMessages] = useState<Message[]>([]);
   const [transcriptStreaming, setTranscriptStreaming] = useState('');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
-  const transcriptAbortRef = useRef<AbortController | null>(null);
+  const transcriptLoadingRef = useRef(false);
+  const transcriptStreamingRef = useRef('');
   const activeSessionRef = useRef<string | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const chatEditorRef = useRef<RichTextEditorHandle>(null);
@@ -407,6 +413,15 @@ export default function Home() {
     activeSessionRef.current = viewingTranscriptId;
   }, [viewingTranscriptId]);
 
+  // Keep refs in sync so SSE event handlers always see the current value
+  useEffect(() => {
+    transcriptLoadingRef.current = transcriptLoading;
+  }, [transcriptLoading]);
+
+  useEffect(() => {
+    transcriptStreamingRef.current = transcriptStreaming;
+  }, [transcriptStreaming]);
+
   // Auto-scroll transcript viewer during streaming
   useEffect(() => {
     if (transcriptStreaming) {
@@ -432,13 +447,17 @@ export default function Home() {
   const fetchTranscript = async (sessionId: string, project: string, displayTitle: string) => {
     // Save current editor draft before switching
     if (viewingTranscriptId && chatEditorRef.current) {
-      const draft = chatEditorRef.current.getContent().trim();
-      if (draft) {
+      const draft = chatEditorRef.current.getContent();
+      if (chatEditorRef.current.getPlainText?.()?.trim?.() || draft.replace(/<[^>]*>/g, '').trim()) {
         sessionDraftsRef.current.set(viewingTranscriptId, draft);
       } else {
         sessionDraftsRef.current.delete(viewingTranscriptId);
       }
     }
+
+    // Update the active session ref synchronously so SSE handlers for the
+    // previous session's isStillActive() return false immediately.
+    activeSessionRef.current = sessionId;
 
     setHistoryTranscriptLoading(true);
     setHistoryTranscript([]);
@@ -452,6 +471,8 @@ export default function Home() {
     setTranscriptLoading(false);
     setTranscriptPartial(false);
     setSuggestedPrompt(null);
+    setIsStuck(false);
+    setStuckReason(undefined);
 
     // Restore draft for the target session (or clear)
     const savedDraft = sessionDraftsRef.current.get(sessionId) || '';
@@ -474,21 +495,68 @@ export default function Home() {
       }
       setHistoryTranscript(transcriptMessages);
 
-      // Check if this session has an active stream buffer (e.g. the user
-      // switched away while it was processing). If so, restore stream state.
+      // Check if this session is actively processing. Restore stream state
+      // from the buffer if available, and check health as a fallback.
+      let detectedProcessing = false;
       try {
         const bufRes = await fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(sessionId)}`);
         if (bufRes.ok) {
           const bufData = await bufRes.json();
-          if (bufData.hasBuffer) {
+          if (bufData.hasBuffer && bufData.isActive) {
+            // The JSONL contains partial assistant messages for the in-flight
+            // turn that the stream buffer is handling. Strip the trailing
+            // messages from the current turn so the chat shows bouncing dots
+            // instead of intermediary assistant bubbles.
+            setHistoryTranscript(prev => {
+              const lastUserIdx = prev.findLastIndex(
+                m => m.role === 'user' && m.content === bufData.userPrompt
+              );
+              if (lastUserIdx >= 0) {
+                return prev.slice(0, lastUserIdx);
+              }
+              const lastIdx = prev.length - 1;
+              if (lastIdx >= 0 && prev[lastIdx].role === 'assistant') {
+                let cutIdx = lastIdx;
+                while (cutIdx >= 0 && prev[cutIdx].role === 'assistant') {
+                  cutIdx--;
+                }
+                if (cutIdx >= 0 && prev[cutIdx].role === 'user') {
+                  return prev.slice(0, cutIdx);
+                }
+                return prev.slice(0, cutIdx + 1);
+              }
+              return prev;
+            });
+
             setTranscriptOverlayMessages([{ role: 'user' as const, content: bufData.userPrompt }]);
             setTranscriptStreaming(bufData.accumulatedText || '');
             setStreamEvents(bufData.events || []);
-            setTranscriptLoading(bufData.isActive);
+            setTranscriptLoading(true);
+            detectedProcessing = true;
+          } else if (bufData.isProcessing) {
+            // Session is processing but buffer is inactive or missing.
+            setTranscriptLoading(true);
+            detectedProcessing = true;
           }
         }
       } catch {
         // Buffer fetch is best-effort; transcript is already loaded
+      }
+
+      // Fallback: if buffer didn't indicate processing, check health directly.
+      // This covers external CLI sessions not managed by Fury's sessionManager.
+      if (!detectedProcessing) {
+        try {
+          const healthRes = await fetch(`/api/health?sessionId=${encodeURIComponent(sessionId)}`);
+          if (healthRes.ok) {
+            const healthData = await healthRes.json();
+            if (healthData.isProcessing) {
+              setTranscriptLoading(true);
+            }
+          }
+        } catch {
+          // Health check is best-effort
+        }
       }
     } catch (error) {
       console.error('Failed to fetch transcript:', error);
@@ -504,107 +572,270 @@ export default function Home() {
     fetchHistory();
   }, []);
 
-  // Poll for live sessions and history updates when chat tab is active
+  // Global SSE connection for live-sessions and history-updated events
   useEffect(() => {
     if (activeTab !== 'chat') return;
 
-    const fetchLiveSessions = async () => {
-      try {
-        const res = await fetch('/api/live-sessions');
-        if (res.ok) {
-          const data = await res.json();
+    // Fetch initial data immediately
+    fetch('/api/live-sessions').then(res => res.json()).then(data => {
+      setLiveSessionIds(new Set(data.liveSessionIds || []));
+    }).catch(() => {});
+
+    const es = new EventSource('/api/events');
+
+    es.addEventListener('live-sessions', (e: MessageEvent) => {
+      const data = JSON.parse(e.data);
+      setLiveSessionIds(new Set(data.liveSessionIds || []));
+    });
+
+    es.addEventListener('history-updated', () => {
+      fetchHistory();
+    });
+
+    es.onerror = () => {
+      // EventSource auto-reconnects; on reconnect re-fetch state to cover gap
+      if (es.readyState === EventSource.CONNECTING) {
+        fetch('/api/live-sessions').then(res => res.json()).then(data => {
           setLiveSessionIds(new Set(data.liveSessionIds || []));
-        }
-      } catch (error) {
-        console.error('Failed to fetch live sessions:', error);
+        }).catch(() => {});
+        fetchHistory();
       }
     };
 
-    fetchLiveSessions();
-    const liveInterval = setInterval(fetchLiveSessions, 10000);
-    const historyInterval = setInterval(fetchHistory, 30000);
-    return () => {
-      clearInterval(liveInterval);
-      clearInterval(historyInterval);
-    };
+    return () => es.close();
   }, [activeTab]);
 
-  // Auto-refresh transcript for live sessions
+  // Session-scoped SSE for stream, health, and transcript events
+  const sessionEsRef = useRef<EventSource | null>(null);
+
   useEffect(() => {
+    // Close previous session-scoped connection
+    if (sessionEsRef.current) {
+      sessionEsRef.current.close();
+      sessionEsRef.current = null;
+    }
+
     if (!viewingTranscriptId || !historyTranscriptProject) return;
 
-    // Check if this transcript's session is live
-    if (!liveSessionIds.has(viewingTranscriptId)) return;
+    const mySessionId = viewingTranscriptId;
+    const myProject = historyTranscriptProject;
 
-    const refreshTranscript = async () => {
-      // Don't refresh while the user is sending a message from the transcript
-      if (transcriptLoading) return;
-      try {
-        const res = await fetch(`/api/transcript?sessionId=${encodeURIComponent(viewingTranscriptId!)}&project=${encodeURIComponent(historyTranscriptProject!)}`);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.messages) {
-            setHistoryTranscript(data.messages);
+    const es = new EventSource(
+      `/api/events?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`
+    );
+    sessionEsRef.current = es;
+
+    const isStillActive = () => activeSessionRef.current === mySessionId;
+
+    // On SSE connect, re-fetch the stream buffer to close the gap between the
+    // initial restore in fetchTranscript and when the EventSource connected.
+    // Events emitted during that window would otherwise be lost.
+    es.addEventListener('connected', () => {
+      if (!isStillActive()) return;
+
+      fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(mySessionId)}`)
+        .then(res => res.json())
+        .then(bufData => {
+          if (!isStillActive()) return;
+
+          if (bufData.hasBuffer) {
+            // Only update if the buffer has more data than what we currently have
+            const currentLen = transcriptStreamingRef.current?.length || 0;
+            if ((bufData.accumulatedText || '').length > currentLen) {
+              setTranscriptStreaming(bufData.accumulatedText || '');
+              setStreamEvents(bufData.events || []);
+            }
+          }
+
+          // Sync loading state — use isProcessing (session-level) not just
+          // isActive (buffer-level) to avoid false negatives during queue processing.
+          const isProcessing = bufData.isProcessing || (bufData.hasBuffer && bufData.isActive);
+          if (isProcessing && !transcriptLoadingRef.current) {
+            setTranscriptLoading(true);
+          } else if (!isProcessing && transcriptLoadingRef.current) {
+            // Processing completed between initial restore and SSE connect —
+            // refresh the transcript to get the final response and clear overlays.
+            setTranscriptLoading(false);
+            setTranscriptStreaming('');
+            fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
+              .then(res => res.json())
+              .then(refreshData => {
+                if (refreshData.messages && isStillActive()) {
+                  setHistoryTranscript(refreshData.messages);
+                  setTranscriptOverlayMessages([]);
+                  setOverlayInsertPoint(null);
+                }
+              })
+              .catch(() => {});
+          }
+        })
+        .catch(() => {});
+    });
+
+    // Track AskUserQuestion tool use across stream events
+    let pendingAskUserQuestion: AskUserQuestionState['input'] | null = null;
+
+    // Handle session:stream events — the single path for all stream data.
+    // NOTE: These events only fire for sessions managed by Fury's sessionManager.
+    // External CLI sessions rely on transcript-updated (file watcher) for updates.
+    es.addEventListener('session-stream', (e: MessageEvent) => {
+      if (!isStillActive()) return;
+
+      const data = JSON.parse(e.data);
+
+      if (data.text) {
+        setTranscriptStreaming(prev => prev + data.text);
+        setStreamEvents(prev => {
+          const last = prev[prev.length - 1];
+          if (last && last.type === 'text') {
+            return [...prev.slice(0, -1), { ...last, content: (last as any).content + data.text }];
+          }
+          return [...prev, { type: 'text' as const, content: data.text, ts: Date.now() }];
+        });
+      } else if (data.toolUse) {
+        const tool = data.toolUse;
+        if (tool.status === 'starting') {
+          setStreamEvents(prev => [...prev, { type: 'tool_start' as const, name: tool.name, ts: Date.now() }]);
+        } else if (tool.status === 'complete') {
+          setStreamEvents(prev => [...prev, { type: 'tool_complete' as const, name: tool.name, input: tool.input, ts: Date.now() }]);
+          // Capture AskUserQuestion for handling when processing completes
+          if (tool.name === 'AskUserQuestion' && tool.input?.questions) {
+            pendingAskUserQuestion = tool.input;
           }
         }
-      } catch (error) {
-        console.error('Failed to refresh transcript:', error);
+      } else if (data.toolResult) {
+        setStreamEvents(prev => [...prev, { type: 'tool_result' as const, preview: data.toolResult.preview, ts: Date.now() }]);
+      } else if (data.error) {
+        setStreamEvents(prev => [...prev, { type: 'error' as const, content: data.error, ts: Date.now() }]);
       }
-    };
+    });
 
-    const interval = setInterval(refreshTranscript, 5000);
-    return () => clearInterval(interval);
-  }, [viewingTranscriptId, historyTranscriptProject, liveSessionIds, transcriptLoading]);
+    // Handle session:health events (replaces health polling)
+    es.addEventListener('session-health', (e: MessageEvent) => {
+      if (!isStillActive()) return;
+      const data = JSON.parse(e.data);
+      setIsStuck(data.isStuck);
+      setStuckReason(data.stuckReason);
 
-  // Poll stream buffer for sessions where we're showing a loading state but
-  // have no active SSE reader (i.e. the user switched away and back).
-  useEffect(() => {
-    if (!viewingTranscriptId || !transcriptLoading || transcriptAbortRef.current) return;
+      // If the session is actively processing, ensure the loading indicator
+      // (bouncing dots) is visible.
+      if (data.isProcessing && !transcriptLoadingRef.current) {
+        setTranscriptLoading(true);
+      }
 
-    const pollBuffer = async () => {
-      try {
-        const res = await fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(viewingTranscriptId!)}`);
-        if (!res.ok) return;
-        const data = await res.json();
-
-        // Guard: user may have switched away during the fetch
-        if (activeSessionRef.current !== viewingTranscriptId) return;
-
-        if (!data.hasBuffer || !data.isActive) {
-          // Stream finished — refresh from JSONL
-          setTranscriptLoading(false);
+      // If processing just ended, handle completion.
+      if (!data.isProcessing && transcriptLoadingRef.current) {
+        // If AskUserQuestion was detected during this turn, save accumulated
+        // text as an overlay message and open the dialog instead of refreshing.
+        if (pendingAskUserQuestion) {
+          const currentText = transcriptStreamingRef.current;
+          if (currentText) {
+            setTranscriptOverlayMessages(prev => [...prev, { role: 'assistant' as const, content: currentText }]);
+          }
           setTranscriptStreaming('');
-          try {
-            const refreshRes = await fetch(
-              `/api/transcript?sessionId=${encodeURIComponent(viewingTranscriptId!)}&project=${encodeURIComponent(historyTranscriptProject || '')}`
-            );
-            if (refreshRes.ok) {
-              const refreshData = await refreshRes.json();
-              if (refreshData.messages && activeSessionRef.current === viewingTranscriptId) {
-                setHistoryTranscript(refreshData.messages);
+          setTranscriptLoading(false);
+          setAskUserQuestion({ input: pendingAskUserQuestion });
+          pendingAskUserQuestion = null;
+          return;
+        }
+
+        // Normal completion: refresh transcript from JSONL.
+        setTranscriptLoading(false);
+        setTranscriptStreaming('');
+        fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
+          .then(res => res.json())
+          .then(refreshData => {
+            if (refreshData.messages && isStillActive()) {
+              setHistoryTranscript(refreshData.messages);
+              setTranscriptOverlayMessages([]);
+              setOverlayInsertPoint(null);
+            }
+          })
+          .catch(() => {});
+      }
+    });
+
+    es.onerror = () => {
+      if (es.readyState === EventSource.CONNECTING && isStillActive()) {
+        // SSE reconnecting — check if session completed while disconnected
+        fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`)
+          .then(res => res.json())
+          .then(data => {
+            if (!isStillActive()) return;
+            if (!data.isProcessing && transcriptLoadingRef.current) {
+              setTranscriptLoading(false);
+              setTranscriptStreaming('');
+            }
+          })
+          .catch(() => {});
+        // Also refresh transcript to pick up any missed messages
+        fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
+          .then(res => res.json())
+          .then(data => {
+            if (data.messages && isStillActive()) {
+              setHistoryTranscript(data.messages);
+              if (!transcriptLoadingRef.current) {
                 setTranscriptOverlayMessages([]);
                 setOverlayInsertPoint(null);
               }
             }
-          } catch {
-            // Will pick up on next auto-refresh
-          }
-          return;
-        }
-
-        // Still active — update stream state
-        setTranscriptStreaming(data.accumulatedText || '');
-        setStreamEvents(data.events || []);
-      } catch {
-        // Network error — will retry on next poll
+          })
+          .catch(() => {});
       }
     };
 
-    // Poll immediately, then every 1 second
-    pollBuffer();
-    const interval = setInterval(pollBuffer, 1000);
-    return () => clearInterval(interval);
-  }, [viewingTranscriptId, transcriptLoading, historyTranscriptProject]);
+    // Handle transcript:updated events (replaces transcript polling for external live sessions)
+    es.addEventListener('transcript-updated', () => {
+      if (!isStillActive()) return;
+      // Don't refresh while any processing is in flight — the JSONL contains
+      // partial assistant messages that would render as intermediary bubbles.
+      if (transcriptLoadingRef.current) return;
+
+      fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
+        .then(res => res.json())
+        .then(data => {
+          if (data.messages && isStillActive()) {
+            setHistoryTranscript(data.messages);
+          }
+        })
+        .catch(() => {});
+    });
+
+    // Fallback health poll: if SSE drops or a session:health event is lost,
+    // the UI can get stuck showing "processing" forever. Poll every 15s while
+    // transcriptLoading is true to catch missed completion events.
+    const healthPoll = setInterval(() => {
+      if (!isStillActive() || !transcriptLoadingRef.current) return;
+      fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`)
+        .then(res => res.json())
+        .then(data => {
+          if (!isStillActive()) return;
+          if (!data.isProcessing && transcriptLoadingRef.current) {
+            setTranscriptLoading(false);
+            setTranscriptStreaming('');
+            fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
+              .then(res => res.json())
+              .then(refreshData => {
+                if (refreshData.messages && isStillActive()) {
+                  setHistoryTranscript(refreshData.messages);
+                  setTranscriptOverlayMessages([]);
+                  setOverlayInsertPoint(null);
+                }
+              })
+              .catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }, 15_000);
+
+    return () => {
+      es.close();
+      clearInterval(healthPoll);
+      if (sessionEsRef.current === es) {
+        sessionEsRef.current = null;
+      }
+    };
+  }, [viewingTranscriptId, historyTranscriptProject]);
 
   // Load workflows and compute recent directories
   useEffect(() => {
@@ -627,48 +858,6 @@ export default function Home() {
 
     loadWorkflowsAndDirectories();
   }, [history]);
-
-  // Health check polling - check every 5 seconds when processing
-  useEffect(() => {
-    const checkHealth = async () => {
-      if (!viewingTranscriptId || !transcriptLoading) {
-        setIsStuck(false);
-        setStuckReason(undefined);
-        return;
-      }
-
-      try {
-        const res = await fetch(`/api/health?sessionId=${viewingTranscriptId}`);
-        if (res.ok) {
-          const health = await res.json();
-          setIsStuck(health.isStuck);
-          setStuckReason(health.stuckReason);
-        }
-      } catch (error) {
-        console.error('Health check failed:', error);
-      }
-    };
-
-    if (transcriptLoading && viewingTranscriptId) {
-      // Start health check polling
-      healthCheckIntervalRef.current = setInterval(checkHealth, 5000);
-      checkHealth(); // Check immediately
-    } else {
-      // Stop health check polling
-      if (healthCheckIntervalRef.current) {
-        clearInterval(healthCheckIntervalRef.current);
-        healthCheckIntervalRef.current = null;
-      }
-      setIsStuck(false);
-      setStuckReason(undefined);
-    }
-
-    return () => {
-      if (healthCheckIntervalRef.current) {
-        clearInterval(healthCheckIntervalRef.current);
-      }
-    };
-  }, [transcriptLoading, viewingTranscriptId]);
 
   const currentProjectPath = historyTranscriptProject;
 
@@ -702,6 +891,9 @@ export default function Home() {
   const handleNotesChange = async (content: string) => {
     if (!currentProjectPath) return;
 
+    // Update local state so remounting the editor (e.g. after tab switch) preserves edits
+    setNotes(content);
+
     try {
       await fetch('/api/notes', {
         method: 'POST',
@@ -725,8 +917,8 @@ export default function Home() {
   const handleDirectorySelected = (path: string) => {
     // Save current editor draft before switching
     if (viewingTranscriptId && chatEditorRef.current) {
-      const draft = chatEditorRef.current.getContent().trim();
-      if (draft) {
+      const draft = chatEditorRef.current.getContent();
+      if (chatEditorRef.current.getPlainText?.()?.trim?.() || draft.replace(/<[^>]*>/g, '').trim()) {
         sessionDraftsRef.current.set(viewingTranscriptId, draft);
       } else {
         sessionDraftsRef.current.delete(viewingTranscriptId);
@@ -734,6 +926,8 @@ export default function Home() {
     }
 
     const newId = generateUUID();
+    // Update ref synchronously so any in-flight handler's isStillActive() returns false
+    activeSessionRef.current = newId;
     // Go directly to transcript view for a new empty session
     setViewingTranscriptId(newId);
     setHistoryTranscriptProject(path);
@@ -746,8 +940,43 @@ export default function Home() {
     setTranscriptLoading(false);
     setTranscriptPartial(false);
 
+    // Track this as a pending session so it persists in the sidebar
+    setPendingNewSessions(prev => [...prev, { sessionId: newId, project: path, title: 'New Session', createdAt: Date.now() }]);
+
     // New session starts with an empty editor
     setTimeout(() => chatEditorRef.current?.setContent(''), 50);
+  };
+
+  const restorePendingSession = (pending: { sessionId: string; project: string; title: string }) => {
+    // Save current editor draft before switching
+    if (viewingTranscriptId && chatEditorRef.current) {
+      const draft = chatEditorRef.current.getContent();
+      if (chatEditorRef.current.getPlainText?.()?.trim?.() || draft.replace(/<[^>]*>/g, '').trim()) {
+        sessionDraftsRef.current.set(viewingTranscriptId, draft);
+      } else {
+        sessionDraftsRef.current.delete(viewingTranscriptId);
+      }
+    }
+
+    activeSessionRef.current = pending.sessionId;
+    setViewingTranscriptId(pending.sessionId);
+    setHistoryTranscriptProject(pending.project);
+    setHistoryTranscriptTitle(pending.title);
+    setHistoryTranscript([]);
+    setTranscriptOverlayMessages([]);
+    setOverlayInsertPoint(null);
+    setTranscriptStreaming('');
+    setStreamEvents([]);
+    setTranscriptLoading(false);
+    setTranscriptPartial(false);
+    setSuggestedPrompt(null);
+    setIsStuck(false);
+    setStuckReason(undefined);
+    setHistoryTranscriptLoading(false);
+
+    // Restore draft for this pending session
+    const savedDraft = sessionDraftsRef.current.get(pending.sessionId) || '';
+    setTimeout(() => chatEditorRef.current?.setContent(savedDraft), 50);
   };
 
   const handleKillStuckSession = async () => {
@@ -826,18 +1055,14 @@ export default function Home() {
   const handleTranscriptSend = async (userMessage: string) => {
     if (!userMessage || transcriptLoading || !viewingTranscriptId) return;
 
-    // Capture the session this handler belongs to. If the user switches sessions
-    // while we're streaming, we skip state updates so we don't contaminate the
-    // new session's display. The data still lands in JSONL via the CLI.
     const mySessionId = viewingTranscriptId;
     const myProject = historyTranscriptProject;
-    const isStillActive = () => activeSessionRef.current === mySessionId;
 
-    // Clear the draft for this session since the message is being sent
+    // Clear the draft and remove from pending sessions since it's being submitted
     sessionDraftsRef.current.delete(mySessionId);
+    setPendingNewSessions(prev => prev.filter(p => p.sessionId !== mySessionId));
 
     // If this session isn't in the history sidebar yet, add it optimistically
-    // so it stays visible even if the user switches to another session.
     if (!history.some(h => h.sessionId === mySessionId)) {
       setHistory(prev => [{
         display: userMessage.length > 200 ? userMessage.substring(0, 200) + '...' : userMessage,
@@ -848,23 +1073,15 @@ export default function Home() {
       }, ...prev]);
     }
 
-    // Add user message to overlay immediately for instant feedback
+    // Instant feedback
     setTranscriptOverlayMessages(prev => [...prev, { role: 'user' as const, content: userMessage }]);
-    setTimeout(() => scrollTranscriptToBottom(), 50);
     setTranscriptLoading(true);
     setTranscriptStreaming('');
     setStreamEvents([]);
     setSuggestedPrompt(null);
-
-    // Scroll to bottom after loading indicator renders so bouncing dots are visible
-    setTimeout(() => scrollTranscriptToBottom(), 150);
-
-    const abortController = new AbortController();
-    transcriptAbortRef.current = abortController;
+    setTimeout(() => scrollTranscriptToBottom(), 50);
 
     try {
-      // The CLI manages conversation context via --session-id/--resume
-      // No need to send conversation history
       const res = await fetch('/api/claude', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -873,124 +1090,19 @@ export default function Home() {
           sessionId: mySessionId,
           projectPath: myProject,
         }),
-        signal: abortController.signal,
       });
-
-      if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      if (!reader) throw new Error('No reader available');
-
-      let accumulatedText = '';
-      let pendingAskUserQuestion: AskUserQuestionState['input'] | null = null;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6));
-              if (data.text) {
-                accumulatedText += data.text;
-                if (isStillActive()) {
-                  setTranscriptStreaming(accumulatedText);
-                  setStreamEvents(prev => {
-                    const last = prev[prev.length - 1];
-                    if (last && last.type === 'text') {
-                      return [...prev.slice(0, -1), { ...last, content: last.content + data.text }];
-                    }
-                    return [...prev, { type: 'text', content: data.text, ts: Date.now() }];
-                  });
-                }
-              } else if (data.error) {
-                accumulatedText = `Error: ${data.error}`;
-                if (isStillActive()) {
-                  setTranscriptStreaming(accumulatedText);
-                  setStreamEvents(prev => [...prev, { type: 'error', content: data.error, ts: Date.now() }]);
-                }
-              } else if (data.tool_use) {
-                const tool = data.tool_use;
-                if (isStillActive()) {
-                  if (tool.status === 'starting') {
-                    setStreamEvents(prev => [...prev, { type: 'tool_start', name: tool.name, ts: Date.now() }]);
-                  } else if (tool.status === 'complete') {
-                    setStreamEvents(prev => [...prev, { type: 'tool_complete', name: tool.name, input: tool.input, ts: Date.now() }]);
-                  }
-                }
-                // Capture AskUserQuestion regardless of active state
-                if (tool.status === 'complete' && tool.name === 'AskUserQuestion' && tool.input?.questions) {
-                  pendingAskUserQuestion = tool.input as AskUserQuestionState['input'];
-                }
-              } else if (data.tool_result) {
-                if (isStillActive()) {
-                  setStreamEvents(prev => [...prev, { type: 'tool_result', preview: data.tool_result.preview, ts: Date.now() }]);
-                }
-              }
-            } catch (e) {
-              // skip unparseable
-            }
-          }
-        }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `HTTP ${res.status}`);
       }
-
-      // If user switched away, skip all post-completion state updates.
-      // The data is in JSONL — fetchTranscript will pick it up when they switch back.
-      if (!isStillActive()) return;
-
-      // If AskUserQuestion was detected, save text and open the dialog
-      if (pendingAskUserQuestion) {
-        if (accumulatedText) {
-          setTranscriptOverlayMessages(prev => [...prev, { role: 'assistant' as const, content: accumulatedText }]);
-          setTranscriptStreaming('');
-        }
-        setAskUserQuestion({ input: pendingAskUserQuestion });
-        return; // finally block will clean up transcriptLoading
-      }
-
-      if (accumulatedText) {
-        setTranscriptOverlayMessages(prev => [...prev, { role: 'assistant' as const, content: accumulatedText }]);
-        setTranscriptStreaming('');
-
-        // Re-fetch the transcript from JSONL to sync with CLI's authoritative record.
-        // This clears overlay messages since they're now in the JSONL.
-        try {
-          const refreshRes = await fetch(
-            `/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject || '')}`
-          );
-          if (refreshRes.ok) {
-            const refreshData = await refreshRes.json();
-            if (refreshData.messages && refreshData.messages.length > 0 && isStillActive()) {
-              setHistoryTranscript(refreshData.messages);
-              setTranscriptOverlayMessages([]);
-              setOverlayInsertPoint(null);
-            }
-          }
-        } catch {
-          // Overlay stays until next auto-refresh
-        }
-      }
+      // Done. SSE delivers all stream events + session:health signals completion.
     } catch (error) {
-      if (isStillActive()) {
-        if (error instanceof Error && error.name === 'AbortError') {
-          setTranscriptOverlayMessages(prev => [...prev, { role: 'assistant' as const, content: '_Processing stopped by user._' }]);
-        } else {
-          const errorMessage = `Error: ${error instanceof Error ? error.message : 'Unknown error'}`;
-          setTranscriptOverlayMessages(prev => [...prev, { role: 'assistant' as const, content: errorMessage }]);
-        }
-      }
-    } finally {
-      if (isStillActive()) {
+      if (activeSessionRef.current === mySessionId) {
+        setTranscriptOverlayMessages(prev => [...prev, {
+          role: 'assistant' as const,
+          content: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        }]);
         setTranscriptLoading(false);
-      }
-      // Only clear the abort ref if it's still ours (not overwritten by a new session)
-      if (transcriptAbortRef.current === abortController) {
-        transcriptAbortRef.current = null;
       }
     }
   };
@@ -998,6 +1110,8 @@ export default function Home() {
   const handleRewind = async (mode: 'conversation' | 'both') => {
     if (!viewingTranscriptId || !historyTranscriptProject || !rewindConfirm) return;
 
+    const mySessionId = viewingTranscriptId;
+    const myProject = historyTranscriptProject;
     const { turnIndex, fullMessage } = rewindConfirm;
     setRewindConfirm(null);
 
@@ -1023,57 +1137,34 @@ export default function Home() {
       // Step 1: If "both", prompt Claude to undo code changes BEFORE truncating
       // (so it still has context of what it did)
       if (mode === 'both') {
+        const undoRes = await fetch('/api/claude', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt: `Undo all file changes you made starting from the message shown below. Restore every modified file to its state before that point. Do not explain, just revert the files.\n\nMessage to rewind to (${rewindConfirm.timestamp ? new Date(rewindConfirm.timestamp).toISOString() : 'unknown time'}):\n> ${rewindConfirm.userMessage}`,
+            sessionId: mySessionId,
+            projectPath: myProject,
+          }),
+        });
 
-        const abortController = new AbortController();
-        transcriptAbortRef.current = abortController;
+        if (!undoRes.ok) throw new Error(`Undo request failed: ${undoRes.status}`);
 
-        try {
-          const res = await fetch('/api/claude', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              prompt: `Undo all file changes you made starting from the message shown below. Restore every modified file to its state before that point. Do not explain, just revert the files.\n\nMessage to rewind to (${rewindConfirm.timestamp ? new Date(rewindConfirm.timestamp).toISOString() : 'unknown time'}):\n> ${rewindConfirm.userMessage}`,
-              sessionId: viewingTranscriptId,
-              projectPath: historyTranscriptProject,
-            }),
-            signal: abortController.signal,
-          });
-
-          if (res.ok) {
-            const reader = res.body?.getReader();
-            if (reader) {
-              const decoder = new TextDecoder();
-              let accumulatedText = '';
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                const chunk = decoder.decode(value);
-                for (const line of chunk.split('\n')) {
-                  if (line.startsWith('data: ')) {
-                    try {
-                      const data = JSON.parse(line.slice(6));
-                      if (data.text) {
-                        accumulatedText += data.text;
-                        setTranscriptStreaming(accumulatedText);
-                      } else if (data.tool_use) {
-                        const tool = data.tool_use;
-                        if (tool.status === 'starting') {
-                          setStreamEvents(prev => [...prev, { type: 'tool_start', name: tool.name, ts: Date.now() }]);
-                        } else if (tool.status === 'complete') {
-                          setStreamEvents(prev => [...prev, { type: 'tool_complete', name: tool.name, input: tool.input, ts: Date.now() }]);
-                        }
-                      } else if (data.tool_result) {
-                        setStreamEvents(prev => [...prev, { type: 'tool_result', preview: data.tool_result.preview, ts: Date.now() }]);
-                      }
-                    } catch { /* skip */ }
-                  }
+        // Poll health until the undo processing finishes.
+        // SSE delivers stream progress to the user during this time.
+        await new Promise<void>((resolve) => {
+          const poll = setInterval(async () => {
+            try {
+              const healthRes = await fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`);
+              if (healthRes.ok) {
+                const healthData = await healthRes.json();
+                if (!healthData.isProcessing) {
+                  clearInterval(poll);
+                  resolve();
                 }
               }
-            }
-          }
-        } finally {
-          transcriptAbortRef.current = null;
-        }
+            } catch { /* retry next interval */ }
+          }, 2000);
+        });
       }
 
       // Step 2: Truncate the JSONL (removes original turns + the undo prompt)
@@ -1081,8 +1172,8 @@ export default function Home() {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          sessionId: viewingTranscriptId,
-          project: historyTranscriptProject,
+          sessionId: mySessionId,
+          project: myProject,
           turnIndex,
           removeLastHistoryEntry: mode === 'both',
         }),
@@ -1092,7 +1183,7 @@ export default function Home() {
 
       // Step 3: Reload transcript from the truncated JSONL
       const refreshRes = await fetch(
-        `/api/transcript?sessionId=${encodeURIComponent(viewingTranscriptId)}&project=${encodeURIComponent(historyTranscriptProject)}`
+        `/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`
       );
       if (refreshRes.ok) {
         const refreshData = await refreshRes.json();
@@ -1113,10 +1204,16 @@ export default function Home() {
     }
   };
 
-  const handleTranscriptStop = () => {
-    if (transcriptAbortRef.current) {
-      transcriptAbortRef.current.abort();
-      transcriptAbortRef.current = null;
+  const handleTranscriptStop = async () => {
+    if (!viewingTranscriptId) return;
+    try {
+      await fetch('/api/health', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: viewingTranscriptId, action: 'kill' }),
+      });
+    } catch (error) {
+      console.error('[App] Failed to stop session:', error);
       setTranscriptLoading(false);
       setTranscriptStreaming('');
     }
@@ -1261,26 +1358,35 @@ export default function Home() {
               {/* Session List */}
               <div className="flex-1 overflow-y-auto p-2">
                 <TooltipProvider>
-                {/* New Session indicator (before it appears in history) */}
-                {viewingTranscriptId && !history.some(h => h.sessionId === viewingTranscriptId) && (
-                  <div className="mb-2 p-3 rounded border bg-primary/10 border-primary cursor-pointer">
-                    <div className="flex justify-between items-start mb-1">
-                      <span className="text-sm font-medium text-foreground">New Session</span>
-                      {transcriptLoading && (
-                        <div className="flex items-center gap-0.5 ml-1">
-                          <div className="dot w-1.5 h-1.5 bg-primary rounded-full"></div>
-                          <div className="dot w-1.5 h-1.5 bg-primary rounded-full"></div>
-                          <div className="dot w-1.5 h-1.5 bg-primary rounded-full"></div>
-                        </div>
-                      )}
-                    </div>
-                    {historyTranscriptProject && (
-                      <div className="mt-1 text-xs text-muted-foreground font-mono truncate" title={historyTranscriptProject}>
-                        {historyTranscriptProject}
+                {/* Pending new sessions (not yet submitted) */}
+                {pendingNewSessions.map((pending) => {
+                  const isViewing = viewingTranscriptId === pending.sessionId;
+                  return (
+                    <div
+                      key={`pending-${pending.sessionId}`}
+                      className={`mb-2 p-3 rounded border cursor-pointer transition-colors ${
+                        isViewing
+                          ? 'bg-primary/10 border-primary'
+                          : 'bg-muted border-dashed border-border hover:border-ring'
+                      }`}
+                      onClick={() => !isViewing && restorePendingSession(pending)}
+                    >
+                      <div className="flex justify-between items-start mb-1">
+                        <span className="text-sm font-medium text-foreground">New Session</span>
+                        {isViewing && transcriptLoading && (
+                          <div className="flex items-center gap-0.5 ml-1">
+                            <div className="dot w-1.5 h-1.5 bg-primary rounded-full"></div>
+                            <div className="dot w-1.5 h-1.5 bg-primary rounded-full"></div>
+                            <div className="dot w-1.5 h-1.5 bg-primary rounded-full"></div>
+                          </div>
+                        )}
                       </div>
-                    )}
-                  </div>
-                )}
+                      <div className="mt-1 text-xs text-muted-foreground font-mono truncate" title={pending.project}>
+                        {pending.project}
+                      </div>
+                    </div>
+                  );
+                })}
 
                 {/* History Entries */}
                 {(() => {
@@ -1531,7 +1637,7 @@ export default function Home() {
                                     <div className="prose-chat max-w-none">
                                       <ReactMarkdown
                                         remarkPlugins={[remarkGfm]}
-                                        rehypePlugins={[rehypeHighlight]}
+                                        rehypePlugins={[[rehypeHighlight, { detect: true }]]}
                                       >
                                         {turn.assistant.content}
                                       </ReactMarkdown>
@@ -1659,12 +1765,10 @@ export default function Home() {
                 </Button>
               </div>
 
-              {/* Files View */}
-              {rightPanelView === 'files' && (
-                <div className="flex-1 overflow-hidden">
-                  <FileTree projectPath={historyTranscriptProject} onFileDoubleClick={handleFileDoubleClick} />
-                </div>
-              )}
+              {/* Files View - always mounted to preserve watcher & expand state */}
+              <div className={`flex-1 overflow-hidden ${rightPanelView === 'files' ? '' : 'hidden'}`}>
+                <FileTree projectPath={historyTranscriptProject} onFileDoubleClick={handleFileDoubleClick} />
+              </div>
 
               {/* Stream View */}
               {rightPanelView === 'stream' && (
@@ -1905,7 +2009,7 @@ export default function Home() {
                   <div className="prose-chat max-w-none">
                     <ReactMarkdown
                       remarkPlugins={[remarkGfm]}
-                      rehypePlugins={[rehypeHighlight]}
+                      rehypePlugins={[[rehypeHighlight, { detect: true }]]}
                     >
                       {msg.content}
                     </ReactMarkdown>

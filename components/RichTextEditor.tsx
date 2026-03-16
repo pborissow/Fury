@@ -4,7 +4,14 @@ import { useEffect, useState, useRef, useCallback, useImperativeHandle, forwardR
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import CodeBlock from '@tiptap/extension-code-block';
+import TurndownService from 'turndown';
 import { Button } from '@/components/ui/button';
+
+const turndown = new TurndownService({
+  headingStyle: 'atx',
+  bulletListMarker: '-',
+  codeBlockStyle: 'fenced',
+});
 import { Bold, Code, List, ListOrdered, Type, Send, Mic, MicOff, Square } from 'lucide-react';
 
 interface RichTextEditorProps {
@@ -24,6 +31,7 @@ interface RichTextEditorProps {
 export interface RichTextEditorHandle {
   setContent: (content: string) => void;
   getContent: () => string;
+  getPlainText: () => string;
 }
 
 const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(function RichTextEditor({
@@ -41,6 +49,8 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
 }, ref) {
   const [isRecording, setIsRecording] = useState(false);
   const [isSupported, setIsSupported] = useState(true);
+  // Force re-render on editor transactions so toolbar active states stay current
+  const [, setTick] = useState(0);
   const recognitionRef = useRef<any>(null);
   const debounceTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const pendingContentRef = useRef<string | null>(null);
@@ -83,8 +93,49 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
         class: 'max-w-none focus:outline-none min-h-[80px] p-3 text-foreground',
       },
       handleKeyDown: (view, event) => {
-        // Submit on Enter, new line on Shift+Enter (chat prompt only)
-        if (showButtonBar && event.key === 'Enter' && !event.shiftKey) {
+        if (showButtonBar && event.key === 'Enter') {
+          const state = view.state;
+          const { $from } = state.selection;
+          const inList = $from.node(-1)?.type.name === 'listItem';
+
+          if (event.shiftKey) {
+            // Shift+Enter = new line (always).
+            event.preventDefault();
+
+            if (inList) {
+              // Inside a list: check if the current item is empty.
+              // If empty, exit the list (like pressing backspace on an empty bullet).
+              // If non-empty, create a new list item.
+              const itemContent = $from.parent.textContent;
+              if (!itemContent) {
+                // Empty list item — exit the list into a paragraph
+                const listDepth = $from.depth - 2;
+                const listNode = $from.node(listDepth);
+                if (listNode && (listNode.type.name === 'bulletList' || listNode.type.name === 'orderedList')) {
+                  const listEnd = $from.end(listDepth);
+                  const paragraphType = state.schema.nodes.paragraph;
+                  const tr = state.tr.insert(listEnd + 1, paragraphType.create());
+                  tr.setSelection((state.selection.constructor as any).near(tr.doc.resolve(listEnd + 2)));
+                  // Delete the empty list item we're leaving behind
+                  const itemStart = $from.before(-1);
+                  const itemEnd = $from.after(-1);
+                  tr.delete(tr.mapping.map(itemStart), tr.mapping.map(itemEnd));
+                  view.dispatch(tr.scrollIntoView());
+                }
+              } else {
+                // Non-empty list item — split into a new list item
+                editor?.chain().splitListItem('listItem').run();
+              }
+            } else {
+              // Outside a list: create a new paragraph block
+              const { tr } = state;
+              const split = tr.split($from.pos);
+              view.dispatch(split);
+            }
+            return true;
+          }
+
+          // Enter = submit (always)
           event.preventDefault();
           handleSubmit();
           return true;
@@ -101,6 +152,10 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
         debouncedOnChange(content);
       }
     },
+    onTransaction: () => {
+      // Trigger re-render so toolbar isActive() checks reflect current state
+      setTick(t => t + 1);
+    },
   });
 
   useImperativeHandle(ref, () => ({
@@ -111,6 +166,9 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
       }
     },
     getContent: () => {
+      return editor?.getHTML() || '';
+    },
+    getPlainText: () => {
       return editor?.getText() || '';
     },
   }), [editor]);
@@ -169,11 +227,16 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
   const handleSubmit = () => {
     if (!editor) return;
 
-    const content = editor.getText().trim();
-    if (!content) return;
+    // Check if there's any meaningful content
+    const plainText = editor.getText().trim();
+    if (!plainText) return;
 
-    // Pass content to parent
-    onSubmit(content);
+    // Convert HTML to markdown so formatting (bold, lists, code blocks)
+    // is preserved in prompts sent to Claude.
+    const html = editor.getHTML();
+    const markdown = turndown.turndown(html).trim();
+
+    onSubmit(markdown);
 
     // Clear the editor after submission (unless persistContent is true)
     if (!persistContent) {
@@ -235,6 +298,10 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
       type="button"
       variant={active ? 'default' : 'ghost'}
       size="sm"
+      // Prevent mousedown from stealing focus away from the editor.
+      // Without this, the editor loses focus before the command runs,
+      // causing toggleBulletList / toggleOrderedList etc. to silently fail.
+      onMouseDown={(e) => e.preventDefault()}
       onClick={onClick}
       disabled={disabled}
       title={title}
@@ -250,7 +317,7 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
       <div className="border-b border-border p-2 flex gap-1">
         <ToolbarButton
           onClick={() => editor.chain().focus().setParagraph().run()}
-          active={editor.isActive('paragraph')}
+          active={editor.isActive('paragraph') && !editor.isActive('bulletList') && !editor.isActive('orderedList')}
           title="Plain Text"
         >
           <Type className="h-4 w-4" />

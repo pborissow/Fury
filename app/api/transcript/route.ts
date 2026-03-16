@@ -89,7 +89,8 @@ function isInternalContent(content: string): boolean {
   if (
     trimmed.startsWith('<command-name>') ||
     trimmed.startsWith('<local-command') ||
-    trimmed.startsWith('<system-reminder>')
+    trimmed.startsWith('<system-reminder>') ||
+    trimmed.startsWith('<task-notification>')
   ) return true;
   // Skip Claude CLI slash commands
   if (/^\/[a-z]/.test(trimmed)) return true;
@@ -155,7 +156,7 @@ export async function GET(request: NextRequest) {
     const slug = projectPathToSlug(project);
     const jsonlPath = join(projectsBase, slug, `${sanitizedSessionId}.jsonl`);
 
-    let content: string;
+    let content = '';
     let resolvedJsonlPath = jsonlPath;
     try {
       content = await fs.readFile(jsonlPath, 'utf-8');
@@ -214,6 +215,11 @@ export async function GET(request: NextRequest) {
     // entry before the next user message.
     let pendingAssistant: TranscriptMessage | null = null;
 
+    // Track when we're inside an internal exchange (e.g. task-notification
+    // and its follow-up assistant responses / tool results) so we can
+    // suppress the entire sub-conversation from the displayed transcript.
+    let inInternalExchange = false;
+
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
@@ -229,6 +235,37 @@ export async function GET(request: NextRequest) {
         if (!msg) continue;
 
         if (entry.type === 'user') {
+          const isToolResult = Array.isArray(msg.content);
+          const isInternalString = typeof msg.content === 'string' && isInternalContent(msg.content);
+          // Task notifications trigger a full internal exchange — both the
+          // notification AND Claude's response to it should be hidden.
+          // Other internal messages (system-reminder, command-name, etc.)
+          // are just metadata; Claude's response to them IS the real answer.
+          const isTaskNotification = typeof msg.content === 'string' &&
+            msg.content.trim().startsWith('<task-notification>');
+
+          if (isTaskNotification) {
+            // Enter internal exchange — skip this message and all
+            // subsequent assistant responses / tool results until the
+            // next real user message.
+            inInternalExchange = true;
+            continue;
+          }
+
+          if (isInternalString) {
+            // Skip the user message but do NOT suppress the next assistant
+            // response — it's the real answer to the user's actual prompt.
+            continue;
+          }
+
+          if (isToolResult && inInternalExchange) {
+            // Tool result that belongs to the internal exchange — skip
+            continue;
+          }
+
+          // Real user message — leave internal exchange
+          inInternalExchange = false;
+
           // Flush any buffered assistant message before this user message
           if (pendingAssistant) {
             messages.push(pendingAssistant);
@@ -237,7 +274,6 @@ export async function GET(request: NextRequest) {
 
           // User messages: content is a string (direct message) or array (tool results)
           if (typeof msg.content === 'string') {
-            if (isInternalContent(msg.content)) continue;
             messages.push({
               role: 'user',
               content: msg.content,
@@ -246,6 +282,9 @@ export async function GET(request: NextRequest) {
           }
           // Skip array content (tool_result entries) - not useful for display
         } else if (entry.type === 'assistant') {
+          // Skip assistant responses that are part of a task-notification exchange
+          if (inInternalExchange) continue;
+
           if (!Array.isArray(msg.content)) continue;
 
           // Concatenate text blocks, skip tool_use, thinking, etc.

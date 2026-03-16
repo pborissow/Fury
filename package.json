@@ -37,7 +37,8 @@
     "react-resizable-panels": "^3.0.6",
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
-    "tailwind-merge": "^3.3.1"
+    "tailwind-merge": "^3.3.1",
+    "turndown": "^7.2.2"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
@@ -46,6 +47,7 @@
     "@types/node": "^20",
     "@types/react": "^19.2.13",
     "@types/react-dom": "^19.2.3",
+    "@types/turndown": "^5.0.6",
     "eslint": "^9",
     "eslint-config-next": "^16.1.6",
     "tailwindcss": "^4",

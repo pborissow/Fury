@@ -115,6 +115,7 @@ Fury does **not** maintain long-running Claude processes. Sessions are stateless
 
 - Node.js 20+
 - Claude CLI installed and authenticated (`claude` command available in PATH)
+- **Important:** Claude CLI auto-deletes session transcripts after 30 days by default. To preserve chat history indefinitely, add `"cleanupPeriodDays": 99999` to `~/.claude/settings.json`.
 
 ### Install & Run
 

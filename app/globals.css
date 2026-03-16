@@ -150,7 +150,7 @@
 }
 
 /* Custom prose styling for chat messages to match UI font sizes */
-@layer utilities {
+@layer base {
   .prose-chat {
     font-size: 0.875rem; /* text-sm */
     line-height: 1.25rem; /* Tighter line height to match UI */
@@ -244,7 +244,28 @@
     background-color: #3e3e3e;
   }
 
-  /* Bouncing dots animation for loading indicator */
+  .prose-chat table {
+    border-collapse: collapse;
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+  }
+}
+
+/* TipTap editor — restore list styles stripped by Tailwind Preflight */
+.tiptap ul,
+.tiptap ol,
+.tiptap menu {
+  padding-left: 1.5em;
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+}
+
+.tiptap ul { list-style-type: disc !important; }
+.tiptap ol { list-style-type: decimal !important; }
+.tiptap li { display: list-item; }
+
+/* Bouncing dots animation for loading indicator */
+@layer utilities {
   @keyframes bounce-dot {
     0%, 80%, 100% {
       transform: translateY(0);

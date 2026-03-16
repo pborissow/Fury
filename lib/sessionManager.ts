@@ -4,6 +4,7 @@ import { appendFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { projectPathToSlug } from './utils';
+import { eventBus } from './eventBus';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -14,7 +15,6 @@ interface QueuedMessage {
   prompt: string;
   resolve: (value: void | PromiseLike<void>) => void;
   reject: (error: Error) => void;
-  controller: ReadableStreamDefaultController;
 }
 
 /**
@@ -66,6 +66,7 @@ export interface StreamBuffer {
   events: StreamBufferEvent[];
   isActive: boolean;
   startedAt: number;
+  completedAt?: number;
 }
 
 interface SessionInfo {
@@ -94,6 +95,7 @@ class SessionManager {
   private sessions: Map<string, SessionInfo> = new Map();
   private readonly PROCESS_TIMEOUT = 5 * 60 * 1000; // 5 minutes
   private readonly ACTIVITY_TIMEOUT = 30 * 1000; // 30 seconds of no activity
+  private readonly BUFFER_TTL = 60 * 1000; // Keep completed buffers for 60 seconds
 
   getOrCreateSession(sessionId: string): SessionInfo {
     if (!this.sessions.has(sessionId)) {
@@ -111,8 +113,6 @@ class SessionManager {
   async processMessage(
     sessionId: string,
     prompt: string,
-    controller: ReadableStreamDefaultController,
-    encoder: TextEncoder,
     conversationHistory: Message[] = [],
     projectPath?: string
   ): Promise<void> {
@@ -129,7 +129,7 @@ class SessionManager {
 
     return new Promise((resolve, reject) => {
       // Add to queue
-      session.queue.push({ prompt, resolve, reject, controller });
+      session.queue.push({ prompt, resolve, reject });
 
       console.log(`[SessionManager] Added to queue. New length: ${session.queue.length}`);
 
@@ -138,14 +138,20 @@ class SessionManager {
       if (!session.isProcessing) {
         console.log(`[SessionManager] Starting queue processing for session ${sessionId}`);
         session.isProcessing = true;
-        this.processQueue(session, encoder);
+        eventBus.emitApp({
+          type: 'session:health',
+          sessionId,
+          isProcessing: true,
+          isStuck: false,
+        });
+        this.processQueue(session);
       } else {
         console.log(`[SessionManager] Session ${sessionId} is already processing, message queued`);
       }
     });
   }
 
-  private async processQueue(session: SessionInfo, encoder: TextEncoder): Promise<void> {
+  private async processQueue(session: SessionInfo): Promise<void> {
     console.log(`[SessionManager] processQueue called for session ${session.sessionId}`);
     console.log(`[SessionManager] isProcessing: ${session.isProcessing}, queue length: ${session.queue.length}`);
 
@@ -176,12 +182,7 @@ class SessionManager {
     console.log(`[SessionManager] Processing message from queue. Remaining: ${session.queue.length}`);
 
     try {
-      await this.executeClaudeCommand(
-        session,
-        message.prompt,
-        message.controller,
-        encoder
-      );
+      await this.executeClaudeCommand(session, message.prompt);
       console.log(`[SessionManager] Command completed successfully`);
       message.resolve();
     } catch (error) {
@@ -189,7 +190,13 @@ class SessionManager {
       message.reject(error as Error);
     } finally {
       session.currentProcess = null;
-      session.streamBuffer = undefined;
+
+      // Keep stream buffer alive so the frontend can restore state if the user
+      // switches back after completion. Mark inactive and set a TTL for cleanup.
+      if (session.streamBuffer) {
+        session.streamBuffer.isActive = false;
+        session.streamBuffer.completedAt = Date.now();
+      }
 
       console.log(`[SessionManager] Finished processing. Queue length: ${session.queue.length}`);
 
@@ -197,10 +204,16 @@ class SessionManager {
       if (session.queue.length > 0) {
         console.log(`[SessionManager] Processing next message in queue`);
         // Keep isProcessing = true and continue with next message
-        this.processQueue(session, encoder);
+        this.processQueue(session);
       } else {
         console.log(`[SessionManager] Queue empty, setting isProcessing = false`);
         session.isProcessing = false;
+        eventBus.emitApp({
+          type: 'session:health',
+          sessionId: session.sessionId,
+          isProcessing: false,
+          isStuck: false,
+        });
       }
     }
   }
@@ -208,34 +221,8 @@ class SessionManager {
   private executeClaudeCommand(
     session: SessionInfo,
     prompt: string,
-    controller: ReadableStreamDefaultController,
-    encoder: TextEncoder
   ): Promise<void> {
     return new Promise((resolve, reject) => {
-      let isClosed = false;
-      let assistantResponse = ''; // Accumulate the assistant's response
-
-      const safeEnqueue = (chunk: Uint8Array) => {
-        if (!isClosed) {
-          try {
-            controller.enqueue(chunk);
-          } catch (e) {
-            isClosed = true;
-          }
-        }
-      };
-
-      const safeClose = () => {
-        if (!isClosed) {
-          try {
-            controller.close();
-            isClosed = true;
-          } catch (e) {
-            isClosed = true;
-          }
-        }
-      };
-
       const buf = session.streamBuffer;
 
       const bufferText = (text: string) => {
@@ -285,7 +272,7 @@ class SessionManager {
           '--verbose',
           '--output-format=stream-json',
           '--include-partial-messages',
-          '--dangerously-skip-permissions',
+          '--allow-dangerously-skip-permissions',
           '--permission-mode=bypassPermissions',
         ];
 
@@ -340,6 +327,22 @@ class SessionManager {
         session.startedAt = Date.now();
         session.lastActivity = Date.now();
 
+        // Periodic stuck detection — emits health event only on status change
+        let wasStuck = false;
+        session.stuckCheckInterval = setInterval(() => {
+          const health = this.getSessionHealth(session.sessionId);
+          if (health.isStuck !== wasStuck) {
+            wasStuck = health.isStuck;
+            eventBus.emitApp({
+              type: 'session:health',
+              sessionId: session.sessionId,
+              isProcessing: health.isProcessing,
+              isStuck: health.isStuck,
+              stuckReason: health.stuckReason,
+            });
+          }
+        }, 5000);
+
         // Stream the output - parse JSON stream from Claude CLI
         let buffer = '';
         let lastTextBlockIndex = -1; // Track text blocks to add separation
@@ -360,19 +363,15 @@ class SessionManager {
                   const event = json.event;
                   if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
                     const text = event.delta.text;
-                    assistantResponse += text; // Accumulate response
                     bufferText(text);
-                    const chunk = encoder.encode(`data: ${JSON.stringify({ text })}\n\n`);
-                    safeEnqueue(chunk);
+                    eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, text });
                   }
                   // Handle content block start - detect when a new text block starts
                   else if (event.type === 'content_block_start') {
                     if (event.content_block?.type === 'text' && event.index !== lastTextBlockIndex && lastTextBlockIndex !== -1) {
                       // New text block starting - add a separator
-                      assistantResponse += '\n\n'; // Accumulate separator
                       bufferText('\n\n');
-                      const chunk = encoder.encode(`data: ${JSON.stringify({ text: '\n\n' })}\n\n`);
-                      safeEnqueue(chunk);
+                      eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, text: '\n\n' });
                     }
                     if (event.content_block?.type === 'text') {
                       lastTextBlockIndex = event.index;
@@ -381,8 +380,7 @@ class SessionManager {
                     else if (event.content_block?.type === 'tool_use') {
                       const toolName = event.content_block.name;
                       bufferEvent({ type: 'tool_start', name: toolName, ts: Date.now() });
-                      const chunk = encoder.encode(`data: ${JSON.stringify({ tool_use: { name: toolName, status: 'starting' } })}\n\n`);
-                      safeEnqueue(chunk);
+                      eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, toolUse: { name: toolName, status: 'starting' } });
                     }
                   }
                 }
@@ -393,21 +391,16 @@ class SessionManager {
                     if (block.type === 'text' && block.text) {
                       // Add separator between text blocks if this isn't the first one
                       if (i > 0 && json.message.content[i - 1]?.type === 'text') {
-                        assistantResponse += '\n\n'; // Accumulate separator
                         bufferText('\n\n');
-                        const separator = encoder.encode(`data: ${JSON.stringify({ text: '\n\n' })}\n\n`);
-                        safeEnqueue(separator);
+                        eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, text: '\n\n' });
                       }
-                      assistantResponse += block.text; // Accumulate response
                       bufferText(block.text);
-                      const chunk = encoder.encode(`data: ${JSON.stringify({ text: block.text })}\n\n`);
-                      safeEnqueue(chunk);
+                      eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, text: block.text });
                     }
                     // Handle tool use in complete message
                     else if (block.type === 'tool_use') {
                       bufferEvent({ type: 'tool_complete', name: block.name, input: block.input, ts: Date.now() });
-                      const chunk = encoder.encode(`data: ${JSON.stringify({ tool_use: { name: block.name, input: block.input, status: 'complete' } })}\n\n`);
-                      safeEnqueue(chunk);
+                      eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, toolUse: { name: block.name, status: 'complete', input: block.input } });
                     }
                   }
                 }
@@ -419,8 +412,7 @@ class SessionManager {
                         ? block.content.substring(0, 100) + (block.content.length > 100 ? '...' : '')
                         : JSON.stringify(block.content).substring(0, 100);
                       bufferEvent({ type: 'tool_result', preview: resultPreview, ts: Date.now() });
-                      const chunk = encoder.encode(`data: ${JSON.stringify({ tool_result: { preview: resultPreview } })}\n\n`);
-                      safeEnqueue(chunk);
+                      eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, toolResult: { preview: resultPreview } });
                     }
                   }
                 }
@@ -445,39 +437,35 @@ class SessionManager {
         // inherited the pipe handles and outlive the main process.
         // 'exit' fires as soon as the process itself exits.
         claude.on('exit', (code) => {
+          if (session.stuckCheckInterval) {
+            clearInterval(session.stuckCheckInterval);
+            session.stuckCheckInterval = undefined;
+          }
           // Clear start time when process ends
           session.startedAt = undefined;
           session.lastActivity = Date.now();
           if (session.streamBuffer) {
             session.streamBuffer.isActive = false;
           }
-          if (code !== 0 && code !== null && !isClosed) {
+          if (code !== 0 && code !== null) {
             bufferEvent({ type: 'error', content: `Claude CLI exited with code ${code}`, ts: Date.now() });
-            const chunk = encoder.encode(
-              `data: ${JSON.stringify({ error: `Claude CLI exited with code ${code}` })}\n\n`
-            );
-            safeEnqueue(chunk);
+            eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, error: `Claude CLI exited with code ${code}` });
             reject(new Error(`Claude CLI exited with code ${code}`));
           } else {
             resolve();
           }
-          safeClose();
         });
 
         // Handle process errors
         claude.on('error', (error) => {
-          const chunk = encoder.encode(
-            `data: ${JSON.stringify({ error: error.message })}\n\n`
-          );
-          safeEnqueue(chunk);
-          safeClose();
+          if (session.stuckCheckInterval) {
+            clearInterval(session.stuckCheckInterval);
+            session.stuckCheckInterval = undefined;
+          }
+          eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, error: error.message });
           reject(error);
         });
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-        const chunk = encoder.encode(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
-        safeEnqueue(chunk);
-        safeClose();
         reject(error as Error);
       }
     });
@@ -534,7 +522,17 @@ class SessionManager {
   }
 
   getStreamBuffer(sessionId: string): StreamBuffer | null {
-    return this.sessions.get(sessionId)?.streamBuffer ?? null;
+    const session = this.sessions.get(sessionId);
+    if (!session?.streamBuffer) return null;
+
+    // Expire completed buffers after TTL
+    const buf = session.streamBuffer;
+    if (!buf.isActive && buf.completedAt && Date.now() - buf.completedAt > this.BUFFER_TTL) {
+      session.streamBuffer = undefined;
+      return null;
+    }
+
+    return buf;
   }
 
   killSession(sessionId: string): void {
@@ -547,9 +545,16 @@ class SessionManager {
       }
       if (session.stuckCheckInterval) {
         clearInterval(session.stuckCheckInterval);
+        session.stuckCheckInterval = undefined;
       }
     }
     this.sessions.delete(sessionId);
+    eventBus.emitApp({
+      type: 'session:health',
+      sessionId,
+      isProcessing: false,
+      isStuck: false,
+    });
   }
 }
 
