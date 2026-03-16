@@ -44,7 +44,13 @@ export async function DELETE(request: NextRequest) {
     // Not managed by Fury — that's fine
   }
 
-  // 2. Delete the session JSONL file
+  // 2. Remove from SQLite archive FIRST — before deleting the JSONL file,
+  //    so the history watcher can't re-archive from the still-existing file.
+  await deleteArchivedSession(sanitizedSessionId).catch(err =>
+    console.error('[DeleteSession] Failed to delete from archive:', err)
+  );
+
+  // 3. Delete the session JSONL file
   if (project) {
     const slug = projectPathToSlug(project);
     const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sanitizedSessionId}.jsonl`);
@@ -58,7 +64,7 @@ export async function DELETE(request: NextRequest) {
     }
   }
 
-  // 3. Remove matching entries from history.jsonl (uses raw sessionId —
+  // 4. Remove matching entries from history.jsonl (uses raw sessionId —
   //    history entries store the original UUID from Claude CLI)
   const historyPath = join(homedir(), '.claude', 'history.jsonl');
   try {
@@ -82,11 +88,6 @@ export async function DELETE(request: NextRequest) {
       console.error('[DeleteSession] Failed to update history.jsonl:', err);
     }
   }
-
-  // Remove from SQLite archive
-  await deleteArchivedSession(sanitizedSessionId).catch(err =>
-    console.error('[DeleteSession] Failed to delete from archive:', err)
-  );
 
   return NextResponse.json({ success: true, results });
 }

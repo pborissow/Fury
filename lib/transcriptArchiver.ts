@@ -4,7 +4,7 @@
  */
 
 import { createHash } from 'crypto';
-import { readFile, readdir, stat } from 'fs/promises';
+import { open, readFile, readdir, stat } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { getDb } from './db';
@@ -53,11 +53,12 @@ export async function archiveTranscript(
   display: string,
   jsonlContent: string,
   messages: TranscriptMessage[],
-  rawLines?: string[]
+  rawLines?: string[],
+  skipHashCheck?: boolean
 ): Promise<void> {
   const hash = computeHash(jsonlContent);
 
-  if (await isCurrentlyArchived(sessionId, hash)) return;
+  if (!skipHashCheck && await isCurrentlyArchived(sessionId, hash)) return;
 
   const db = await getDb();
   const now = Date.now();
@@ -73,18 +74,20 @@ export async function archiveTranscript(
       ? new Date(messages[0].timestamp).getTime() || now
       : now);
 
-  // Build statements: UPSERT session, clear old data, then insert new data
+  // Build statements: UPSERT session (with NULL hash), clear old data, then insert new data.
+  // The hash is set to NULL initially so that if a later batch fails, the incomplete
+  // archive will be retried on the next call (NULL hash never matches).
   const preamble = [
     {
       sql: `INSERT INTO sessions (session_id, project, display, message_count, created_at, updated_at, jsonl_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, NULL)
             ON CONFLICT(session_id) DO UPDATE SET
               project = excluded.project,
               display = excluded.display,
               message_count = excluded.message_count,
               updated_at = excluded.updated_at,
-              jsonl_hash = excluded.jsonl_hash`,
-      args: [sessionId, project, display.substring(0, 200), messages.length, createdAt, now, hash],
+              jsonl_hash = NULL`,
+      args: [sessionId, project, display.substring(0, 200), messages.length, createdAt, now],
     },
     { sql: 'DELETE FROM messages WHERE session_id = ?', args: [sessionId] },
     { sql: 'DELETE FROM raw_jsonl WHERE session_id = ?', args: [sessionId] },
@@ -113,6 +116,12 @@ export async function archiveTranscript(
   for (let offset = CHUNK_SIZE; offset < inserts.length; offset += CHUNK_SIZE) {
     await db.batch(inserts.slice(offset, offset + CHUNK_SIZE), 'write');
   }
+
+  // All batches succeeded — stamp the real hash to mark the archive as complete
+  await db.execute({
+    sql: 'UPDATE sessions SET jsonl_hash = ? WHERE session_id = ?',
+    args: [hash, sessionId],
+  });
 }
 
 /**
@@ -218,8 +227,9 @@ async function archiveSessionFromDisk(
   project: string,
   display?: string
 ): Promise<void> {
+  const sanitizedId = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
   const slug = projectPathToSlug(project);
-  const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sessionId}.jsonl`);
+  const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sanitizedId}.jsonl`);
 
   let content: string;
   try {
@@ -237,21 +247,45 @@ async function archiveSessionFromDisk(
   if (messages.length === 0) return;
 
   const label = display || messages.find(m => m.role === 'user')?.content?.substring(0, 200) || sessionId;
-  await archiveTranscript(sessionId, project, label, content, messages, rawLines);
+  await archiveTranscript(sessionId, project, label, content, messages, rawLines, true);
+}
+
+/**
+ * Read the tail of a file (last `bytes` bytes). Returns the partial
+ * content as a UTF-8 string. Falls back to full read for small files.
+ */
+async function readTail(filePath: string, bytes = 8192): Promise<string> {
+  const fh = await open(filePath, 'r');
+  try {
+    const fileStat = await fh.stat();
+    if (fileStat.size <= bytes) {
+      const buf = Buffer.alloc(fileStat.size);
+      await fh.read(buf, 0, fileStat.size, 0);
+      return buf.toString('utf-8');
+    }
+    const buf = Buffer.alloc(bytes);
+    await fh.read(buf, 0, bytes, fileStat.size - bytes);
+    return buf.toString('utf-8');
+  } finally {
+    await fh.close();
+  }
 }
 
 /**
  * When history.jsonl changes, find recently-active sessions and archive them.
- * Reads the tail of history.jsonl to identify which sessions were updated.
+ * Reads only the tail (~8KB) of history.jsonl to identify which sessions were updated.
  */
 async function onHistoryUpdated(): Promise<void> {
   try {
     const historyPath = join(homedir(), '.claude', 'history.jsonl');
-    const content = await readFile(historyPath, 'utf-8');
-    const lines = content.trim().split('\n');
+    const tail = await readTail(historyPath);
+
+    // The first line may be partial (cut mid-JSON) — skip it
+    const lines = tail.split('\n');
+    const safeLines = lines.slice(1).filter(l => l.trim());
 
     // Only process the most recent entries (last 20) to keep it fast
-    const recentLines = lines.slice(-20);
+    const recentLines = safeLines.slice(-20);
     const seen = new Set<string>();
 
     for (const line of recentLines) {
@@ -286,6 +320,23 @@ async function onTranscriptUpdated(sessionId: string, project: string): Promise<
  * Call this from the SSE events route alongside liveSessionScanner.start()
  * and fileWatchers.startHistoryWatcher().
  */
+/**
+ * Run an async function with a single retry after a delay.
+ */
+async function withRetry(fn: () => Promise<void>, label: string, delayMs = 2000): Promise<void> {
+  try {
+    await fn();
+  } catch (err) {
+    console.warn(`[ArchiveListener] ${label} failed, retrying in ${delayMs}ms:`, err);
+    await new Promise(r => setTimeout(r, delayMs));
+    try {
+      await fn();
+    } catch (retryErr) {
+      console.error(`[ArchiveListener] ${label} retry failed:`, retryErr);
+    }
+  }
+}
+
 export function startArchiveListener(): void {
   const g = globalThis as any;
   if (g[LISTENER_KEY]) return;
@@ -294,14 +345,13 @@ export function startArchiveListener(): void {
   eventBus.onApp(payload => {
     switch (payload.type) {
       case 'history-updated':
-        onHistoryUpdated().catch(err =>
-          console.error('[ArchiveListener] history-updated error:', err)
-        );
+        withRetry(onHistoryUpdated, 'history-updated');
         break;
 
       case 'transcript:updated':
-        onTranscriptUpdated(payload.sessionId, payload.project).catch(err =>
-          console.error('[ArchiveListener] transcript:updated error:', err)
+        withRetry(
+          () => onTranscriptUpdated(payload.sessionId, payload.project),
+          `transcript:updated(${payload.sessionId})`
         );
         break;
     }

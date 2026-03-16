@@ -72,16 +72,22 @@ export function getDb(): Promise<Client> {
   if (g[PROMISE_KEY]) return g[PROMISE_KEY] as Promise<Client>;
 
   g[PROMISE_KEY] = (async () => {
-    const client = createClient({ url: getDbPath() });
-    await initDb(client);
-    g[GLOBAL_KEY] = client;
+    try {
+      const client = createClient({ url: getDbPath() });
+      await initDb(client);
+      g[GLOBAL_KEY] = client;
 
-    // Kick off startup scan (fire-and-forget, don't block callers)
-    scanAndArchiveAll(client).catch(err =>
-      console.error('[DB] Startup scan error:', err)
-    );
+      // Kick off startup scan (fire-and-forget, don't block callers)
+      scanAndArchiveAll(client).catch(err =>
+        console.error('[DB] Startup scan error:', err)
+      );
 
-    return client;
+      return client;
+    } catch (err) {
+      // Clear the cached promise so the next call retries initialization
+      delete g[PROMISE_KEY];
+      throw err;
+    }
   })();
 
   return g[PROMISE_KEY];
@@ -183,7 +189,7 @@ async function scanAndArchiveAll(client: Client): Promise<void> {
         const project = info.project;
         const display = info.display || messages[0]?.content?.substring(0, 200) || sessionId;
 
-        await archiveTranscript(sessionId, project, display, content, messages, rawLines);
+        await archiveTranscript(sessionId, project, display, content, messages, rawLines, true);
         archived++;
       } catch (err) {
         errors++;
