@@ -52,7 +52,9 @@ app/
   api/
     claude/route.ts     # POST - Streams Claude CLI output via SSE
     history/route.ts    # GET/DELETE - Read/clear ~/.claude/history.jsonl
-    transcript/route.ts # GET - Read session transcript from CLI JSONL files
+    transcript/route.ts # GET - Read transcript (JSONL with SQLite fallback)
+    session/route.ts    # DELETE/PATCH - Session deletion and rewind
+    events/route.ts     # GET - SSE stream for real-time updates
     live-sessions/route.ts # GET - List currently active CLI sessions
     tree/route.ts       # GET - Build file tree for a directory
     directories/route.ts# GET - Browse filesystem directories
@@ -64,11 +66,17 @@ app/
 
 lib/
   sessionManager.ts     # Singleton that spawns/queues Claude CLI processes (--session-id/--resume)
+  db.ts                 # SQLite singleton (fury.db), migrations, startup scan
+  transcriptArchiver.ts # Archive/load/delete transcripts, reactive event listener
+  transcriptParser.ts   # Shared JSONL-to-messages parsing logic
+  eventBus.ts           # App-wide event emitter (SSE, file watchers, archiver)
+  fileWatchers.ts       # Watches history.jsonl and session JSONL files for changes
+  liveSessionScanner.ts # Periodic scan for running Claude CLI processes
   workflowPersistence.ts # Read/write workflows to .claude-workflows/
   uiStatePersistence.ts  # Read/write UI state to .claude-ui-state/
   promptPersistence.ts   # Read/write saved prompts to .claude-prompts/
   recent-directories.ts  # Extract recent dirs from history & workflows
-  utils.ts               # cn() utility for class merging
+  utils.ts               # cn() utility, projectPathToSlug
 
 components/
   DrawflowCanvas.tsx     # Drawflow wrapper with drag-drop node creation
@@ -89,11 +97,50 @@ components/
 |------|----------|
 | Session transcripts | `~/.claude/projects/<slug>/<sessionId>.jsonl` (Claude CLI managed) |
 | Chat history | `~/.claude/history.jsonl` (Claude CLI global, also appended by Fury) |
+| **Transcript archive** | **`~/.claude/fury.db` (SQLite, Fury managed)** |
 | Workflows | `.claude-workflows/*.json` (project-local) |
 | UI state | `.claude-ui-state/state.json` (project-local) |
 | Saved prompts | `.claude-prompts/*.json` (project-local) |
 | Session notes | `~/.claude-session-notes/*.md` (user home) |
 | Theme | `localStorage` (browser) |
+
+### Transcript Database
+
+Claude Code auto-deletes session JSONL files after 30 days (controlled by `cleanupPeriodDays` in `~/.claude/settings.json`). Fury maintains an independent SQLite archive at `~/.claude/fury.db` so transcripts survive cleanup.
+
+**How it works:**
+
+The database is populated automatically through four triggers:
+1. **Startup scan** — On first connection, scans all `~/.claude/projects/*/` JSONL files and archives any that are new or changed.
+2. **History watcher** — When `history.jsonl` changes (any session, including external CLI), archives the recently-active sessions.
+3. **Transcript watcher** — When a watched session's JSONL changes during a live session, archives it immediately.
+4. **Archive-on-read** — When `/api/transcript` loads a JSONL, persists it as a fire-and-forget side effect.
+
+A SHA-256 hash per session ensures duplicate archival is a no-op. When a JSONL file is missing (deleted by cleanup), the transcript API falls back to SQLite transparently. The history list merges archived sessions so cleaned-up sessions remain visible.
+
+**Schema** (3 tables):
+- `sessions` — session metadata, project path, display text, message count, content hash
+- `messages` — parsed transcript messages (role, content, timestamp, turn index)
+- `raw_jsonl` — original JSONL lines preserved for full-fidelity restoration
+
+**Technology:** `@libsql/client` (Turso/libSQL) with WAL mode for concurrent read/write safety.
+
+**Manual population:**
+
+```bash
+npx tsx scripts/populate-db.ts           # Archive all existing JSONL files
+npx tsx scripts/populate-db.ts --dry-run # Preview without writing
+npx tsx scripts/populate-db.ts --verbose # Show per-file details
+```
+
+**Key files:**
+
+| File | Role |
+|------|------|
+| `lib/db.ts` | Database singleton, migrations, startup scan |
+| `lib/transcriptArchiver.ts` | Archive/load/delete functions, reactive event listener |
+| `lib/transcriptParser.ts` | Shared JSONL parsing logic |
+| `scripts/populate-db.ts` | Standalone population script |
 
 ## Session Lifecycle
 
@@ -135,3 +182,4 @@ Open [http://localhost:3879](http://localhost:3879) in your browser.
 | `npm run build` | Production build |
 | `npm start` | Start production server on port 3879 |
 | `npm run lint` | Run ESLint |
+| `npx tsx scripts/populate-db.ts` | Populate transcript database from existing JSONL files |

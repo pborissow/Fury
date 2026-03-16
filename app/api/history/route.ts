@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { readFile, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
+import { loadArchivedSessions } from '@/lib/transcriptArchiver';
 
 export const runtime = 'nodejs';
 
@@ -67,6 +68,31 @@ export async function GET(req: NextRequest) {
         }))
         .sort((a, b) => b.timestamp - a.timestamp)
         .slice(0, 50);
+
+      // Merge archived sessions from SQLite (surfaces sessions that survived
+      // in the DB after Claude deleted the JSONL + history entries)
+      try {
+        const archivedSessions = await loadArchivedSessions();
+        const existingIds = new Set(entries.map(e => e.sessionId).filter(Boolean));
+
+        for (const archived of archivedSessions) {
+          if (existingIds.has(archived.session_id)) continue;
+          if (isSkippableDisplay(archived.display)) continue;
+          entries.push({
+            display: archived.display,
+            timestamp: archived.updated_at,
+            project: archived.project,
+            sessionId: archived.session_id,
+            messageCount: archived.message_count,
+          });
+        }
+
+        // Re-sort after merging and re-apply limit
+        entries.sort((a, b) => b.timestamp - a.timestamp);
+        entries.splice(50);
+      } catch (archiveErr) {
+        console.error('[History] Failed to load archived sessions:', archiveErr);
+      }
 
       return new Response(JSON.stringify({ entries }), {
         status: 200,

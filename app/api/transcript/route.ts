@@ -4,14 +4,10 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { realpath } from 'fs/promises';
 import { projectPathToSlug } from '@/lib/utils';
+import { parseTranscriptJsonl, type TranscriptMessage } from '@/lib/transcriptParser';
+import { archiveTranscript, loadTranscript } from '@/lib/transcriptArchiver';
 
 export const runtime = 'nodejs';
-
-interface TranscriptMessage {
-  role: 'user' | 'assistant';
-  content: string;
-  timestamp: string;
-}
 
 // How long (ms) since the JSONL was last modified before we consider
 // the response "stale" and eligible for an incomplete-response suggestion.
@@ -83,19 +79,12 @@ function detectIntentLanguage(text: string): string | null {
   return null;
 }
 
-function isInternalContent(content: string): boolean {
-  const trimmed = content.trim();
-  if (trimmed === '') return true;
-  if (
-    trimmed.startsWith('<command-name>') ||
-    trimmed.startsWith('<local-command') ||
-    trimmed.startsWith('<system-reminder>') ||
-    trimmed.startsWith('<task-notification>')
-  ) return true;
-  // Skip Claude CLI slash commands
-  if (/^\/[a-z]/.test(trimmed)) return true;
-  return false;
-}
+// Cache parsed history.jsonl keyed by file mtime to avoid re-reading
+// the entire file on every /api/transcript request.
+let historyCache: {
+  mtimeMs: number;
+  bySession: Map<string, TranscriptMessage[]>;
+} | null = null;
 
 /**
  * When no JSONL transcript exists (pre-persistence sessions), extract
@@ -104,33 +93,42 @@ function isInternalContent(content: string): boolean {
 async function getHistoryPrompts(sessionId: string): Promise<TranscriptMessage[]> {
   try {
     const historyPath = join(homedir(), '.claude', 'history.jsonl');
-    const content = await fs.readFile(historyPath, 'utf-8');
-    const lines = content.trim().split('\n');
-    const messages: TranscriptMessage[] = [];
+    const fileStat = await fs.stat(historyPath);
 
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-        if (entry.sessionId !== sessionId) continue;
-        if (!entry.display || !entry.display.trim()) continue;
-        // Skip slash commands and bare "exit"
-        const trimmed = entry.display.trim();
-        if (/^\/[a-z]/i.test(trimmed)) continue;
-        if (trimmed.toLowerCase() === 'exit') continue;
+    if (!historyCache || historyCache.mtimeMs !== fileStat.mtimeMs) {
+      const content = await fs.readFile(historyPath, 'utf-8');
+      const lines = content.trim().split('\n');
+      const bySession = new Map<string, TranscriptMessage[]>();
 
-        messages.push({
-          role: 'user',
-          content: entry.display,
-          timestamp: typeof entry.timestamp === 'number'
-            ? new Date(entry.timestamp).toISOString()
-            : entry.timestamp,
-        });
-      } catch {
-        // Skip unparseable lines
+      for (const line of lines) {
+        try {
+          const entry = JSON.parse(line);
+          if (!entry.sessionId || !entry.display || !entry.display.trim()) continue;
+          const trimmed = entry.display.trim();
+          if (/^\/[a-z]/i.test(trimmed)) continue;
+          if (trimmed.toLowerCase() === 'exit') continue;
+
+          let arr = bySession.get(entry.sessionId);
+          if (!arr) {
+            arr = [];
+            bySession.set(entry.sessionId, arr);
+          }
+          arr.push({
+            role: 'user',
+            content: entry.display,
+            timestamp: typeof entry.timestamp === 'number'
+              ? new Date(entry.timestamp).toISOString()
+              : entry.timestamp,
+          });
+        } catch {
+          // Skip unparseable lines
+        }
       }
+
+      historyCache = { mtimeMs: fileStat.mtimeMs, bySession };
     }
 
-    return messages;
+    return historyCache.bySession.get(sessionId) || [];
   } catch {
     return [];
   }
@@ -191,7 +189,19 @@ export async function GET(request: NextRequest) {
             if (!found) throw error;
           }
         } catch {
-          // All attempts failed — fall back to user prompts from history.jsonl
+          // All JSONL attempts failed — try SQLite archive, then history.jsonl
+          try {
+            const archived = await loadTranscript(sanitizedSessionId);
+            if (archived && archived.messages.length > 0) {
+              return NextResponse.json({
+                messages: archived.messages,
+                fromArchive: true,
+              });
+            }
+          } catch (archiveErr) {
+            console.error('[Transcript API] Archive fallback error:', archiveErr);
+          }
+
           const historyMessages = await getHistoryPrompts(sanitizedSessionId);
           return NextResponse.json({
             messages: historyMessages,
@@ -203,120 +213,8 @@ export async function GET(request: NextRequest) {
       }
     }
 
-    const messages: TranscriptMessage[] = [];
-    // Also collect raw entries for incomplete-response detection.
-    // We need the full content arrays (including tool_use blocks).
-    const rawEntries: any[] = [];
-    const lines = content.split('\n').filter(line => line.trim());
-
-    // Buffer the latest assistant message per turn.
-    // Claude Code logs every streaming update (stop_reason: null) as a
-    // separate JSONL entry. We only want the last (most complete) assistant
-    // entry before the next user message.
-    let pendingAssistant: TranscriptMessage | null = null;
-
-    // Track when we're inside an internal exchange (e.g. task-notification
-    // and its follow-up assistant responses / tool results) so we can
-    // suppress the entire sub-conversation from the displayed transcript.
-    let inInternalExchange = false;
-
-    for (const line of lines) {
-      try {
-        const entry = JSON.parse(line);
-        rawEntries.push(entry);
-
-        // Skip non-message types
-        if (entry.type !== 'user' && entry.type !== 'assistant') continue;
-
-        // Skip meta messages
-        if (entry.isMeta) continue;
-
-        const msg = entry.message;
-        if (!msg) continue;
-
-        if (entry.type === 'user') {
-          const isToolResult = Array.isArray(msg.content);
-          const isInternalString = typeof msg.content === 'string' && isInternalContent(msg.content);
-          // Task notifications trigger a full internal exchange — both the
-          // notification AND Claude's response to it should be hidden.
-          // Other internal messages (system-reminder, command-name, etc.)
-          // are just metadata; Claude's response to them IS the real answer.
-          const isTaskNotification = typeof msg.content === 'string' &&
-            msg.content.trim().startsWith('<task-notification>');
-
-          if (isTaskNotification) {
-            // Enter internal exchange — skip this message and all
-            // subsequent assistant responses / tool results until the
-            // next real user message.
-            inInternalExchange = true;
-            continue;
-          }
-
-          if (isInternalString) {
-            // Skip the user message but do NOT suppress the next assistant
-            // response — it's the real answer to the user's actual prompt.
-            continue;
-          }
-
-          if (isToolResult && inInternalExchange) {
-            // Tool result that belongs to the internal exchange — skip
-            continue;
-          }
-
-          // Real user message — leave internal exchange
-          inInternalExchange = false;
-
-          // Flush any buffered assistant message before this user message
-          if (pendingAssistant) {
-            messages.push(pendingAssistant);
-            pendingAssistant = null;
-          }
-
-          // User messages: content is a string (direct message) or array (tool results)
-          if (typeof msg.content === 'string') {
-            messages.push({
-              role: 'user',
-              content: msg.content,
-              timestamp: entry.timestamp,
-            });
-          }
-          // Skip array content (tool_result entries) - not useful for display
-        } else if (entry.type === 'assistant') {
-          // Skip assistant responses that are part of a task-notification exchange
-          if (inInternalExchange) continue;
-
-          if (!Array.isArray(msg.content)) continue;
-
-          // Concatenate text blocks, skip tool_use, thinking, etc.
-          const textParts: string[] = [];
-          for (const block of msg.content) {
-            if (block.type === 'text' && block.text) {
-              textParts.push(block.text);
-            }
-          }
-
-          if (textParts.length === 0) continue;
-
-          const fullText = textParts.join('\n\n');
-          if (!fullText.trim()) continue;
-
-          // Buffer instead of pushing — later entries for the same turn
-          // will overwrite this with more complete content
-          pendingAssistant = {
-            role: 'assistant',
-            content: fullText,
-            timestamp: entry.timestamp,
-          };
-        }
-      } catch {
-        // Skip unparseable lines
-      }
-    }
-
-    // Flush the last buffered assistant message
-    if (pendingAssistant) {
-      messages.push(pendingAssistant);
-    }
+    // Parse the JSONL using shared parser
+    const { messages, rawLines, rawEntries } = parseTranscriptJsonl(content);
 
     // --- Unprocessed prompts detection ---
     // history.jsonl entries are written the instant the user hits send,
@@ -405,6 +303,11 @@ export async function GET(request: NextRequest) {
         // stat failed — skip suggestion
       }
     }
+
+    // Archive to SQLite (fire-and-forget — never blocks the response)
+    const display = historyPrompts[0]?.content || messages.find(m => m.role === 'user')?.content || sanitizedSessionId;
+    archiveTranscript(sanitizedSessionId, project, display.substring(0, 200), content, messages, rawLines)
+      .catch(err => console.error('[Transcript API] Archive error:', err));
 
     return NextResponse.json({ messages, suggestedPrompt, unprocessedPrompt });
   } catch (error) {

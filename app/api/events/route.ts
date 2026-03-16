@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { eventBus, AppEvent } from '@/lib/eventBus';
 import { liveSessionScanner } from '@/lib/liveSessionScanner';
 import { fileWatchers } from '@/lib/fileWatchers';
+import { startArchiveListener } from '@/lib/transcriptArchiver';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -14,6 +15,7 @@ export async function GET(request: NextRequest) {
   // Ensure global services are running (idempotent)
   liveSessionScanner.start();
   fileWatchers.startHistoryWatcher();
+  startArchiveListener();
 
   // If the client wants transcript updates for a specific session, start watching
   if (watchSessionId && watchProject) {

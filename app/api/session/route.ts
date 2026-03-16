@@ -4,21 +4,8 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { sessionManager } from '@/lib/sessionManager';
 import { projectPathToSlug } from '@/lib/utils';
-
-/**
- * Check if a user message content string is internal/meta and should be skipped.
- */
-function isInternalContent(content: string): boolean {
-  const trimmed = content.trim();
-  if (!trimmed) return true;
-  if (
-    trimmed.startsWith('<command-name>') ||
-    trimmed.startsWith('<local-command') ||
-    trimmed.startsWith('<system-reminder>')
-  ) return true;
-  if (/^\/[a-z]/.test(trimmed)) return true;
-  return false;
-}
+import { deleteArchivedSession, invalidateArchive } from '@/lib/transcriptArchiver';
+import { isInternalContent } from '@/lib/transcriptParser';
 
 export const runtime = 'nodejs';
 
@@ -42,9 +29,14 @@ export async function DELETE(request: NextRequest) {
     return NextResponse.json({ error: 'sessionId is required' }, { status: 400 });
   }
 
+  // Sanitized ID for filesystem paths (prevents path traversal).
+  // The raw sessionId is still needed for sessionManager (keyed by original ID)
+  // and history.jsonl comparison (stores original IDs from Claude CLI).
+  const sanitizedSessionId = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
   const results: string[] = [];
 
-  // 1. Kill the process if Fury is managing it
+  // 1. Kill the process if Fury is managing it (uses raw sessionId — sessions
+  //    are keyed by their original UUID, which is already safe for in-memory lookup)
   try {
     sessionManager.killSession(sessionId);
     results.push('Killed active process');
@@ -55,7 +47,7 @@ export async function DELETE(request: NextRequest) {
   // 2. Delete the session JSONL file
   if (project) {
     const slug = projectPathToSlug(project);
-    const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sessionId}.jsonl`);
+    const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sanitizedSessionId}.jsonl`);
     try {
       await unlink(jsonlPath);
       results.push('Deleted session JSONL');
@@ -66,7 +58,8 @@ export async function DELETE(request: NextRequest) {
     }
   }
 
-  // 3. Remove matching entries from history.jsonl
+  // 3. Remove matching entries from history.jsonl (uses raw sessionId —
+  //    history entries store the original UUID from Claude CLI)
   const historyPath = join(homedir(), '.claude', 'history.jsonl');
   try {
     const content = await readFile(historyPath, 'utf-8');
@@ -89,6 +82,11 @@ export async function DELETE(request: NextRequest) {
       console.error('[DeleteSession] Failed to update history.jsonl:', err);
     }
   }
+
+  // Remove from SQLite archive
+  await deleteArchivedSession(sanitizedSessionId).catch(err =>
+    console.error('[DeleteSession] Failed to delete from archive:', err)
+  );
 
   return NextResponse.json({ success: true, results });
 }
@@ -147,6 +145,11 @@ export async function PATCH(request: NextRequest) {
 
     const truncatedLines = lines.slice(0, cutLineIndex);
     await writeFile(jsonlPath, truncatedLines.join('\n') + '\n', 'utf-8');
+
+    // Invalidate SQLite archive so the next transcript GET re-archives the truncated version
+    await invalidateArchive(sanitizedSessionId).catch(err =>
+      console.error('[Session/Rewind] Failed to invalidate archive:', err)
+    );
 
     console.log(`[Session/Rewind] Truncated session ${sanitizedSessionId} at turn ${turnIndex} (removed ${lines.length - cutLineIndex} lines)`);
 
