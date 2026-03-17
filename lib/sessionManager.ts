@@ -5,6 +5,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { projectPathToSlug } from './utils';
 import { eventBus } from './eventBus';
+import { killProcessTree } from './killProcessTree';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -79,6 +80,7 @@ interface SessionInfo {
   startedAt?: number; // When current process started
   stuckCheckInterval?: NodeJS.Timeout; // Interval for checking if stuck
   streamBuffer?: StreamBuffer;
+  stoppedByUser?: boolean; // Set when user explicitly stops processing
 }
 
 interface SessionHealth {
@@ -191,6 +193,14 @@ class SessionManager {
     } finally {
       session.currentProcess = null;
 
+      // If stopProcessing() or killSession() already handled state cleanup,
+      // don't duplicate it here — just bail out.
+      if (session.stoppedByUser || !this.sessions.has(session.sessionId)) {
+        session.stoppedByUser = false;
+        console.log(`[SessionManager] Skipping finally cleanup — session was stopped/killed`);
+        return;
+      }
+
       // Keep stream buffer alive so the frontend can restore state if the user
       // switches back after completion. Mark inactive and set a TTL for cleanup.
       if (session.streamBuffer) {
@@ -296,6 +306,10 @@ class SessionManager {
           stdio: ['pipe', 'pipe', 'pipe'],
           cwd,
           env: cleanEnv,
+          // On Unix, create a new process group so killProcessTree can
+          // send signals to the group without killing the Fury server.
+          // On Windows detached opens a new console window, so skip it.
+          ...(process.platform !== 'win32' ? { detached: true } : {}),
         });
 
         // Write prompt to stdin and close it so claude reads it
@@ -447,7 +461,14 @@ class SessionManager {
           if (session.streamBuffer) {
             session.streamBuffer.isActive = false;
           }
-          if (code !== 0 && code !== null) {
+          // If the user explicitly stopped this process, treat it as a
+          // clean exit regardless of the exit code.
+          if (session.stoppedByUser) {
+            // Don't reset stoppedByUser here — the processQueue finally
+            // block checks it to skip duplicate cleanup. It will be
+            // cleared there instead.
+            resolve();
+          } else if (code !== 0 && code !== null) {
             bufferEvent({ type: 'error', content: `Claude CLI exited with code ${code}`, ts: Date.now() });
             eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, error: `Claude CLI exited with code ${code}` });
             reject(new Error(`Claude CLI exited with code ${code}`));
@@ -535,17 +556,83 @@ class SessionManager {
     return buf;
   }
 
-  killSession(sessionId: string): void {
+  /**
+   * Stop the currently running process for a session but keep the session
+   * alive so the user can continue chatting. Queued messages are rejected.
+   */
+  async stopProcessing(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    // Mark as user-stopped so the exit handler resolves cleanly
+    session.stoppedByUser = true;
+
+    // Drain the queue — reject any pending messages
+    while (session.queue.length > 0) {
+      const queued = session.queue.shift()!;
+      queued.reject(new Error('Processing stopped by user'));
+    }
+
+    // Clear stuck-check interval
+    if (session.stuckCheckInterval) {
+      clearInterval(session.stuckCheckInterval);
+      session.stuckCheckInterval = undefined;
+    }
+
+    // Kill the entire process tree
+    if (session.currentProcess) {
+      const proc = session.currentProcess;
+      session.currentProcess = null;
+      await killProcessTree(proc);
+    }
+
+    // Mark the stream buffer as stopped (but preserve its text)
+    if (session.streamBuffer) {
+      session.streamBuffer.isActive = false;
+      session.streamBuffer.completedAt = Date.now();
+    }
+
+    // The processQueue finally block will fire via the exit event and
+    // emit session:health. But if the process was already null (edge case),
+    // emit it ourselves.
+    if (session.isProcessing) {
+      session.isProcessing = false;
+      session.startedAt = undefined;
+      eventBus.emitApp({
+        type: 'session:health',
+        sessionId,
+        isProcessing: false,
+        isStuck: false,
+      });
+    }
+  }
+
+  /**
+   * Destroy a session entirely — kills the process tree and removes all
+   * in-memory state. Use stopProcessing() if you just want to stop the
+   * current turn without tearing down the session.
+   */
+  async killSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (session) {
+      session.stoppedByUser = true;
       session.streamBuffer = undefined;
-      if (session.currentProcess) {
-        session.currentProcess.kill();
-        session.currentProcess = null;
+
+      // Drain the queue
+      while (session.queue.length > 0) {
+        const queued = session.queue.shift()!;
+        queued.reject(new Error('Session killed'));
       }
+
       if (session.stuckCheckInterval) {
         clearInterval(session.stuckCheckInterval);
         session.stuckCheckInterval = undefined;
+      }
+
+      if (session.currentProcess) {
+        const proc = session.currentProcess;
+        session.currentProcess = null;
+        await killProcessTree(proc);
       }
     }
     this.sessions.delete(sessionId);

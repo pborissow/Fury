@@ -683,6 +683,10 @@ export default function Home() {
 
       const data = JSON.parse(e.data);
 
+      // Ignore stream data that arrives after the user has stopped processing.
+      // Without this guard, buffered events could overwrite the cleared state.
+      if (!transcriptLoadingRef.current) return;
+
       if (data.text) {
         setTranscriptStreaming(prev => prev + data.text);
         setStreamEvents(prev => {
@@ -990,7 +994,7 @@ export default function Home() {
         },
         body: JSON.stringify({
           sessionId: viewingTranscriptId,
-          action: 'kill',
+          action: 'stop',
         }),
       });
 
@@ -1210,10 +1214,13 @@ export default function Home() {
       await fetch('/api/health', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: viewingTranscriptId, action: 'kill' }),
+        body: JSON.stringify({ sessionId: viewingTranscriptId, action: 'stop' }),
       });
     } catch (error) {
       console.error('[App] Failed to stop session:', error);
+    } finally {
+      // Always reset UI state — the SSE health event should also fire,
+      // but reset here too in case the fetch itself failed.
       setTranscriptLoading(false);
       setTranscriptStreaming('');
     }

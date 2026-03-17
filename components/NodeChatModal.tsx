@@ -134,13 +134,28 @@ export default function NodeChatModal({
     }
   };
 
-  const handleStop = () => {
+  const handleStop = async () => {
+    // Abort the client-side fetch stream
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
-      setIsLoading(false);
-      setStreamingMessage('');
     }
+    // Also kill the server-side Claude CLI process so it stops executing
+    if (nodeId) {
+      try {
+        await fetch('/api/health', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: `node-${nodeId}`, action: 'stop' }),
+        });
+      } catch (error) {
+        console.error('[NodeChatModal] Failed to stop server process:', error);
+      }
+    }
+    setIsLoading(false);
+    setToolActivity('');
+    // Don't clear streamingMessage here — let the AbortError handler
+    // in handleSend preserve the partial text
   };
 
   const handleSend = async (userMessage: string) => {
@@ -162,6 +177,9 @@ export default function NodeChatModal({
     // Create new AbortController for this request
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
+
+    // Hoisted so the catch block can access partial text on abort
+    let accumulatedText = '';
 
     try {
       // Generate a temporary session ID for this node
@@ -192,7 +210,6 @@ export default function NodeChatModal({
         throw new Error('No reader available');
       }
 
-      let accumulatedText = '';
       let pendingAskUserQuestion: { questions: any[] } | null = null;
 
       while (true) {
@@ -266,9 +283,15 @@ export default function NodeChatModal({
     } catch (error) {
       // Check if the error is due to abort
       if (error instanceof Error && error.name === 'AbortError') {
-        const abortedMessages = [...updatedMessages, { role: 'assistant' as const, content: '_Processing stopped by user._' }];
+        // Preserve any partial response that was streamed before the abort
+        const partialText = accumulatedText || '';
+        const stoppedContent = partialText
+          ? partialText + '\n\n_— Processing stopped by user._'
+          : '_Processing stopped by user._';
+        const abortedMessages = [...updatedMessages, { role: 'assistant' as const, content: stoppedContent }];
         const abortedSession = { ...session, messages: abortedMessages };
         setSession(abortedSession);
+        setStreamingMessage('');
         if (nodeId) {
           onSessionUpdate(nodeId, abortedSession);
         }

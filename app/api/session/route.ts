@@ -38,7 +38,7 @@ export async function DELETE(request: NextRequest) {
   // 1. Kill the process if Fury is managing it (uses raw sessionId — sessions
   //    are keyed by their original UUID, which is already safe for in-memory lookup)
   try {
-    sessionManager.killSession(sessionId);
+    await sessionManager.killSession(sessionId);
     results.push('Killed active process');
   } catch {
     // Not managed by Fury — that's fine

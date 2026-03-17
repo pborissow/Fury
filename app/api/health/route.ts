@@ -39,8 +39,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (action === 'stop') {
+      await sessionManager.stopProcessing(sessionId);
+      return NextResponse.json({ success: true, message: 'Processing stopped' });
+    }
+
     if (action === 'kill') {
-      sessionManager.killSession(sessionId);
+      await sessionManager.killSession(sessionId);
       return NextResponse.json({ success: true, message: 'Session killed' });
     }
 
