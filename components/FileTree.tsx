@@ -55,14 +55,10 @@ function FileTreeItem({ node, depth, onFileDoubleClick, fileStatuses }: FileTree
   const isDirectory = node.type === 'directory';
   const hasChildren = isDirectory && node.children && node.children.length > 0;
 
-  const handleToggle = () => {
+  const handleClick = () => {
     if (isDirectory) {
       setIsExpanded(!isExpanded);
-    }
-  };
-
-  const handleDoubleClick = () => {
-    if (!isDirectory && onFileDoubleClick) {
+    } else if (onFileDoubleClick) {
       onFileDoubleClick(node.path);
     }
   };
@@ -83,8 +79,7 @@ function FileTreeItem({ node, depth, onFileDoubleClick, fileStatuses }: FileTree
           transition-colors
         `}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
-        onClick={handleToggle}
-        onDoubleClick={handleDoubleClick}
+        onClick={handleClick}
       >
         {isDirectory ? (
           <>
@@ -300,7 +295,7 @@ export default function FileTree({ projectPath, onFileDoubleClick }: FileTreePro
                   <div
                     key={file.path}
                     className="flex items-center gap-2 px-3 py-1 cursor-pointer hover:bg-accent rounded-sm text-sm transition-colors"
-                    onDoubleClick={() => onFileDoubleClick?.(file.path)}
+                    onClick={() => onFileDoubleClick?.(file.path)}
                   >
                     <File className={`h-4 w-4 shrink-0 ${fileStatus ? VCS_STATUS_COLORS[fileStatus] : 'text-muted-foreground'}`} />
                     <span className={`truncate ${fileStatus ? VCS_STATUS_COLORS[fileStatus] : ''}`}>{file.name}</span>

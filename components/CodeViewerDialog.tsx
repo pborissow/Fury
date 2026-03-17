@@ -6,6 +6,9 @@ import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { Resizable } from 're-resizable';
 import hljs from 'highlight.js';
 import { diffLines } from 'diff';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
 
 // File extensions that should open in the code viewer
 const CODE_EXTENSIONS = new Set([
@@ -261,11 +264,17 @@ interface CodeViewerDialogProps {
   onClose: () => void;
 }
 
+function isMarkdownFile(fileName: string): boolean {
+  const ext = fileName.toLowerCase().split('.').pop();
+  return ext === 'md' || ext === 'mdx';
+}
+
 export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeViewerDialogProps) {
   const [content, setContent] = useState<string | null>(null);
   const [originalContent, setOriginalContent] = useState<string | null>(null);
   const [hasOriginal, setHasOriginal] = useState(false);
   const [showDiff, setShowDiff] = useState(false);
+  const [mdView, setMdView] = useState<'preview' | 'raw'>('preview');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const codeRef = useRef<HTMLPreElement>(null);
@@ -308,10 +317,13 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
     }, 500);
   }, []);
 
-  // Reset diff state when a new file is opened (but keep size/position)
+  const isMd = isMarkdownFile(fileName);
+
+  // Reset view state when a new file is opened (but keep size/position)
   useEffect(() => {
     if (filePath) {
       setShowDiff(false);
+      setMdView('preview');
     }
   }, [filePath]);
 
@@ -347,7 +359,9 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
         // Original is optional — file might not be in VCS or might be new
         if (originalRes.ok) {
           const originalData = await originalRes.json();
-          if (originalData.content !== currentData.content) {
+          // Normalize line endings before comparing — git returns LF but
+          // the filesystem may use CRLF (Windows), causing false diffs.
+          if (normalizeLineEndings(originalData.content) !== normalizeLineEndings(currentData.content)) {
             setOriginalContent(originalData.content);
             setHasOriginal(true);
           }
@@ -436,7 +450,8 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
             minHeight={MIN_HEIGHT}
             maxWidth="95vw"
             maxHeight="95vh"
-            className="bg-background rounded-lg border shadow-lg flex flex-col overflow-hidden"
+            className="bg-background rounded-lg border flex flex-col overflow-hidden"
+            style={{ boxShadow: '0 8px 40px rgba(0, 0, 0, 0.8), 0 2px 12px rgba(0, 0, 0, 0.6)' }}
             handleStyles={{
               right: { cursor: 'ew-resize' },
               bottom: { cursor: 'ns-resize' },
@@ -455,7 +470,7 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
           >
             {/* Draggable header */}
             <div
-              className="flex items-center gap-2 px-4 py-3 border-b shrink-0 cursor-grab active:cursor-grabbing select-none"
+              className="bg-card flex items-center gap-2 px-4 py-3 border-b border-border shrink-0 cursor-grab active:cursor-grabbing select-none"
               onPointerDown={handleDragStart}
               onPointerMove={handleDragMove}
               onPointerUp={handleDragEnd}
@@ -468,16 +483,19 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
                 </span>
               </DialogPrimitive.Title>
 
-              {/* Diff toggle */}
+              {/* Diff toggle — hidden when no VCS changes, disabled during markdown preview */}
               {hasOriginal && (
                 <button
                   onClick={() => setShowDiff(!showDiff)}
+                  disabled={isMd && mdView === 'preview' && !showDiff}
                   className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
                     showDiff
                       ? 'bg-primary text-primary-foreground'
-                      : 'bg-muted text-muted-foreground hover:text-foreground'
+                      : isMd && mdView === 'preview'
+                        ? 'bg-muted text-muted-foreground/40 cursor-not-allowed'
+                        : 'bg-muted text-muted-foreground hover:text-foreground'
                   }`}
-                  title="Toggle diff view"
+                  title={isMd && mdView === 'preview' && !showDiff ? 'Switch to Source tab to use diff view' : 'Toggle diff view'}
                 >
                   <GitCompareArrows className="h-3.5 w-3.5" />
                   Diff
@@ -489,6 +507,42 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
                 <span className="sr-only">Close</span>
               </DialogPrimitive.Close>
             </div>
+
+            {/* Markdown view tabs */}
+            {isMd && !showDiff && (
+              <div className="border-b border-border px-4 flex items-center gap-6 shrink-0" style={{ backgroundColor: '#1e1e1e' }}>
+                <button
+                  onClick={() => setMdView('preview')}
+                  className={`
+                    relative py-2 text-sm font-medium transition-colors
+                    ${mdView === 'preview'
+                      ? 'text-foreground'
+                      : 'text-muted-foreground hover:text-foreground'
+                    }
+                  `}
+                >
+                  Preview
+                  {mdView === 'preview' && (
+                    <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
+                  )}
+                </button>
+                <button
+                  onClick={() => setMdView('raw')}
+                  className={`
+                    relative py-2 text-sm font-medium transition-colors
+                    ${mdView === 'raw'
+                      ? 'text-foreground'
+                      : 'text-muted-foreground hover:text-foreground'
+                    }
+                  `}
+                >
+                  Source
+                  {mdView === 'raw' && (
+                    <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
+                  )}
+                </button>
+              </div>
+            )}
 
             {/* Content area */}
             <div className="flex-1 overflow-auto min-h-0">
@@ -505,10 +559,30 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
                 </div>
               )}
 
-              {content !== null && !loading && !showDiff && (
+              {content !== null && !loading && !showDiff && isMd && mdView === 'preview' && (
+                <div className="p-6 prose-chat text-foreground max-w-none overflow-auto h-full" style={{ backgroundColor: '#1b1b1b' }}>
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[rehypeHighlight]}
+                    components={{
+                      code({ className, children, ...props }) {
+                        // rehype-highlight adds hljs + language-* classes to fenced blocks.
+                        // Ensure the hljs class is always present so the theme applies.
+                        const hasHljs = className?.includes('hljs');
+                        const cls = hasHljs ? className : `hljs ${className || ''}`.trim();
+                        return <code className={cls} {...props}>{children}</code>;
+                      },
+                    }}
+                  >
+                    {content}
+                  </ReactMarkdown>
+                </div>
+              )}
+
+              {content !== null && !loading && !showDiff && (!isMd || mdView === 'raw') && (
                 <div className="flex text-sm font-mono">
                   {/* Line numbers */}
-                  <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0 bg-background">
+                  <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0" style={{ backgroundColor: '#0d1117' }}>
                     {lines.map((_, i) => (
                       <div key={i} className="leading-6">{i + 1}</div>
                     ))}
@@ -565,11 +639,11 @@ function DiffView({ rows }: { rows: DiffRow[] }) {
   }, [firstDiffIndex]);
 
   return (
-    <div ref={containerRef} className="flex text-sm font-mono min-w-0">
+    <div ref={containerRef} className="hljs flex text-sm font-mono min-w-0">
       {/* Left side (original) */}
       <div className="flex flex-1 min-w-0 border-r border-border overflow-x-auto">
         {/* Line numbers */}
-        <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0 bg-background z-10">
+        <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0 z-10" style={{ backgroundColor: '#0d1117' }}>
           {rows.map((row, i) => (
             <div key={i} className="leading-6" style={{ backgroundColor: ROW_BG[row.leftType] }}
               {...(i === firstDiffIndex ? { 'data-first-diff': true } : {})}
@@ -604,7 +678,7 @@ function DiffView({ rows }: { rows: DiffRow[] }) {
       {/* Right side (current) */}
       <div className="flex flex-1 min-w-0 overflow-x-auto">
         {/* Line numbers */}
-        <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0 bg-background z-10">
+        <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0 z-10" style={{ backgroundColor: '#0d1117' }}>
           {rows.map((row, i) => (
             <div key={i} className="leading-6" style={{ backgroundColor: ROW_BG[row.rightType] }}>
               {row.rightNum ?? ' '}
