@@ -688,6 +688,13 @@ export default function Home() {
       if (!transcriptLoadingRef.current) return;
 
       if (data.text) {
+        // If Claude streams more text after calling AskUserQuestion, the
+        // question was already handled (e.g. the CLI responded with an error
+        // and Claude continued). Clear the pending dialog so the normal
+        // transcript-refresh completion path runs instead.
+        if (pendingAskUserQuestion) {
+          pendingAskUserQuestion = null;
+        }
         setTranscriptStreaming(prev => prev + data.text);
         setStreamEvents(prev => {
           const last = prev[prev.length - 1];

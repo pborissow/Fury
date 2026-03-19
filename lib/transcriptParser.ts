@@ -66,7 +66,11 @@ export function parseTranscriptJsonl(content: string): {
 
         if (isInternalString) continue;
 
-        if (isToolResult && inInternalExchange) continue;
+        // Tool results are arrays (never displayed as user messages) but must
+        // still flow through so inInternalExchange gets cleared below.  The
+        // old `if (isToolResult && inInternalExchange) continue;` caused the
+        // flag to stick permanently after a <task-notification>, hiding every
+        // subsequent message for the rest of the transcript.
 
         inInternalExchange = false;
 
