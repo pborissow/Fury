@@ -26,6 +26,7 @@ interface RichTextEditorProps {
   persistContent?: boolean; // If true, don't clear after submit
   showButtonBar?: boolean; // If true, show mic and send buttons
   debounceMs?: number; // Debounce delay for onChange callback (default: 300ms)
+  statusBar?: React.ReactNode; // Optional status bar rendered below the editor
 }
 
 export interface RichTextEditorHandle {
@@ -46,6 +47,7 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
   persistContent = false,
   showButtonBar = true,
   debounceMs = 300,
+  statusBar,
 }, ref) {
   const [isRecording, setIsRecording] = useState(false);
   const [isSupported, setIsSupported] = useState(true);
@@ -364,6 +366,9 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
       <div className="flex-1 overflow-y-auto">
         <EditorContent editor={editor} className="text-foreground text-sm h-full" />
       </div>
+
+      {/* Optional status bar (e.g. provider indicator) */}
+      {statusBar}
 
       {/* Footer with Microphone and Send Buttons - only shown if showButtonBar is true */}
       {showButtonBar && (

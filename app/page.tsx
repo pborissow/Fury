@@ -257,6 +257,7 @@ export default function Home() {
   const [transcriptOverlayMessages, setTranscriptOverlayMessages] = useState<Message[]>([]);
   const [transcriptStreaming, setTranscriptStreaming] = useState('');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
+  const [providerLabel, setProviderLabel] = useState<string>('');
   const transcriptLoadingRef = useRef(false);
   const transcriptStreamingRef = useRef('');
   const activeSessionRef = useRef<string | null>(null);
@@ -581,6 +582,21 @@ export default function Home() {
       setLiveSessionIds(new Set(data.liveSessionIds || []));
     }).catch(() => {});
 
+    // Fetch current provider status
+    const formatProviderLabel = (data: { current: string; bedrockEnv?: Record<string, string> }) => {
+      const source = data.current === 'bedrock' ? 'Bedrock' : 'Anthropic';
+      const raw = data.bedrockEnv?.ANTHROPIC_MODEL || '';
+      // Convert "us.anthropic.claude-sonnet-4-6" → "Claude Sonnet 4.6"
+      const match = raw.match(/claude-(\w+)-(\d+)-(\d+)/i);
+      const model = match
+        ? `Claude ${match[1][0].toUpperCase()}${match[1].slice(1)} ${match[2]}.${match[3]}`
+        : 'Claude';
+      return `${model} (${source})`;
+    };
+    fetch('/api/provider').then(res => res.json()).then(data => {
+      setProviderLabel(formatProviderLabel(data));
+    }).catch(() => setProviderLabel(''));
+
     const es = new EventSource('/api/events');
 
     es.addEventListener('live-sessions', (e: MessageEvent) => {
@@ -590,6 +606,13 @@ export default function Home() {
 
     es.addEventListener('history-updated', () => {
       fetchHistory();
+    });
+
+    es.addEventListener('provider-switched', () => {
+      // Re-fetch full status for the label
+      fetch('/api/provider').then(res => res.json()).then(status => {
+        setProviderLabel(formatProviderLabel(status));
+      }).catch(() => {});
     });
 
     es.onerror = () => {
@@ -1714,6 +1737,11 @@ export default function Home() {
                             submitLabel={transcriptLoading ? 'Sending...' : 'Send'}
                             isProcessing={transcriptLoading}
                             onStop={handleTranscriptStop}
+                            statusBar={providerLabel ? (
+                              <div style={{ fontSize: '9px', fontWeight: 100, padding: '0 8px 1px' }} className="text-muted-foreground">
+                                {providerLabel}
+                              </div>
+                            ) : undefined}
                           />
                         </div>
                       </Panel>

@@ -74,6 +74,10 @@ export async function GET(request: NextRequest) {
               send('transcript-updated', payload);
             }
             break;
+
+          case 'provider:switched':
+            send('provider-switched', payload);
+            break;
         }
       };
 

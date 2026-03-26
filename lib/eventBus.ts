@@ -34,12 +34,19 @@ export interface TranscriptUpdatedEvent {
   project: string;
 }
 
+export interface ProviderSwitchedEvent {
+  type: 'provider:switched';
+  provider: 'anthropic' | 'bedrock';
+  message: string;
+}
+
 export type AppEvent =
   | LiveSessionsEvent
   | HistoryUpdatedEvent
   | SessionStreamEvent
   | SessionHealthEvent
-  | TranscriptUpdatedEvent;
+  | TranscriptUpdatedEvent
+  | ProviderSwitchedEvent;
 
 class AppEventBus extends EventEmitter {
   emitApp(payload: AppEvent): boolean {

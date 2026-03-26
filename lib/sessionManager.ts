@@ -6,6 +6,7 @@ import { join } from 'path';
 import { projectPathToSlug } from './utils';
 import { eventBus } from './eventBus';
 import { killProcessTree } from './killProcessTree';
+import { detectUsageLimit, handleUsageLimitDetected } from './providerSwitch';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -432,6 +433,14 @@ class SessionManager {
                 }
               } catch (e) {
                 console.error('Failed to parse JSON line:', line, e);
+                // Non-JSON output may contain usage-limit messages
+                const usageLimit = detectUsageLimit(line);
+                if (usageLimit.detected) {
+                  console.log('[SessionManager] Usage limit detected in stdout — triggering provider switch');
+                  handleUsageLimitDetected(usageLimit).catch(err =>
+                    console.error('[SessionManager] Failed to auto-switch provider:', err),
+                  );
+                }
               }
             }
           }
@@ -443,6 +452,15 @@ class SessionManager {
           session.lastActivity = Date.now();
           const errorMessage = data.toString();
           console.error('Claude CLI error:', errorMessage);
+
+          // Detect usage-limit messages and auto-switch to Bedrock
+          const usageLimit = detectUsageLimit(errorMessage);
+          if (usageLimit.detected) {
+            console.log('[SessionManager] Usage limit detected in stderr — triggering provider switch');
+            handleUsageLimitDetected(usageLimit).catch(err =>
+              console.error('[SessionManager] Failed to auto-switch provider:', err),
+            );
+          }
         });
 
         // Use 'exit' instead of 'close' for process lifecycle management.
