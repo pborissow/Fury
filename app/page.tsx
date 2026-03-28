@@ -5,24 +5,7 @@ import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import Dialog, { ConfirmDialog, AlertDialog, type DialogButton } from '@/components/Dialog';
 import {
   TooltipProvider,
 } from '@/components/ui/tooltip';
@@ -35,7 +18,7 @@ import DrawflowCanvas from '@/components/DrawflowCanvas';
 import WorkflowsPanel from '@/components/WorkflowsPanel';
 import NodeChatModal from '@/components/NodeChatModal';
 import AskUserQuestionDialog from '@/components/AskUserQuestionDialog';
-import { Plus, AlertTriangle, Sun, Moon, FolderTree, FileText, Activity, Trash2, RotateCcw, Copy, Check } from 'lucide-react';
+import { Plus, AlertTriangle, Sun, Moon, FolderTree, FileText, Activity, Trash2, RotateCcw, Copy, Check, Plug } from 'lucide-react';
 import { getRecentDirectories } from '@/lib/recent-directories';
 
 // Client-side only timestamp component to avoid hydration mismatch
@@ -70,6 +53,41 @@ const HistoryTimestamp = ({ timestamp }: { timestamp: number }) => {
 // Convert plain text to HTML paragraphs so TipTap can parse line breaks
 const textToHtml = (text: string) =>
   text.split('\n').map(line => `<p>${line || '<br>'}</p>`).join('');
+
+// Code block with hover-to-copy button for use inside ReactMarkdown
+const CopyableCodeBlock = ({ children, ...props }: React.HTMLAttributes<HTMLPreElement>) => {
+  const [copied, setCopied] = useState(false);
+  const preRef = useRef<HTMLPreElement>(null);
+
+  const handleCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const text = preRef.current?.textContent || '';
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy code block:', err);
+    }
+  };
+
+  return (
+    <div className="relative group/code">
+      <button
+        onClick={handleCopy}
+        className="absolute top-2 right-2 opacity-0 group-hover/code:opacity-100 transition-opacity p-1 rounded bg-background/80 hover:bg-background border border-border"
+        title="Copy code"
+      >
+        {copied ? (
+          <Check className="h-3.5 w-3.5 text-green-500" />
+        ) : (
+          <Copy className="h-3.5 w-3.5 text-muted-foreground" />
+        )}
+      </button>
+      <pre ref={preRef} {...props}>{children}</pre>
+    </div>
+  );
+};
 
 // Chat bubble wrapper with hover-to-copy button
 const ChatBubble = ({ label, children, headerExtra, className, rawContent, isMarkdown }: {
@@ -180,6 +198,7 @@ export default function Home() {
   // Health check state
   const [isStuck, setIsStuck] = useState(false);
   const [stuckReason, setStuckReason] = useState<string | undefined>();
+  const [showKillConfirm, setShowKillConfirm] = useState(false);
 
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
@@ -205,8 +224,58 @@ export default function Home() {
   const [suggestedPrompt, setSuggestedPrompt] = useState<{ text: string; context: string } | null>(null);
 
   // Right panel view state
-  type RightPanelView = 'files' | 'notes' | 'stream';
+  type RightPanelView = 'files' | 'notes' | 'stream' | 'mcp';
   const [rightPanelView, setRightPanelView] = useState<RightPanelView>('stream');
+
+  // MCP servers state
+  const [mcpServers, setMcpServers] = useState<{ name: string; url: string; status: string; statusDetail: string }[]>([]);
+  const [mcpLoading, setMcpLoading] = useState(false);
+  const [mcpError, setMcpError] = useState<string | null>(null);
+
+  const fetchMcpServers = useCallback(async () => {
+    setMcpLoading(true);
+    setMcpError(null);
+    try {
+      const res = await fetch('/api/mcp');
+      const data = await res.json();
+      setMcpServers(data.servers || []);
+      if (data.error) setMcpError(data.error);
+    } catch (err) {
+      setMcpError(err instanceof Error ? err.message : 'Failed to fetch MCP servers');
+    } finally {
+      setMcpLoading(false);
+    }
+  }, []);
+
+  // Add MCP server dialog
+  const [showAddMcp, setShowAddMcp] = useState(false);
+  const [mcpForm, setMcpForm] = useState({ name: '', transport: 'stdio' as 'stdio' | 'http', commandOrUrl: '', args: '', envVars: '', scope: 'user' as 'local' | 'user' | 'project' });
+  const [mcpAddLoading, setMcpAddLoading] = useState(false);
+  const [mcpAddError, setMcpAddError] = useState<string | null>(null);
+
+  const handleAddMcpServer = useCallback(async () => {
+    setMcpAddLoading(true);
+    setMcpAddError(null);
+    try {
+      const res = await fetch('/api/mcp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(mcpForm),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        setMcpAddError(data.error || 'Failed to add server');
+        return;
+      }
+      setShowAddMcp(false);
+      setMcpForm({ name: '', transport: 'stdio', commandOrUrl: '', args: '', envVars: '', scope: 'user' });
+      fetchMcpServers();
+    } catch (err) {
+      setMcpAddError(err instanceof Error ? err.message : 'Failed to add server');
+    } finally {
+      setMcpAddLoading(false);
+    }
+  }, [mcpForm, fetchMcpServers]);
 
   // Code viewer state
   const [codeViewerPath, setCodeViewerPath] = useState<string | null>(null);
@@ -1518,33 +1587,15 @@ export default function Home() {
                   {/* Stuck process kill banner */}
                   {isStuck && (
                     <div className="p-2 border-b border-border flex justify-end">
-                      <AlertDialog>
-                        <AlertDialogTrigger asChild>
-                          <Button
-                            variant="destructive"
-                            size="sm"
-                            className="flex items-center gap-2"
-                          >
-                            <AlertTriangle className="h-4 w-4" />
-                            Process Stuck - Kill
-                          </Button>
-                        </AlertDialogTrigger>
-                        <AlertDialogContent>
-                          <AlertDialogHeader>
-                            <AlertDialogTitle>Kill stuck process?</AlertDialogTitle>
-                            <AlertDialogDescription>
-                              {stuckReason}<br /><br />
-                              This will terminate the Claude CLI process. The current response will be lost.
-                            </AlertDialogDescription>
-                          </AlertDialogHeader>
-                          <AlertDialogFooter>
-                            <AlertDialogCancel>Cancel</AlertDialogCancel>
-                            <AlertDialogAction onClick={handleKillStuckSession}>
-                              Kill Process
-                            </AlertDialogAction>
-                          </AlertDialogFooter>
-                        </AlertDialogContent>
-                      </AlertDialog>
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        className="flex items-center gap-2"
+                        onClick={() => setShowKillConfirm(true)}
+                      >
+                        <AlertTriangle className="h-4 w-4" />
+                        Process Stuck - Kill
+                      </Button>
                     </div>
                   )}
 
@@ -1648,9 +1699,15 @@ export default function Home() {
                                       <RotateCcw className="h-3.5 w-3.5 text-muted-foreground" />
                                     </button>
                                   )}
-                                  <ChatBubble label="You" className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-blue-900 text-white border-blue-700" rawContent={turn.user.content}>
-                                    <div className="whitespace-pre-wrap break-words text-sm">
-                                      {turn.user.content}
+                                  <ChatBubble label="You" className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-blue-900 text-white border-blue-700" rawContent={turn.user.content} isMarkdown>
+                                    <div className="prose-chat prose-invert max-w-none">
+                                      <ReactMarkdown
+                                        remarkPlugins={[remarkGfm]}
+                                        rehypePlugins={[[rehypeHighlight, { detect: true }]]}
+                                        components={{ pre: CopyableCodeBlock }}
+                                      >
+                                        {turn.user.content}
+                                      </ReactMarkdown>
                                     </div>
                                   </ChatBubble>
                                 </div>
@@ -1675,6 +1732,7 @@ export default function Home() {
                                       <ReactMarkdown
                                         remarkPlugins={[remarkGfm]}
                                         rehypePlugins={[[rehypeHighlight, { detect: true }]]}
+                                        components={{ pre: CopyableCodeBlock }}
                                       >
                                         {turn.assistant.content}
                                       </ReactMarkdown>
@@ -1804,6 +1862,18 @@ export default function Home() {
                 >
                   <FileText className="h-4 w-4" />
                   Notes
+                </Button>
+                <Button
+                  variant={rightPanelView === 'mcp' ? 'default' : 'ghost'}
+                  size="sm"
+                  onClick={() => {
+                    setRightPanelView('mcp');
+                    fetchMcpServers();
+                  }}
+                  className="flex items-center gap-2"
+                >
+                  <Plug className="h-4 w-4" />
+                  MCP
                 </Button>
               </div>
 
@@ -1949,6 +2019,80 @@ export default function Home() {
                 </div>
               )}
 
+              {/* MCP View */}
+              {rightPanelView === 'mcp' && (
+                <div className="flex-1 overflow-y-auto p-4">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-sm font-semibold text-foreground">MCP Servers</h3>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => {
+                          setMcpAddError(null);
+                          setShowAddMcp(true);
+                        }}
+                        className="h-7 w-7 p-0"
+                        title="Add MCP server"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={fetchMcpServers}
+                        disabled={mcpLoading}
+                        className="h-7 w-7 p-0"
+                        title="Refresh"
+                      >
+                        <RotateCcw className={`h-3.5 w-3.5 ${mcpLoading ? 'animate-spin' : ''}`} />
+                      </Button>
+                    </div>
+                  </div>
+                  {mcpLoading && mcpServers.length === 0 ? (
+                    <div className="flex items-center justify-center h-32 text-muted-foreground text-sm">
+                      Loading MCP servers...
+                    </div>
+                  ) : mcpError && mcpServers.length === 0 ? (
+                    <div className="text-sm text-red-400 p-3 bg-red-500/10 rounded">
+                      {mcpError}
+                    </div>
+                  ) : mcpServers.length === 0 ? (
+                    <div className="flex items-center justify-center h-32 text-muted-foreground text-sm">
+                      No MCP servers configured.
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {mcpServers.map((server) => (
+                        <div
+                          key={server.name}
+                          className="p-3 rounded-lg border border-border bg-muted/30"
+                        >
+                          <div className="flex items-center gap-2">
+                            {server.status === 'connected' ? (
+                              <Check className="h-4 w-4 text-green-500 flex-shrink-0" />
+                            ) : server.status === 'needs_auth' ? (
+                              <AlertTriangle className="h-4 w-4 text-yellow-500 flex-shrink-0" />
+                            ) : server.status === 'error' ? (
+                              <AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" />
+                            ) : (
+                              <span className="h-4 w-4 flex items-center justify-center text-muted-foreground flex-shrink-0">?</span>
+                            )}
+                            <span className="text-sm font-medium text-foreground truncate">{server.name}</span>
+                          </div>
+                          <div className="mt-1 ml-6 text-xs text-muted-foreground truncate" title={server.url}>
+                            {server.url}
+                          </div>
+                          <div className="mt-0.5 ml-6 text-xs text-muted-foreground">
+                            {server.statusDetail}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
             </div>
           </Panel>
         </PanelGroup>
@@ -2035,32 +2179,125 @@ export default function Home() {
       {/* Code Viewer Dialog */}
       <CodeViewerDialog filePath={codeViewerPath} onClose={closeCodeViewer} />
 
-      <Dialog open={intermediaryMessages.length > 0} onOpenChange={(open) => { if (!open) setIntermediaryMessages([]); }}>
-        <DialogContent className="max-w-3xl h-[80vh] flex flex-col p-0">
-          <DialogHeader className="px-6 pt-6 pb-2 shrink-0">
-            <DialogTitle>Intermediary Messages</DialogTitle>
-            <DialogDescription>
-              {intermediaryMessages.length} intermediary response{intermediaryMessages.length !== 1 ? 's' : ''} before the final output
-            </DialogDescription>
-          </DialogHeader>
-          <div className="flex-1 overflow-y-auto px-6 pb-6 space-y-4">
-            {intermediaryMessages.map((msg, i) => (
-              <div key={i} className="flex justify-start">
-                <div className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border">
-                  <div className="text-xs opacity-70 mb-1">Claude</div>
-                  <div className="prose-chat max-w-none">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      rehypePlugins={[[rehypeHighlight, { detect: true }]]}
-                    >
-                      {msg.content}
-                    </ReactMarkdown>
-                  </div>
+      {/* Add MCP Server Dialog */}
+      <Dialog
+        open={showAddMcp}
+        onOpenChange={(open) => { if (!open) setShowAddMcp(false); }}
+        title="Add MCP Server"
+        defaultWidth={480}
+        defaultHeight={520}
+        minWidth={380}
+        minHeight={400}
+        buttons={[
+          { label: 'Cancel', onClick: () => setShowAddMcp(false), variant: 'ghost' },
+          { label: mcpAddLoading ? 'Adding...' : 'Add Server', onClick: handleAddMcpServer, disabled: mcpAddLoading || !mcpForm.name || !mcpForm.commandOrUrl },
+        ]}
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">Configure a new MCP server connection.</p>
+          <div>
+            <label className="text-sm font-medium text-foreground block mb-1">Name</label>
+            <input
+              type="text"
+              value={mcpForm.name}
+              onChange={(e) => setMcpForm(f => ({ ...f, name: e.target.value }))}
+              placeholder="my-server"
+              className="w-full px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+          </div>
+          <div>
+            <label className="text-sm font-medium text-foreground block mb-1">Transport</label>
+            <select
+              value={mcpForm.transport}
+              onChange={(e) => setMcpForm(f => ({ ...f, transport: e.target.value as 'stdio' | 'http' }))}
+              className="w-full px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+            >
+              <option value="stdio">stdio</option>
+              <option value="http">http</option>
+            </select>
+          </div>
+          <div>
+            <label className="text-sm font-medium text-foreground block mb-1">
+              {mcpForm.transport === 'http' ? 'URL' : 'Command'}
+            </label>
+            <input
+              type="text"
+              value={mcpForm.commandOrUrl}
+              onChange={(e) => setMcpForm(f => ({ ...f, commandOrUrl: e.target.value }))}
+              placeholder={mcpForm.transport === 'http' ? 'https://mcp.example.com/mcp' : 'npx my-mcp-server'}
+              className="w-full px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+          </div>
+          <div>
+            <label className="text-sm font-medium text-foreground block mb-1">Arguments <span className="text-muted-foreground font-normal">(optional, space-separated)</span></label>
+            <input
+              type="text"
+              value={mcpForm.args}
+              onChange={(e) => setMcpForm(f => ({ ...f, args: e.target.value }))}
+              placeholder="--port 3000"
+              className="w-full px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+          </div>
+          <div>
+            <label className="text-sm font-medium text-foreground block mb-1">Environment variables <span className="text-muted-foreground font-normal">(optional, KEY=value per line)</span></label>
+            <textarea
+              value={mcpForm.envVars}
+              onChange={(e) => setMcpForm(f => ({ ...f, envVars: e.target.value }))}
+              placeholder={"API_KEY=xxx\nDEBUG=true"}
+              rows={2}
+              className="w-full px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring resize-none"
+            />
+          </div>
+          <div>
+            <label className="text-sm font-medium text-foreground block mb-1">Scope</label>
+            <select
+              value={mcpForm.scope}
+              onChange={(e) => setMcpForm(f => ({ ...f, scope: e.target.value as 'local' | 'user' | 'project' }))}
+              className="w-full px-3 py-2 text-sm rounded-md border border-border bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+            >
+              <option value="local">Local (this machine)</option>
+              <option value="user">User (all projects)</option>
+              <option value="project">Project (shared via repo)</option>
+            </select>
+          </div>
+          {mcpAddError && (
+            <div className="text-sm text-red-400 p-2 bg-red-500/10 rounded">
+              {mcpAddError}
+            </div>
+          )}
+        </div>
+      </Dialog>
+
+      <Dialog
+        open={intermediaryMessages.length > 0}
+        onOpenChange={(open) => { if (!open) setIntermediaryMessages([]); }}
+        title="Intermediary Messages"
+        defaultWidth={720}
+        defaultHeight={500}
+        minWidth={400}
+        minHeight={300}
+      >
+        <div className="-mx-4 -mt-4 px-4 pt-2 pb-1 mb-4 text-sm text-muted-foreground border-b border-border">
+          {intermediaryMessages.length} intermediary response{intermediaryMessages.length !== 1 ? 's' : ''} before the final output
+        </div>
+        <div className="space-y-4">
+          {intermediaryMessages.map((msg, i) => (
+            <div key={i} className="flex justify-start">
+              <div className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border">
+                <div className="text-xs opacity-70 mb-1">Claude</div>
+                <div className="prose-chat max-w-none">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[[rehypeHighlight, { detect: true }]]}
+                    components={{ pre: CopyableCodeBlock }}
+                  >
+                    {msg.content}
+                  </ReactMarkdown>
                 </div>
               </div>
-            ))}
-          </div>
-        </DialogContent>
+            </div>
+          ))}
+        </div>
       </Dialog>
 
       {/* Directory Picker Dialog */}
@@ -2106,77 +2343,72 @@ export default function Home() {
         </div>
       )}
 
+      {/* Kill Stuck Process Confirmation */}
+      <ConfirmDialog
+        open={showKillConfirm}
+        onOpenChange={setShowKillConfirm}
+        title="Kill stuck process?"
+        message={<>{stuckReason}<br /><br />This will terminate the Claude CLI process. The current response will be lost.</>}
+        confirmLabel="Kill Process"
+        confirmVariant="destructive"
+        onConfirm={() => { setShowKillConfirm(false); handleKillStuckSession(); }}
+      />
+
       {/* Rewind Confirmation */}
-      <AlertDialog open={!!rewindConfirm} onOpenChange={(open) => { if (!open) setRewindConfirm(null); }}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Rewind conversation?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Rewind the conversation to before this message:
-              <br /><br />
-              <span className="text-muted-foreground text-xs font-mono break-all">&ldquo;{rewindConfirm?.userMessage}&rdquo;</span>
-              {rewindConfirm?.timestamp && (
-                <><br /><span className="text-muted-foreground text-xs">{new Date(rewindConfirm.timestamp).toLocaleString()}</span></>
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction className="bg-secondary text-secondary-foreground hover:bg-secondary/80" onClick={() => handleRewind('conversation')}>
-              Conversation only
-            </AlertDialogAction>
-            <AlertDialogAction onClick={() => handleRewind('both')}>
-              Conversation + Code
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <Dialog
+        open={!!rewindConfirm}
+        onOpenChange={(open) => { if (!open) setRewindConfirm(null); }}
+        title="Rewind conversation?"
+        defaultWidth={460}
+        defaultHeight={280}
+        minWidth={360}
+        minHeight={220}
+        resizable={false}
+        buttons={[
+          { label: 'Cancel', onClick: () => setRewindConfirm(null), variant: 'ghost' },
+          { label: 'Conversation only', onClick: () => handleRewind('conversation'), variant: 'secondary' },
+          { label: 'Conversation + Code', onClick: () => handleRewind('both') },
+        ]}
+      >
+        <div className="text-sm text-muted-foreground">
+          Rewind the conversation to before this message:
+          <br /><br />
+          <span className="text-xs font-mono break-all">&ldquo;{rewindConfirm?.userMessage}&rdquo;</span>
+          {rewindConfirm?.timestamp && (
+            <><br /><span className="text-xs">{new Date(rewindConfirm.timestamp).toLocaleString()}</span></>
+          )}
+        </div>
+      </Dialog>
 
       {/* Delete Session Confirmation */}
-      <AlertDialog open={!!deleteConfirm} onOpenChange={(open) => { if (!open) setDeleteConfirm(null); }}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete session?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {deleteConfirm?.isLive && (
-                <>
-                  <span className="text-yellow-500 font-semibold">This session is currently live.</span> The running process will be terminated.
-                  <br /><br />
-                </>
-              )}
-              This will permanently delete the session transcript and remove it from history. This action cannot be undone.
+      <ConfirmDialog
+        open={!!deleteConfirm}
+        onOpenChange={(open) => { if (!open) setDeleteConfirm(null); }}
+        title="Delete session?"
+        message={<>
+          {deleteConfirm?.isLive && (
+            <>
+              <span className="text-yellow-500 font-semibold">This session is currently live.</span> The running process will be terminated.
               <br /><br />
-              <span className="text-muted-foreground text-xs font-mono break-all">{deleteConfirm?.display}</span>
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              onClick={() => {
-                if (deleteConfirm) {
-                  handleDeleteSession(deleteConfirm.sessionId, deleteConfirm.project);
-                }
-              }}
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+            </>
+          )}
+          This will permanently delete the session transcript and remove it from history. This action cannot be undone.
+          <br /><br />
+          <span className="text-xs font-mono break-all">{deleteConfirm?.display}</span>
+        </>}
+        confirmLabel="Delete"
+        confirmVariant="destructive"
+        onConfirm={() => { if (deleteConfirm) handleDeleteSession(deleteConfirm.sessionId, deleteConfirm.project); }}
+        onCancel={() => setDeleteConfirm(null)}
+      />
 
       {/* Error Dialog */}
-      <AlertDialog open={!!errorDialog} onOpenChange={(open) => { if (!open) setErrorDialog(null); }}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{errorDialog?.title}</AlertDialogTitle>
-            <AlertDialogDescription>{errorDialog?.message}</AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogAction onClick={() => setErrorDialog(null)}>OK</AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <AlertDialog
+        open={!!errorDialog}
+        onOpenChange={(open) => { if (!open) setErrorDialog(null); }}
+        title={errorDialog?.title || 'Error'}
+        message={errorDialog?.message}
+      />
     </div>
   );
 }

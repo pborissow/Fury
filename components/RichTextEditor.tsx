@@ -81,6 +81,7 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
     extensions: [
       StarterKit.configure({
         codeBlock: false, // Disable default code block to use custom one
+        link: false, // Disable auto-linking of URLs, file paths, and emails
       }),
       CodeBlock.configure({
         HTMLAttributes: {
@@ -93,6 +94,11 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
     editorProps: {
       attributes: {
         class: 'max-w-none focus:outline-none min-h-[80px] p-3 text-foreground',
+      },
+      // Strip <a> tags from pasted HTML so file paths, URLs, and emails
+      // aren't auto-wrapped in hyperlinks by the source application.
+      transformPastedHTML(html) {
+        return html.replace(/<a[^>]*>(.*?)<\/a>/gi, '$1');
       },
       handleKeyDown: (view, event) => {
         if (showButtonBar && event.key === 'Enter') {

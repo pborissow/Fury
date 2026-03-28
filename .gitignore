@@ -12,6 +12,7 @@ next-env.d.ts
 
 # debug logs
 npm-debug.log*
+scripts/
 
 # runtime data (persisted sessions, workflows, prompts, ui state)
 .claude-chat-sessions/
@@ -24,6 +25,10 @@ npm-debug.log*
 
 # playwright
 test-results/
+
+# Codemogger indexes
+.codemogger/
+
 
 # misc
 nul

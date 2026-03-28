@@ -2,24 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
+import Dialog, { ConfirmDialog } from '@/components/Dialog';
 import { Input } from '@/components/ui/input';
 import RichTextEditor from '@/components/RichTextEditor';
 import { Plus, Trash2, Edit, Copy } from 'lucide-react';
@@ -279,151 +262,119 @@ export function PromptsPanel({ onInsertPrompt }: PromptsPanelProps) {
       </div>
 
       {/* Create Modal */}
-      <Dialog open={showCreateModal} onOpenChange={setShowCreateModal}>
-        <DialogContent className="max-w-3xl max-h-[80vh] flex flex-col">
-          <DialogHeader>
-            <DialogTitle>Create New Prompt</DialogTitle>
-            <DialogDescription>
-              Create a reusable prompt template that you can use in your chats.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="flex-1 overflow-y-auto space-y-4">
-            <div>
-              <label className="text-sm font-medium mb-2 block">
-                Prompt Name
-              </label>
-              <Input
-                value={promptName}
-                onChange={(e) => setPromptName(e.target.value)}
-                placeholder="Enter a name for this prompt..."
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                  }
-                }}
+      <Dialog
+        open={showCreateModal}
+        onOpenChange={setShowCreateModal}
+        title="Create New Prompt"
+        defaultWidth={720}
+        defaultHeight={500}
+        minWidth={500}
+        minHeight={350}
+        buttons={[
+          { label: 'Cancel', onClick: () => { setShowCreateModal(false); setPromptName(''); setPromptContent(''); }, variant: 'outline' },
+          { label: isSaving ? 'Creating...' : 'Create Prompt', onClick: handleSaveNewPrompt, disabled: !promptName.trim() || !promptContent.trim() || isSaving },
+        ]}
+      >
+        <div className="-mx-4 -mt-4 px-4 pt-2 pb-2 mb-4 text-sm text-muted-foreground border-b border-border">
+          Create a reusable prompt template that you can use in your chats.
+        </div>
+        <div className="space-y-4">
+          <div>
+            <label className="text-sm font-medium mb-2 block">
+              Prompt Name
+            </label>
+            <Input
+              value={promptName}
+              onChange={(e) => setPromptName(e.target.value)}
+              placeholder="Enter a name for this prompt..."
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                }
+              }}
+            />
+          </div>
+          <div>
+            <label className="text-sm font-medium mb-2 block">
+              Prompt Content
+            </label>
+            <div className="border border-border rounded-lg overflow-hidden">
+              <RichTextEditor
+                initialContent={promptContent}
+                onChange={setPromptContent}
+                onSubmit={() => {}}
+                placeholder="Enter your prompt text here..."
+                persistContent={true}
+                showButtonBar={true}
               />
             </div>
-            <div>
-              <label className="text-sm font-medium mb-2 block">
-                Prompt Content
-              </label>
-              <div className="border border-border rounded-lg overflow-hidden">
-                <RichTextEditor
-                  initialContent={promptContent}
-                  onChange={setPromptContent}
-                  onSubmit={() => {}}
-                  placeholder="Enter your prompt text here..."
-                  persistContent={true}
-                  showButtonBar={true}
-                />
-              </div>
-            </div>
           </div>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => {
-                setShowCreateModal(false);
-                setPromptName('');
-                setPromptContent('');
-              }}
-            >
-              Cancel
-            </Button>
-            <Button
-              onClick={handleSaveNewPrompt}
-              disabled={!promptName.trim() || !promptContent.trim() || isSaving}
-            >
-              {isSaving ? 'Creating...' : 'Create Prompt'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
+        </div>
       </Dialog>
 
       {/* Edit Modal */}
-      <Dialog open={showEditModal} onOpenChange={setShowEditModal}>
-        <DialogContent className="max-w-3xl max-h-[80vh] flex flex-col">
-          <DialogHeader>
-            <DialogTitle>Edit Prompt</DialogTitle>
-            <DialogDescription>
-              Update your prompt template.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="flex-1 overflow-y-auto space-y-4">
-            <div>
-              <label className="text-sm font-medium mb-2 block">
-                Prompt Name
-              </label>
-              <Input
-                value={promptName}
-                onChange={(e) => setPromptName(e.target.value)}
-                placeholder="Enter a name for this prompt..."
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                  }
-                }}
+      <Dialog
+        open={showEditModal}
+        onOpenChange={setShowEditModal}
+        title="Edit Prompt"
+        defaultWidth={720}
+        defaultHeight={500}
+        minWidth={500}
+        minHeight={350}
+        buttons={[
+          { label: 'Cancel', onClick: () => { setShowEditModal(false); setSelectedPrompt(null); setPromptName(''); setPromptContent(''); }, variant: 'outline' },
+          { label: isSaving ? 'Saving...' : 'Save Changes', onClick: handleSaveEditedPrompt, disabled: !promptName.trim() || !promptContent.trim() || isSaving },
+        ]}
+      >
+        <div className="-mx-4 -mt-4 px-4 pt-2 pb-2 mb-4 text-sm text-muted-foreground border-b border-border">
+          Update your prompt template.
+        </div>
+        <div className="space-y-4">
+          <div>
+            <label className="text-sm font-medium mb-2 block">
+              Prompt Name
+            </label>
+            <Input
+              value={promptName}
+              onChange={(e) => setPromptName(e.target.value)}
+              placeholder="Enter a name for this prompt..."
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                }
+              }}
+            />
+          </div>
+          <div>
+            <label className="text-sm font-medium mb-2 block">
+              Prompt Content
+            </label>
+            <div className="border border-border rounded-lg overflow-hidden">
+              <RichTextEditor
+                key={selectedPrompt?.id}
+                initialContent={promptContent}
+                onChange={setPromptContent}
+                onSubmit={() => {}}
+                placeholder="Enter your prompt text here..."
+                persistContent={true}
+                showButtonBar={true}
               />
             </div>
-            <div>
-              <label className="text-sm font-medium mb-2 block">
-                Prompt Content
-              </label>
-              <div className="border border-border rounded-lg overflow-hidden">
-                <RichTextEditor
-                  key={selectedPrompt?.id}
-                  initialContent={promptContent}
-                  onChange={setPromptContent}
-                  onSubmit={() => {}}
-                  placeholder="Enter your prompt text here..."
-                  persistContent={true}
-                  showButtonBar={true}
-                />
-              </div>
-            </div>
           </div>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => {
-                setShowEditModal(false);
-                setSelectedPrompt(null);
-                setPromptName('');
-                setPromptContent('');
-              }}
-            >
-              Cancel
-            </Button>
-            <Button
-              onClick={handleSaveEditedPrompt}
-              disabled={!promptName.trim() || !promptContent.trim() || isSaving}
-            >
-              {isSaving ? 'Saving...' : 'Save Changes'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
+        </div>
       </Dialog>
 
       {/* Delete Confirmation Dialog */}
-      <AlertDialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete prompt?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete &quot;{selectedPrompt?.name}&quot;. This action
-              cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel onClick={() => setSelectedPrompt(null)}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction onClick={confirmDeletePrompt}>
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDialog
+        open={showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
+        title="Delete prompt?"
+        message={<>This will permanently delete &quot;{selectedPrompt?.name}&quot;. This action cannot be undone.</>}
+        confirmLabel="Delete"
+        confirmVariant="destructive"
+        onConfirm={confirmDeletePrompt}
+        onCancel={() => { setShowDeleteDialog(false); setSelectedPrompt(null); }}
+      />
     </div>
   );
 }

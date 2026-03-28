@@ -1,15 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
-import { Button } from '@/components/ui/button';
+import Dialog from '@/components/Dialog';
 import { Input } from '@/components/ui/input';
 
 interface QuestionOption {
@@ -133,110 +125,104 @@ export default function AskUserQuestionDialog({
   };
 
   return (
-    <Dialog open={open} onOpenChange={(o) => { if (!o) onSkip(); }}>
-      <DialogContent
-        showCloseButton={false}
-        className="sm:max-w-xl max-h-[80vh] flex flex-col"
-        onPointerDownOutside={(e) => e.preventDefault()}
-        onEscapeKeyDown={(e) => e.preventDefault()}
-      >
-        <DialogHeader>
-          <DialogTitle>Claude has a question</DialogTitle>
-          <DialogDescription>
-            Please answer to continue the conversation
-          </DialogDescription>
-        </DialogHeader>
+    <Dialog
+      open={open}
+      onOpenChange={(o) => { if (!o) onSkip(); }}
+      title="Claude has a question"
+      defaultWidth={560}
+      defaultHeight={480}
+      minWidth={400}
+      minHeight={300}
+      buttons={[
+        { label: 'Skip', onClick: onSkip, variant: 'outline' },
+        { label: 'Submit', onClick: handleSubmit, disabled: !isValid },
+      ]}
+    >
+      <div className="-mx-4 -mt-4 px-4 pt-2 pb-2 mb-4 text-sm text-muted-foreground border-b border-border">
+        Please answer to continue the conversation
+      </div>
 
-        <div className="flex-1 overflow-y-auto space-y-6 py-2">
-          {questions.map((q, qIndex) => (
-            <div key={qIndex} className="space-y-3">
-              {q.header && (
-                <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  {q.header}
-                </div>
-              )}
-              <p className="text-sm text-foreground">{q.question}</p>
-
-              <div className="space-y-2">
-                {q.options.map((opt, oIndex) => {
-                  const isSelected = selections.get(qIndex)?.has(oIndex) || false;
-                  return (
-                    <label
-                      key={oIndex}
-                      className={`flex items-start gap-3 p-3 rounded-md border cursor-pointer transition-colors ${
-                        isSelected
-                          ? 'border-primary bg-primary/5'
-                          : 'border-border hover:bg-accent/50'
-                      }`}
-                    >
-                      <input
-                        type={q.multiSelect ? 'checkbox' : 'radio'}
-                        name={`question-${qIndex}`}
-                        checked={isSelected}
-                        onChange={() => toggleOption(qIndex, oIndex, q.multiSelect)}
-                        className="mt-0.5 accent-primary"
-                      />
-                      <div>
-                        <div className="text-sm font-medium">{opt.label}</div>
-                        {opt.description && (
-                          <div className="text-xs text-muted-foreground mt-0.5">
-                            {opt.description}
-                          </div>
-                        )}
-                      </div>
-                    </label>
-                  );
-                })}
-
-                {/* "Other" option */}
-                <label
-                  className={`flex items-start gap-3 p-3 rounded-md border cursor-pointer transition-colors ${
-                    useOther.get(qIndex)
-                      ? 'border-primary bg-primary/5'
-                      : 'border-border hover:bg-accent/50'
-                  }`}
-                >
-                  <input
-                    type={q.multiSelect ? 'checkbox' : 'radio'}
-                    name={`question-${qIndex}`}
-                    checked={useOther.get(qIndex) || false}
-                    onChange={() => toggleOther(qIndex, q.multiSelect)}
-                    className="mt-0.5 accent-primary"
-                  />
-                  <div className="flex-1">
-                    <div className="text-sm font-medium">Other</div>
-                    {useOther.get(qIndex) && (
-                      <Input
-                        value={otherText.get(qIndex) || ''}
-                        onChange={(e) => setOtherTextForQuestion(qIndex, e.target.value)}
-                        placeholder="Type your answer..."
-                        className="mt-2"
-                        autoFocus
-                        onClick={(e) => e.stopPropagation()}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' && isValid) {
-                            e.preventDefault();
-                            handleSubmit();
-                          }
-                        }}
-                      />
-                    )}
-                  </div>
-                </label>
+      <div className="space-y-6">
+        {questions.map((q, qIndex) => (
+          <div key={qIndex} className="space-y-3">
+            {q.header && (
+              <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                {q.header}
               </div>
-            </div>
-          ))}
-        </div>
+            )}
+            <p className="text-sm text-foreground">{q.question}</p>
 
-        <DialogFooter>
-          <Button variant="outline" onClick={onSkip}>
-            Skip
-          </Button>
-          <Button onClick={handleSubmit} disabled={!isValid}>
-            Submit
-          </Button>
-        </DialogFooter>
-      </DialogContent>
+            <div className="space-y-2">
+              {q.options.map((opt, oIndex) => {
+                const isSelected = selections.get(qIndex)?.has(oIndex) || false;
+                return (
+                  <label
+                    key={oIndex}
+                    className={`flex items-start gap-3 p-3 rounded-md border cursor-pointer transition-colors ${
+                      isSelected
+                        ? 'border-primary bg-primary/5'
+                        : 'border-border hover:bg-accent/50'
+                    }`}
+                  >
+                    <input
+                      type={q.multiSelect ? 'checkbox' : 'radio'}
+                      name={`question-${qIndex}`}
+                      checked={isSelected}
+                      onChange={() => toggleOption(qIndex, oIndex, q.multiSelect)}
+                      className="mt-0.5 accent-primary"
+                    />
+                    <div>
+                      <div className="text-sm font-medium">{opt.label}</div>
+                      {opt.description && (
+                        <div className="text-xs text-muted-foreground mt-0.5">
+                          {opt.description}
+                        </div>
+                      )}
+                    </div>
+                  </label>
+                );
+              })}
+
+              {/* "Other" option */}
+              <label
+                className={`flex items-start gap-3 p-3 rounded-md border cursor-pointer transition-colors ${
+                  useOther.get(qIndex)
+                    ? 'border-primary bg-primary/5'
+                    : 'border-border hover:bg-accent/50'
+                }`}
+              >
+                <input
+                  type={q.multiSelect ? 'checkbox' : 'radio'}
+                  name={`question-${qIndex}`}
+                  checked={useOther.get(qIndex) || false}
+                  onChange={() => toggleOther(qIndex, q.multiSelect)}
+                  className="mt-0.5 accent-primary"
+                />
+                <div className="flex-1">
+                  <div className="text-sm font-medium">Other</div>
+                  {useOther.get(qIndex) && (
+                    <Input
+                      value={otherText.get(qIndex) || ''}
+                      onChange={(e) => setOtherTextForQuestion(qIndex, e.target.value)}
+                      placeholder="Type your answer..."
+                      className="mt-2"
+                      autoFocus
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && isValid) {
+                          e.preventDefault();
+                          handleSubmit();
+                        }
+                      }}
+                    />
+                  )}
+                </div>
+              </label>
+            </div>
+          </div>
+        ))}
+      </div>
+
     </Dialog>
   );
 }

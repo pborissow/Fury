@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Loader2, GripHorizontal, XIcon, GitCompareArrows } from 'lucide-react';
+import { Loader2, XIcon, GitCompareArrows } from 'lucide-react';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { Resizable } from 're-resizable';
 import hljs from 'highlight.js';
@@ -450,7 +450,7 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
             minHeight={MIN_HEIGHT}
             maxWidth="95vw"
             maxHeight="95vh"
-            className="bg-background rounded-lg border flex flex-col overflow-hidden"
+            className="bg-card rounded-lg border flex flex-col overflow-hidden"
             style={{ boxShadow: '0 8px 40px rgba(0, 0, 0, 0.8), 0 2px 12px rgba(0, 0, 0, 0.6)' }}
             handleStyles={{
               right: { cursor: 'ew-resize' },
@@ -470,12 +470,12 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
           >
             {/* Draggable header */}
             <div
-              className="bg-card flex items-center gap-2 px-4 py-3 border-b border-border shrink-0 cursor-grab active:cursor-grabbing select-none"
+              className="flex items-center gap-2 px-4 py-3 border-b border-border shrink-0 cursor-grab active:cursor-grabbing select-none"
+              style={{ backgroundColor: '#313131' }}
               onPointerDown={handleDragStart}
               onPointerMove={handleDragMove}
               onPointerUp={handleDragEnd}
             >
-              <GripHorizontal className="h-4 w-4 text-muted-foreground/50 shrink-0" />
               <DialogPrimitive.Title className="font-mono text-sm font-semibold truncate flex-1">
                 {fileName}
                 <span className="text-muted-foreground font-normal ml-3 text-xs">

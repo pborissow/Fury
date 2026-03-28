@@ -3,25 +3,7 @@
 import { useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import Dialog, { ConfirmDialog } from '@/components/Dialog';
 import { Plus, Trash2, Edit2, Download } from 'lucide-react';
 
 interface Workflow {
@@ -50,6 +32,8 @@ export default function WorkflowsPanel({
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [showEditDialog, setShowEditDialog] = useState(false);
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [deleteWorkflow, setDeleteWorkflow] = useState<Workflow | null>(null);
   const [editingWorkflowId, setEditingWorkflowId] = useState<string | null>(null);
   const [workflowName, setWorkflowName] = useState('');
 
@@ -130,6 +114,8 @@ export default function WorkflowsPanel({
     } catch (error) {
       console.error('Failed to delete workflow:', error);
     }
+    setShowDeleteDialog(false);
+    setDeleteWorkflow(null);
   };
 
   const handleRename = async () => {
@@ -259,31 +245,17 @@ export default function WorkflowsPanel({
                 >
                   <Edit2 className="h-3 w-3" />
                 </Button>
-                <AlertDialog>
-                  <AlertDialogTrigger asChild>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-6 w-6 p-0 hover:bg-destructive/10"
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </Button>
-                  </AlertDialogTrigger>
-                  <AlertDialogContent>
-                    <AlertDialogHeader>
-                      <AlertDialogTitle>Delete workflow?</AlertDialogTitle>
-                      <AlertDialogDescription>
-                        This will permanently delete &ldquo;{workflow.name}&rdquo;. This action cannot be undone.
-                      </AlertDialogDescription>
-                    </AlertDialogHeader>
-                    <AlertDialogFooter>
-                      <AlertDialogCancel>Cancel</AlertDialogCancel>
-                      <AlertDialogAction onClick={() => handleDelete(workflow.id)}>
-                        Delete
-                      </AlertDialogAction>
-                    </AlertDialogFooter>
-                  </AlertDialogContent>
-                </AlertDialog>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 w-6 p-0 hover:bg-destructive/10"
+                  onClick={() => {
+                    setDeleteWorkflow(workflow);
+                    setShowDeleteDialog(true);
+                  }}
+                >
+                  <Trash2 className="h-3 w-3" />
+                </Button>
               </div>
             </div>
             <div className="text-xs text-muted-foreground">
@@ -294,14 +266,22 @@ export default function WorkflowsPanel({
       </div>
 
       {/* Save Dialog */}
-      <Dialog open={showSaveDialog} onOpenChange={setShowSaveDialog}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Create Workflow</DialogTitle>
-            <DialogDescription>
-              Enter a name for your new workflow
-            </DialogDescription>
-          </DialogHeader>
+      <Dialog
+        open={showSaveDialog}
+        onOpenChange={setShowSaveDialog}
+        title="Create Workflow"
+        defaultWidth={420}
+        defaultHeight={240}
+        minWidth={320}
+        minHeight={200}
+        resizable={false}
+        buttons={[
+          { label: 'Cancel', onClick: () => setShowSaveDialog(false), variant: 'ghost' },
+          { label: 'Create', onClick: handleSave, disabled: !workflowName.trim() },
+        ]}
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">Enter a name for your new workflow</p>
           <Input
             value={workflowName}
             onChange={(e) => setWorkflowName(e.target.value)}
@@ -310,34 +290,29 @@ export default function WorkflowsPanel({
             onKeyDown={(e) => {
               if (e.key === 'Enter' && workflowName.trim()) {
                 handleSave();
-              } else if (e.key === 'Escape') {
-                setShowSaveDialog(false);
               }
             }}
           />
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowSaveDialog(false)}>
-              Cancel
-            </Button>
-            <Button
-              onClick={handleSave}
-              disabled={!workflowName.trim()}
-            >
-              Create
-            </Button>
-          </DialogFooter>
-        </DialogContent>
+        </div>
       </Dialog>
 
       {/* Edit Dialog */}
-      <Dialog open={showEditDialog} onOpenChange={setShowEditDialog}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Rename Workflow</DialogTitle>
-            <DialogDescription>
-              Enter a new name for this workflow
-            </DialogDescription>
-          </DialogHeader>
+      <Dialog
+        open={showEditDialog}
+        onOpenChange={setShowEditDialog}
+        title="Rename Workflow"
+        defaultWidth={420}
+        defaultHeight={240}
+        minWidth={320}
+        minHeight={200}
+        resizable={false}
+        buttons={[
+          { label: 'Cancel', onClick: () => setShowEditDialog(false), variant: 'ghost' },
+          { label: 'Save', onClick: handleRename, disabled: !workflowName.trim() },
+        ]}
+      >
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">Enter a new name for this workflow</p>
           <Input
             value={workflowName}
             onChange={(e) => setWorkflowName(e.target.value)}
@@ -346,24 +321,23 @@ export default function WorkflowsPanel({
             onKeyDown={(e) => {
               if (e.key === 'Enter' && workflowName.trim()) {
                 handleRename();
-              } else if (e.key === 'Escape') {
-                setShowEditDialog(false);
               }
             }}
           />
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setShowEditDialog(false)}>
-              Cancel
-            </Button>
-            <Button
-              onClick={handleRename}
-              disabled={!workflowName.trim()}
-            >
-              Save
-            </Button>
-          </DialogFooter>
-        </DialogContent>
+        </div>
       </Dialog>
+
+      {/* Delete Confirmation */}
+      <ConfirmDialog
+        open={showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
+        title="Delete workflow?"
+        message={<>This will permanently delete &ldquo;{deleteWorkflow?.name}&rdquo;. This action cannot be undone.</>}
+        confirmLabel="Delete"
+        confirmVariant="destructive"
+        onConfirm={() => { if (deleteWorkflow) handleDelete(deleteWorkflow.id); }}
+        onCancel={() => { setShowDeleteDialog(false); setDeleteWorkflow(null); }}
+      />
     </div>
   );
 }
