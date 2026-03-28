@@ -11,11 +11,7 @@ import RichTextEditor from '@/components/RichTextEditor';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
 import { getRecentDirectories } from '@/lib/recent-directories';
 import AskUserQuestionDialog from '@/components/AskUserQuestionDialog';
-
-interface Message {
-  role: 'user' | 'assistant';
-  content: string;
-}
+import type { Message } from '@/lib/types';
 
 interface NodeChatSession {
   workingDirectory: string;
