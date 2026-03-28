@@ -22,6 +22,9 @@ npm-debug.log*
 # claude code
 .claude/
 
+# playwright
+test-results/
+
 # misc
 nul
 *.zip

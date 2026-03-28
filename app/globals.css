@@ -251,6 +251,14 @@
   }
 }
 
+/* Fallback background for code blocks that highlight.js doesn't detect.
+   Outside @layer so it overrides Tailwind Preflight. When highlight.js does
+   apply .hljs, the theme's own background (#0d1117) wins on the inner code element. */
+.prose-chat pre {
+  background: #0d1117;
+  border: 1px solid oklch(1 0 0 / 10%);
+}
+
 /* TipTap editor — restore list styles stripped by Tailwind Preflight */
 .tiptap ul,
 .tiptap ol,
