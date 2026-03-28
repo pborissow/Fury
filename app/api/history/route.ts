@@ -75,6 +75,21 @@ export async function GET(req: NextRequest) {
         const archivedSessions = await loadArchivedSessions();
         const existingIds = new Set(entries.map(e => e.sessionId).filter(Boolean));
 
+        // Build a metadata lookup from archived sessions
+        const metadataMap = new Map<string, Record<string, unknown>>();
+        for (const archived of archivedSessions) {
+          if (archived.metadata) {
+            metadataMap.set(archived.session_id, archived.metadata);
+          }
+        }
+
+        // Enrich existing entries with metadata from the DB
+        for (const entry of entries) {
+          if (entry.sessionId && metadataMap.has(entry.sessionId)) {
+            (entry as any).metadata = metadataMap.get(entry.sessionId);
+          }
+        }
+
         for (const archived of archivedSessions) {
           if (existingIds.has(archived.session_id)) continue;
           if (isSkippableDisplay(archived.display)) continue;
@@ -84,7 +99,8 @@ export async function GET(req: NextRequest) {
             project: archived.project,
             sessionId: archived.session_id,
             messageCount: archived.message_count,
-          });
+            ...(archived.metadata ? { metadata: archived.metadata } : {}),
+          } as any);
         }
 
         // Re-sort after merging and re-apply limit

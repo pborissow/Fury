@@ -18,7 +18,7 @@ import DrawflowCanvas from '@/components/DrawflowCanvas';
 import WorkflowsPanel from '@/components/WorkflowsPanel';
 import NodeChatModal from '@/components/NodeChatModal';
 import AskUserQuestionDialog from '@/components/AskUserQuestionDialog';
-import { Plus, AlertTriangle, Sun, Moon, FolderTree, FileText, Activity, Trash2, RotateCcw, Copy, Check, Plug } from 'lucide-react';
+import { Plus, AlertTriangle, Sun, Moon, FolderTree, FileText, Activity, Trash2, RotateCcw, Copy, Check, Plug, Pencil } from 'lucide-react';
 import { getRecentDirectories } from '@/lib/recent-directories';
 
 // Client-side only timestamp component to avoid hydration mismatch
@@ -172,12 +172,18 @@ interface AskUserQuestionState {
   };
 }
 
+interface SessionMetadata {
+  label?: string;
+  [key: string]: unknown;
+}
+
 interface HistoryEntry {
   display: string;
   timestamp: number;
   project: string;
   sessionId?: string;
   messageCount?: number;
+  metadata?: SessionMetadata;
 }
 
 // Generate a UUID v4
@@ -361,6 +367,13 @@ export default function Home() {
     display: string;
     isLive: boolean;
   } | null>(null);
+
+  // Label edit state
+  const [labelEdit, setLabelEdit] = useState<{
+    sessionId: string;
+    currentLabel: string;
+  } | null>(null);
+  const [labelInput, setLabelInput] = useState('');
 
   // Rewind confirmation state
   const [rewindConfirm, setRewindConfirm] = useState<{
@@ -1350,6 +1363,40 @@ export default function Home() {
     };
   }, [contextMenu]);
 
+  const handleSaveLabel = async () => {
+    if (!labelEdit) return;
+    const { sessionId } = labelEdit;
+    const label = labelInput.trim();
+    setLabelEdit(null);
+    try {
+      const res = await fetch('/api/session', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, metadata: { label: label || null } }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setErrorDialog({
+          title: 'Failed to update label',
+          message: data.error || `Server returned ${res.status}`,
+        });
+        return;
+      }
+      // Update metadata in local state
+      setHistory(prev => prev.map(h => {
+        if (h.sessionId !== sessionId) return h;
+        const metadata = { ...h.metadata };
+        if (label) { metadata.label = label; } else { delete metadata.label; }
+        return { ...h, metadata: Object.keys(metadata).length > 0 ? metadata : undefined };
+      }));
+    } catch (error) {
+      setErrorDialog({
+        title: 'Failed to update label',
+        message: error instanceof Error ? error.message : 'An unexpected error occurred',
+      });
+    }
+  };
+
   const handleDeleteSession = async (sessionId: string, project: string) => {
     setDeleteConfirm(null);
     try {
@@ -1503,7 +1550,7 @@ export default function Home() {
                     return (
                       <div
                         key={`history-${index}`}
-                        className={`mb-2 p-3 rounded border transition-colors ${
+                        className={`group/session relative mb-2 p-3 rounded border transition-colors ${
                           isViewing
                             ? 'bg-primary/10 border-primary'
                             : isLive
@@ -1523,6 +1570,36 @@ export default function Home() {
                           });
                         } : undefined}
                       >
+                        {entry.sessionId && !isLive && (
+                          <div className="absolute top-1.5 right-1.5 opacity-0 group-hover/session:opacity-100 transition-opacity flex items-center gap-0.5 z-10">
+                            <button
+                              className="cursor-pointer p-1 rounded hover:bg-yellow-500/20 text-muted-foreground hover:text-yellow-500"
+                              title="Edit label"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setLabelInput(entry.metadata?.label || '');
+                                setLabelEdit({ sessionId: entry.sessionId!, currentLabel: entry.metadata?.label || '' });
+                              }}
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              className="cursor-pointer p-1 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
+                              title="Delete session"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setDeleteConfirm({
+                                  sessionId: entry.sessionId!,
+                                  project: entry.project,
+                                  display: entry.display,
+                                  isLive,
+                                });
+                              }}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        )}
                         <div className="flex justify-between items-start mb-1">
                           <HistoryTimestamp timestamp={entry.timestamp} />
                           <div className="flex items-center gap-1.5">
@@ -1544,9 +1621,13 @@ export default function Home() {
                             )}
                           </div>
                         </div>
-                        <div className="text-sm text-foreground break-words line-clamp-2">
-                          {entry.display}
-                        </div>
+                        {entry.metadata?.label ? (
+                          <div className="text-sm text-foreground break-words line-clamp-2">{entry.metadata.label}</div>
+                        ) : (
+                          <div className="text-sm text-foreground break-words line-clamp-2">
+                            {entry.display}
+                          </div>
+                        )}
                         {entry.messageCount != null && (
                           <div className="mt-1 text-xs text-muted-foreground flex items-center gap-1">
                             <span>
@@ -2401,6 +2482,30 @@ export default function Home() {
         onConfirm={() => { if (deleteConfirm) handleDeleteSession(deleteConfirm.sessionId, deleteConfirm.project); }}
         onCancel={() => setDeleteConfirm(null)}
       />
+
+      {/* Label Edit Dialog */}
+      <Dialog
+        open={!!labelEdit}
+        onOpenChange={(open) => { if (!open) setLabelEdit(null); }}
+        title="Session Label"
+        defaultWidth={450}
+        defaultHeight={270}
+        minHeight={160}
+        buttons={[
+          { label: 'Cancel', onClick: () => setLabelEdit(null), variant: 'ghost' },
+          { label: 'Save', onClick: handleSaveLabel },
+        ]}
+      >
+
+          <textarea
+            value={labelInput}
+            onChange={(e) => setLabelInput(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSaveLabel(); } }}
+            className="w-full h-full px-3 py-2 rounded border border-border bg-background text-foreground text-sm focus:outline-none focus:border-ring resize-none"
+            autoFocus
+          />
+
+      </Dialog>
 
       {/* Error Dialog */}
       <AlertDialog

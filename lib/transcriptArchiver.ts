@@ -12,6 +12,11 @@ import { eventBus } from './eventBus';
 import { parseTranscriptJsonl, type TranscriptMessage } from './transcriptParser';
 import { projectPathToSlug } from './utils';
 
+export interface SessionMetadata {
+  label?: string;
+  [key: string]: unknown;
+}
+
 export interface SessionRecord {
   session_id: string;
   project: string;
@@ -19,6 +24,7 @@ export interface SessionRecord {
   message_count: number;
   created_at: number;
   updated_at: number;
+  metadata?: SessionMetadata;
 }
 
 export function computeHash(content: string): string {
@@ -167,7 +173,7 @@ export async function loadArchivedSessions(opts?: {
   const limit = opts?.limit ?? 200;
   const offset = opts?.offset ?? 0;
 
-  let sql = 'SELECT session_id, project, display, message_count, created_at, updated_at FROM sessions';
+  let sql = 'SELECT session_id, project, display, message_count, created_at, updated_at, metadata FROM sessions';
   const args: any[] = [];
 
   if (opts?.project) {
@@ -180,19 +186,49 @@ export async function loadArchivedSessions(opts?: {
 
   const result = await db.execute({ sql, args });
 
-  return result.rows.map(row => ({
-    session_id: row.session_id as string,
-    project: row.project as string,
-    display: row.display as string,
-    message_count: row.message_count as number,
-    created_at: row.created_at as number,
-    updated_at: row.updated_at as number,
-  }));
+  return result.rows.map(row => {
+    let metadata: SessionMetadata | undefined;
+    if (row.metadata) {
+      try { metadata = JSON.parse(row.metadata as string); } catch { /* ignore bad JSON */ }
+    }
+    return {
+      session_id: row.session_id as string,
+      project: row.project as string,
+      display: row.display as string,
+      message_count: row.message_count as number,
+      created_at: row.created_at as number,
+      updated_at: row.updated_at as number,
+      metadata,
+    };
+  });
 }
 
 /**
- * Delete a session and all its messages/raw lines from the archive.
+ * Update the metadata JSON for a session (merges with existing metadata).
  */
+export async function updateSessionMetadata(sessionId: string, patch: Partial<SessionMetadata>): Promise<void> {
+  const db = await getDb();
+  // Read existing metadata, merge, and write back
+  const existing = await db.execute({
+    sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+    args: [sessionId],
+  });
+  let current: SessionMetadata = {};
+  if (existing.rows.length > 0 && existing.rows[0].metadata) {
+    try { current = JSON.parse(existing.rows[0].metadata as string); } catch { /* ignore */ }
+  }
+  const merged = { ...current, ...patch };
+  // Remove keys set to null/undefined
+  for (const key of Object.keys(merged)) {
+    if (merged[key] == null) delete merged[key];
+  }
+  const json = Object.keys(merged).length > 0 ? JSON.stringify(merged) : null;
+  await db.execute({
+    sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+    args: [json, sessionId],
+  });
+}
+
 export async function deleteArchivedSession(sessionId: string): Promise<void> {
   const db = await getDb();
   await db.execute({

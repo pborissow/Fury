@@ -35,7 +35,8 @@ async function initDb(client: Client): Promise<void> {
       message_count INTEGER DEFAULT 0,
       created_at    INTEGER NOT NULL,
       updated_at    INTEGER NOT NULL,
-      jsonl_hash    TEXT
+      jsonl_hash    TEXT,
+      metadata      TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
     CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
@@ -60,6 +61,13 @@ async function initDb(client: Client): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_raw_jsonl_session ON raw_jsonl(session_id);
   `);
+
+  // Migration: add metadata column to existing databases
+  try {
+    await client.execute('ALTER TABLE sessions ADD COLUMN metadata TEXT');
+  } catch {
+    // Column already exists — expected after first migration
+  }
 }
 
 /**

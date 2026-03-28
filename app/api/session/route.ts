@@ -4,7 +4,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { sessionManager } from '@/lib/sessionManager';
 import { projectPathToSlug } from '@/lib/utils';
-import { deleteArchivedSession, invalidateArchive } from '@/lib/transcriptArchiver';
+import { deleteArchivedSession, invalidateArchive, updateSessionMetadata } from '@/lib/transcriptArchiver';
 import { isInternalContent } from '@/lib/transcriptParser';
 
 export const runtime = 'nodejs';
@@ -189,6 +189,35 @@ export async function PATCH(request: NextRequest) {
     console.error('[Session/Rewind] Error:', error);
     return NextResponse.json(
       { error: 'Failed to rewind session' },
+      { status: 500 }
+    );
+  }
+}
+
+/**
+ * PUT /api/session - Update session metadata (label, etc.).
+ * Body: { sessionId: string, metadata: { label?: string, ... } }
+ */
+export async function PUT(request: NextRequest) {
+  try {
+    const { sessionId, metadata } = await request.json();
+
+    if (!sessionId) {
+      return NextResponse.json({ error: 'sessionId is required' }, { status: 400 });
+    }
+    if (!metadata || typeof metadata !== 'object') {
+      return NextResponse.json({ error: 'metadata object is required' }, { status: 400 });
+    }
+
+    const sanitizedSessionId = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
+
+    await updateSessionMetadata(sanitizedSessionId, metadata);
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    console.error('[Session/Metadata] Error:', error);
+    return NextResponse.json(
+      { error: 'Failed to update session metadata' },
       { status: 500 }
     );
   }
