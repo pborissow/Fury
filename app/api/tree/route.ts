@@ -25,7 +25,7 @@ const IGNORED_ITEMS = new Set([
   '.cache',
 ]);
 
-async function buildFileTree(dirPath: string, maxDepth: number = 5, currentDepth: number = 0): Promise<FileTreeNode[]> {
+async function buildFileTree(dirPath: string, maxDepth: number = 20, currentDepth: number = 0): Promise<FileTreeNode[]> {
   if (currentDepth >= maxDepth) {
     return [];
   }
@@ -225,8 +225,11 @@ export async function GET(request: NextRequest) {
       );
     }
 
+    const depthParam = searchParams.get('depth');
+    const maxDepth = depthParam ? Math.max(1, Math.min(50, parseInt(depthParam, 10) || 20)) : 20;
+
     const [tree, vcsResult] = await Promise.all([
-      buildFileTree(dirPath),
+      buildFileTree(dirPath, maxDepth),
       getVcsStatus(dirPath),
     ]);
 

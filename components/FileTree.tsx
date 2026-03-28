@@ -140,9 +140,10 @@ function collectFiles(nodes: FileTreeNode[]): FileTreeNode[] {
 interface FileTreeProps {
   projectPath: string | null;
   onFileDoubleClick?: (filePath: string) => void;
+  maxDepth?: number;
 }
 
-export default function FileTree({ projectPath, onFileDoubleClick }: FileTreeProps) {
+export default function FileTree({ projectPath, onFileDoubleClick, maxDepth }: FileTreeProps) {
   const [tree, setTree] = useState<FileTreeNode[]>([]);
   const [fileStatuses, setFileStatuses] = useState<VcsStatusMap | null>(null);
   const [loading, setLoading] = useState(false);
@@ -156,7 +157,8 @@ export default function FileTree({ projectPath, onFileDoubleClick }: FileTreePro
     setError(null);
 
     try {
-      const response = await fetch(`/api/tree?path=${encodeURIComponent(projectPath)}`);
+      const depthParam = maxDepth ? `&depth=${maxDepth}` : '';
+      const response = await fetch(`/api/tree?path=${encodeURIComponent(projectPath)}${depthParam}`);
       const data = await response.json();
 
       if (!response.ok) {
@@ -171,7 +173,7 @@ export default function FileTree({ projectPath, onFileDoubleClick }: FileTreePro
     } finally {
       if (showLoading) setLoading(false);
     }
-  }, [projectPath]);
+  }, [projectPath, maxDepth]);
 
   // Initial fetch
   useEffect(() => {
