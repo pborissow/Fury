@@ -34,6 +34,7 @@ interface ChatTabProps {
   chatVerticalLayout: number[];
   onHorizontalLayoutChange: (sizes: number[]) => void;
   onVerticalLayoutChange: (sizes: number[]) => void;
+  isActive: boolean; // pause SSE processing when tab is hidden
 }
 
 export default function ChatTab({
@@ -41,6 +42,7 @@ export default function ChatTab({
   chatVerticalLayout,
   onHorizontalLayoutChange,
   onVerticalLayoutChange,
+  isActive,
 }: ChatTabProps) {
   // --- State moved from page.tsx ---
 
@@ -129,7 +131,13 @@ export default function ChatTab({
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
 
-  // --- Ref sync effects (from page.tsx) ---
+  // --- Ref sync effects ---
+
+  // Track whether this tab is visible so SSE handlers can skip work when hidden.
+  const isActiveRef = useRef(isActive);
+  useEffect(() => {
+    isActiveRef.current = isActive;
+  }, [isActive]);
 
   // Track the currently-viewed session so in-flight SSE handlers can detect
   // when the user has switched away and skip state updates accordingly.
@@ -300,17 +308,21 @@ export default function ChatTab({
   };
 
   // --- Global SSE connection for live-sessions and history-updated events ---
+  // Connects when the tab becomes active, disconnects when hidden to save resources.
+  // On reconnect (tab re-shown), re-fetches state to cover the gap.
   useEffect(() => {
-    // Fetch initial data immediately
+    if (!isActive) return;
+
+    // Fetch initial / catch-up data
     fetch('/api/live-sessions').then(res => res.json()).then(data => {
       setLiveSessionIds(new Set(data.liveSessionIds || []));
     }).catch(() => {});
+    fetchHistory();
 
     // Fetch current provider status
     const formatProviderLabel = (data: { current: string; bedrockEnv?: Record<string, string> }) => {
       const source = data.current === 'bedrock' ? 'Bedrock' : 'Anthropic';
       const raw = data.bedrockEnv?.ANTHROPIC_MODEL || '';
-      // Convert "us.anthropic.claude-sonnet-4-6" → "Claude Sonnet 4.6"
       const match = raw.match(/claude-(\w+)-(\d+)-(\d+)/i);
       const model = match
         ? `Claude ${match[1][0].toUpperCase()}${match[1].slice(1)} ${match[2]}.${match[3]}`
@@ -333,14 +345,12 @@ export default function ChatTab({
     });
 
     es.addEventListener('provider-switched', () => {
-      // Re-fetch full status for the label
       fetch('/api/provider').then(res => res.json()).then(status => {
         setProviderLabel(formatProviderLabel(status));
       }).catch(() => {});
     });
 
     es.onerror = () => {
-      // EventSource auto-reconnects; on reconnect re-fetch state to cover gap
       if (es.readyState === EventSource.CONNECTING) {
         fetch('/api/live-sessions').then(res => res.json()).then(data => {
           setLiveSessionIds(new Set(data.liveSessionIds || []));
@@ -350,7 +360,7 @@ export default function ChatTab({
     };
 
     return () => es.close();
-  }, []);
+  }, [isActive]);
 
   // --- Session-scoped SSE for stream, health, and transcript events ---
   useEffect(() => {
@@ -371,17 +381,20 @@ export default function ChatTab({
     sessionEsRef.current = es;
 
     const isStillActive = () => activeSessionRef.current === mySessionId;
+    // Skip expensive state updates when the tab is hidden; catch-up happens
+    // when isActive flips back to true (see effect below).
+    const shouldProcess = () => isStillActive() && isActiveRef.current;
 
     // On SSE connect, re-fetch the stream buffer to close the gap between the
     // initial restore in fetchTranscript and when the EventSource connected.
     // Events emitted during that window would otherwise be lost.
     es.addEventListener('connected', () => {
-      if (!isStillActive()) return;
+      if (!shouldProcess()) return;
 
       fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(mySessionId)}`)
         .then(res => res.json())
         .then(bufData => {
-          if (!isStillActive()) return;
+          if (!shouldProcess()) return;
 
           if (bufData.hasBuffer) {
             // Only update if the buffer has more data than what we currently have
@@ -405,7 +418,7 @@ export default function ChatTab({
             fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
               .then(res => res.json())
               .then(refreshData => {
-                if (refreshData.messages && isStillActive()) {
+                if (refreshData.messages && shouldProcess()) {
                   setHistoryTranscript(refreshData.messages);
                   setTranscriptOverlayMessages([]);
                   setOverlayInsertPoint(null);
@@ -424,7 +437,7 @@ export default function ChatTab({
     // NOTE: These events only fire for sessions managed by Fury's sessionManager.
     // External CLI sessions rely on transcript-updated (file watcher) for updates.
     es.addEventListener('session-stream', (e: MessageEvent) => {
-      if (!isStillActive()) return;
+      if (!shouldProcess()) return;
 
       const data = JSON.parse(e.data);
 
@@ -468,7 +481,7 @@ export default function ChatTab({
 
     // Handle session:health events (replaces health polling)
     es.addEventListener('session-health', (e: MessageEvent) => {
-      if (!isStillActive()) return;
+      if (!shouldProcess()) return;
       const data = JSON.parse(e.data);
       setIsStuck(data.isStuck);
       setStuckReason(data.stuckReason);
@@ -501,7 +514,7 @@ export default function ChatTab({
         fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
           .then(res => res.json())
           .then(refreshData => {
-            if (refreshData.messages && isStillActive()) {
+            if (refreshData.messages && shouldProcess()) {
               setHistoryTranscript(refreshData.messages);
               setTranscriptOverlayMessages([]);
               setOverlayInsertPoint(null);
@@ -512,12 +525,12 @@ export default function ChatTab({
     });
 
     es.onerror = () => {
-      if (es.readyState === EventSource.CONNECTING && isStillActive()) {
+      if (es.readyState === EventSource.CONNECTING && shouldProcess()) {
         // SSE reconnecting — check if session completed while disconnected
         fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`)
           .then(res => res.json())
           .then(data => {
-            if (!isStillActive()) return;
+            if (!shouldProcess()) return;
             if (!data.isProcessing && transcriptLoadingRef.current) {
               setTranscriptLoading(false);
               setTranscriptStreaming('');
@@ -528,7 +541,7 @@ export default function ChatTab({
         fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
           .then(res => res.json())
           .then(data => {
-            if (data.messages && isStillActive()) {
+            if (data.messages && shouldProcess()) {
               setHistoryTranscript(data.messages);
               if (!transcriptLoadingRef.current) {
                 setTranscriptOverlayMessages([]);
@@ -542,7 +555,7 @@ export default function ChatTab({
 
     // Handle transcript:updated events (replaces transcript polling for external live sessions)
     es.addEventListener('transcript-updated', () => {
-      if (!isStillActive()) return;
+      if (!shouldProcess()) return;
       // Don't refresh while any processing is in flight — the JSONL contains
       // partial assistant messages that would render as intermediary bubbles.
       if (transcriptLoadingRef.current) return;
@@ -550,7 +563,7 @@ export default function ChatTab({
       fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
         .then(res => res.json())
         .then(data => {
-          if (data.messages && isStillActive()) {
+          if (data.messages && shouldProcess()) {
             setHistoryTranscript(data.messages);
           }
         })
@@ -560,19 +573,20 @@ export default function ChatTab({
     // Fallback health poll: if SSE drops or a session:health event is lost,
     // the UI can get stuck showing "processing" forever. Poll every 15s while
     // transcriptLoading is true to catch missed completion events.
+    // Also skips when tab is hidden to avoid unnecessary network requests.
     const healthPoll = setInterval(() => {
-      if (!isStillActive() || !transcriptLoadingRef.current) return;
+      if (!shouldProcess() || !transcriptLoadingRef.current) return;
       fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`)
         .then(res => res.json())
         .then(data => {
-          if (!isStillActive()) return;
+          if (!shouldProcess()) return;
           if (!data.isProcessing && transcriptLoadingRef.current) {
             setTranscriptLoading(false);
             setTranscriptStreaming('');
             fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
               .then(res => res.json())
               .then(refreshData => {
-                if (refreshData.messages && isStillActive()) {
+                if (refreshData.messages && shouldProcess()) {
                   setHistoryTranscript(refreshData.messages);
                   setTranscriptOverlayMessages([]);
                   setOverlayInsertPoint(null);
@@ -592,6 +606,50 @@ export default function ChatTab({
       }
     };
   }, [viewingTranscriptId, historyTranscriptProject]);
+
+  // --- Catch-up when tab becomes visible again ---
+  // SSE events were skipped while hidden; re-fetch stream buffer + transcript
+  // to sync state with what happened while the user was on another tab.
+  useEffect(() => {
+    if (!isActive || !viewingTranscriptId || !historyTranscriptProject) return;
+
+    const mySessionId = viewingTranscriptId;
+    const myProject = historyTranscriptProject;
+
+    fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(mySessionId)}`)
+      .then(res => res.json())
+      .then(bufData => {
+        if (activeSessionRef.current !== mySessionId) return;
+
+        if (bufData.isProcessing || (bufData.hasBuffer && bufData.isActive)) {
+          // Session is still processing — restore stream state
+          if (bufData.accumulatedText) {
+            setTranscriptStreaming(bufData.accumulatedText);
+          }
+          if (bufData.events) {
+            setStreamEvents(bufData.events);
+          }
+          if (!transcriptLoadingRef.current) {
+            setTranscriptLoading(true);
+          }
+        } else if (transcriptLoadingRef.current) {
+          // Processing completed while we were hidden — refresh transcript
+          setTranscriptLoading(false);
+          setTranscriptStreaming('');
+          fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
+            .then(res => res.json())
+            .then(refreshData => {
+              if (refreshData.messages && activeSessionRef.current === mySessionId) {
+                setHistoryTranscript(refreshData.messages);
+                setTranscriptOverlayMessages([]);
+                setOverlayInsertPoint(null);
+              }
+            })
+            .catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }, [isActive, viewingTranscriptId, historyTranscriptProject]);
 
   // --- Load workflows + compute recentDirectories ---
   useEffect(() => {

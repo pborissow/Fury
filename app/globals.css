@@ -259,6 +259,22 @@
   border: 1px solid oklch(1 0 0 / 10%);
 }
 
+/* Blue-themed code blocks for user bubbles (prose-invert context) */
+.prose-chat.prose-invert code {
+  background-color: rgba(147, 197, 253, 0.15);
+  color: #bfdbfe;
+}
+
+.prose-chat.prose-invert pre {
+  background: #172554;
+  border-color: rgba(147, 197, 253, 0.2);
+}
+
+.prose-chat.prose-invert pre code {
+  background-color: transparent;
+  color: inherit;
+}
+
 /* TipTap editor — restore list styles stripped by Tailwind Preflight */
 .tiptap ul,
 .tiptap ol,

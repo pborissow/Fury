@@ -154,7 +154,10 @@ export default function Home() {
         {/* Tab Content — lazy mount, then CSS hide to preserve state */}
         <div className="flex-1 overflow-hidden relative">
           {layoutsLoaded && mountedTabs.has('chat') && (
-            <div className="absolute inset-0" style={{ display: activeTab === 'chat' ? 'block' : 'none' }}>
+            <div
+              className="absolute inset-0"
+              style={activeTab !== 'chat' ? { visibility: 'hidden', pointerEvents: 'none' } : undefined}
+            >
               <ChatTab
                 chatHorizontalLayout={chatHorizontalLayout}
                 chatVerticalLayout={chatVerticalLayout}
@@ -166,12 +169,16 @@ export default function Home() {
                   setChatVerticalLayout(sizes);
                   saveLayoutState({ chatVerticalLayout: sizes });
                 }}
+                isActive={activeTab === 'chat'}
               />
             </div>
           )}
 
           {layoutsLoaded && mountedTabs.has('canvas') && (
-            <div className="absolute inset-0" style={{ display: activeTab === 'canvas' ? 'block' : 'none' }}>
+            <div
+              className="absolute inset-0"
+              style={activeTab !== 'canvas' ? { visibility: 'hidden', pointerEvents: 'none' } : undefined}
+            >
               <CanvasTab
                 canvasHorizontalLayout={canvasHorizontalLayout}
                 onLayoutChange={(sizes) => {
