@@ -13,6 +13,17 @@ export default function Home() {
   // Tab control state
   const [activeTab, setActiveTab] = useState<'chat' | 'canvas'>('chat');
 
+  // Track which tabs have been mounted at least once (lazy mount + CSS hide)
+  const [mountedTabs, setMountedTabs] = useState<Set<string>>(new Set(['chat']));
+
+  // When activeTab changes, mark it as mounted
+  useEffect(() => {
+    setMountedTabs(prev => {
+      if (prev.has(activeTab)) return prev;
+      return new Set(prev).add(activeTab);
+    });
+  }, [activeTab]);
+
   // Persisted workflow ID (loaded from UI state, saved on change)
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
 
@@ -140,33 +151,37 @@ export default function Home() {
           </button>
         </div>
 
-        {/* Tab Content */}
-        <div className="flex-1 overflow-hidden">
-          {activeTab === 'chat' && layoutsLoaded && (
-            <ChatTab
-              chatHorizontalLayout={chatHorizontalLayout}
-              chatVerticalLayout={chatVerticalLayout}
-              onHorizontalLayoutChange={(sizes) => {
-                setChatHorizontalLayout(sizes);
-                saveLayoutState({ chatHorizontalLayout: sizes });
-              }}
-              onVerticalLayoutChange={(sizes) => {
-                setChatVerticalLayout(sizes);
-                saveLayoutState({ chatVerticalLayout: sizes });
-              }}
-            />
+        {/* Tab Content — lazy mount, then CSS hide to preserve state */}
+        <div className="flex-1 overflow-hidden relative">
+          {layoutsLoaded && mountedTabs.has('chat') && (
+            <div className="absolute inset-0" style={{ display: activeTab === 'chat' ? 'block' : 'none' }}>
+              <ChatTab
+                chatHorizontalLayout={chatHorizontalLayout}
+                chatVerticalLayout={chatVerticalLayout}
+                onHorizontalLayoutChange={(sizes) => {
+                  setChatHorizontalLayout(sizes);
+                  saveLayoutState({ chatHorizontalLayout: sizes });
+                }}
+                onVerticalLayoutChange={(sizes) => {
+                  setChatVerticalLayout(sizes);
+                  saveLayoutState({ chatVerticalLayout: sizes });
+                }}
+              />
+            </div>
           )}
 
-          {activeTab === 'canvas' && layoutsLoaded && (
-            <CanvasTab
-              canvasHorizontalLayout={canvasHorizontalLayout}
-              onLayoutChange={(sizes) => {
-                setCanvasHorizontalLayout(sizes);
-                saveLayoutState({ canvasHorizontalLayout: sizes });
-              }}
-              initialWorkflowId={activeWorkflowId}
-              onWorkflowIdChange={setActiveWorkflowId}
-            />
+          {layoutsLoaded && mountedTabs.has('canvas') && (
+            <div className="absolute inset-0" style={{ display: activeTab === 'canvas' ? 'block' : 'none' }}>
+              <CanvasTab
+                canvasHorizontalLayout={canvasHorizontalLayout}
+                onLayoutChange={(sizes) => {
+                  setCanvasHorizontalLayout(sizes);
+                  saveLayoutState({ canvasHorizontalLayout: sizes });
+                }}
+                initialWorkflowId={activeWorkflowId}
+                onWorkflowIdChange={setActiveWorkflowId}
+              />
+            </div>
           )}
         </div>
       </div>

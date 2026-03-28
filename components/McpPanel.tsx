@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { Plus, RotateCcw, Check, AlertTriangle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import Dialog from '@/components/Dialog';
@@ -31,6 +31,11 @@ export default function McpPanel() {
       setMcpLoading(false);
     }
   }, []);
+
+  // Auto-fetch on mount
+  useEffect(() => {
+    fetchMcpServers();
+  }, [fetchMcpServers]);
 
   // Add MCP server dialog
   const [showAddMcp, setShowAddMcp] = useState(false);
