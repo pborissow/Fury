@@ -1,12 +1,20 @@
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { readFile, readdir, stat } from 'fs/promises';
+import { readFile, readdir } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
-import { projectPathToSlug } from './utils';
 import { eventBus } from './eventBus';
 
 const execAsync = promisify(exec);
+
+interface SessionPidEntry {
+  pid: number;
+  sessionId: string;
+  cwd: string;
+  startedAt: number;
+  kind: string;
+  entrypoint: string;
+}
 
 class LiveSessionScanner {
   private intervalHandle: NodeJS.Timeout | null = null;
@@ -29,9 +37,7 @@ class LiveSessionScanner {
 
   /** Run a scan immediately and return the result (for REST endpoint). */
   async scanNow(): Promise<string[]> {
-    return process.platform === 'win32'
-      ? this.scanWindows()
-      : this.scanUnix();
+    return this.scanViaPidFiles();
   }
 
   private async scan() {
@@ -62,158 +68,56 @@ class LiveSessionScanner {
     return true;
   }
 
-  private async scanWindows(): Promise<string[]> {
-    const liveSessionIds: string[] = [];
+  /**
+   * Reads ~/.claude/sessions/*.json to get deterministic pid-to-session mappings,
+   * then checks whether each pid is still alive. Works on macOS, Linux, and Windows.
+   */
+  private async scanViaPidFiles(): Promise<string[]> {
+    const sessionsDir = join(homedir(), '.claude', 'sessions');
+    const liveSessionIds = new Set<string>();
 
     try {
-      const psCommand = [
-        'powershell -NoProfile -Command',
-        '"Get-CimInstance Win32_Process | Where-Object {',
-        "$_.Name -eq \'claude.exe\'",
-        '} | ForEach-Object {',
-        "$_.CreationDate.ToString(\'o\')",
-        '}"',
-      ].join(' ');
+      const files = await readdir(sessionsDir);
 
-      const { stdout } = await execAsync(psCommand, { timeout: 5000 });
-      const processCreationTimes = stdout.trim().split('\n')
-        .map(line => new Date(line.trim()).getTime())
-        .filter(t => !isNaN(t))
-        .sort((a, b) => b - a);
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue;
 
-      if (processCreationTimes.length === 0) {
-        return [];
-      }
-
-      const historyPath = join(homedir(), '.claude', 'history.jsonl');
-      let projectsFromHistory: { project: string; sessionId: string }[] = [];
-
-      try {
-        const content = await readFile(historyPath, 'utf-8');
-        const entries = content.trim().split('\n')
-          .map(line => { try { return JSON.parse(line); } catch { return null; } })
-          .filter(Boolean)
-          .reverse();
-
-        const seenProjects = new Set<string>();
-        for (const entry of entries) {
-          if (!entry.project || !entry.sessionId || seenProjects.has(entry.project)) continue;
-          seenProjects.add(entry.project);
-          projectsFromHistory.push({ project: entry.project, sessionId: entry.sessionId });
-        }
-      } catch {
-        // history.jsonl not readable
-      }
-
-      const usedProcesses = new Set<number>();
-      const projectsDir = join(homedir(), '.claude', 'projects');
-
-      for (const { project } of projectsFromHistory) {
-        const slug = projectPathToSlug(project);
-        const slugDir = join(projectsDir, slug);
-
-        let bestSession: { sessionId: string; mtime: number } | null = null;
         try {
-          const files = await readdir(slugDir);
-          for (const file of files) {
-            if (!file.endsWith('.jsonl')) continue;
-            try {
-              const fileStat = await stat(join(slugDir, file));
-              if (!bestSession || fileStat.mtimeMs > bestSession.mtime) {
-                bestSession = {
-                  sessionId: file.replace('.jsonl', ''),
-                  mtime: fileStat.mtimeMs,
-                };
-              }
-            } catch { /* skip unreadable files */ }
+          const content = await readFile(join(sessionsDir, file), 'utf-8');
+          const entry: SessionPidEntry = JSON.parse(content);
+
+          if (entry.pid && entry.sessionId && await this.isProcessAlive(entry.pid)) {
+            liveSessionIds.add(entry.sessionId);
           }
-        } catch { /* skip unreadable dirs */ }
-
-        if (!bestSession) continue;
-
-        let matchedProcess = -1;
-        for (let i = 0; i < processCreationTimes.length; i++) {
-          if (usedProcesses.has(i)) continue;
-          if (processCreationTimes[i] <= bestSession.mtime) {
-            matchedProcess = i;
-            break;
-          }
-        }
-
-        if (matchedProcess >= 0) {
-          usedProcesses.add(matchedProcess);
-          liveSessionIds.push(bestSession.sessionId);
-        }
-
-        if (usedProcesses.size >= processCreationTimes.length) break;
+        } catch { /* skip unreadable/malformed files */ }
       }
     } catch {
-      // Process detection or history parsing failed
+      // sessions directory doesn't exist or isn't readable
     }
 
-    return liveSessionIds;
+    return [...liveSessionIds];
   }
 
-  private async scanUnix(): Promise<string[]> {
-    const liveSessionIds: string[] = [];
-
-    try {
-      const { stdout: pgrepOut } = await execAsync('pgrep -af "^claude" 2>/dev/null', { timeout: 5000 });
-      const pids = pgrepOut.trim().split('\n').map(line => line.trim().split(/\s/)[0]).filter(Boolean);
-
-      if (pids.length === 0) {
-        return [];
+  private async isProcessAlive(pid: number): Promise<boolean> {
+    if (process.platform === 'win32') {
+      try {
+        const { stdout } = await execAsync(
+          `tasklist /FI "PID eq ${pid}" /NH`,
+          { timeout: 3000 }
+        );
+        return stdout.includes(String(pid));
+      } catch {
+        return false;
       }
-
-      const pidList = pids.join(',');
-      const { stdout: lsofOut } = await execAsync(
-        `lsof -a -p ${pidList} -d cwd -Fn 2>/dev/null`,
-        { timeout: 5000 }
-      );
-
-      const projectDirs: string[] = [];
-      for (const line of lsofOut.split('\n')) {
-        if (line.startsWith('n/')) {
-          projectDirs.push(line.substring(1));
-        }
-      }
-
-      const projectsDir = join(homedir(), '.claude', 'projects');
-      const processCounts: Record<string, number> = {};
-      for (const dir of projectDirs) {
-        processCounts[dir] = (processCounts[dir] || 0) + 1;
-      }
-
-      for (const [dir, count] of Object.entries(processCounts)) {
-        const slug = projectPathToSlug(dir);
-        const slugDir = join(projectsDir, slug);
-
-        try {
-          const files = await readdir(slugDir);
-          const sessions: { sessionId: string; mtime: number }[] = [];
-
-          for (const file of files) {
-            if (!file.endsWith('.jsonl')) continue;
-            try {
-              const fileStat = await stat(join(slugDir, file));
-              sessions.push({
-                sessionId: file.replace('.jsonl', ''),
-                mtime: fileStat.mtimeMs,
-              });
-            } catch { /* skip */ }
-          }
-
-          sessions.sort((a, b) => b.mtime - a.mtime);
-          for (let i = 0; i < Math.min(count, sessions.length); i++) {
-            liveSessionIds.push(sessions[i].sessionId);
-          }
-        } catch { /* skip unreadable dirs */ }
-      }
-    } catch {
-      // No claude processes or commands unavailable
     }
 
-    return liveSessionIds;
+    // macOS / Linux: signal 0 checks existence without killing
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }
 
