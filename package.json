@@ -22,6 +22,10 @@
     "@tiptap/extension-code-block": "^3.7.2",
     "@tiptap/extension-code-block-lowlight": "^3.7.2",
     "@tiptap/extension-placeholder": "^3.7.2",
+    "@tiptap/extension-table": "^3.22.1",
+    "@tiptap/extension-table-cell": "^3.22.1",
+    "@tiptap/extension-table-header": "^3.22.1",
+    "@tiptap/extension-table-row": "^3.22.1",
     "@tiptap/react": "^3.7.2",
     "@tiptap/starter-kit": "^3.7.2",
     "class-variance-authority": "^0.7.1",
@@ -39,7 +43,8 @@
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
     "tailwind-merge": "^3.3.1",
-    "turndown": "^7.2.2"
+    "turndown": "^7.2.2",
+    "turndown-plugin-gfm": "^1.0.2"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",

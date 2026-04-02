@@ -23,29 +23,44 @@ const ChatBubble = ({ label, children, headerExtra, className, rawContent, isMar
     const el = contentRef.current;
     if (!el) return;
 
-    // For markdown (assistant) bubbles, use the rendered HTML from the DOM.
-    // For plain text (user) bubbles, convert newlines to <p> tags so TipTap
-    // preserves line breaks on paste.
     const html = isMarkdown ? el.innerHTML : textToHtml(rawContent);
-    const text = rawContent;
 
-    try {
-      await navigator.clipboard.write([
-        new ClipboardItem({
-          'text/html': new Blob([html], { type: 'text/html' }),
-          'text/plain': new Blob([text], { type: 'text/plain' }),
-        }),
-      ]);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch {
+    // Ctrl+Click: copy rendered HTML (for apps that don't support markdown)
+    // Normal click: copy markdown as plain text + HTML for TipTap paste
+    const copyHtmlOnly = e.ctrlKey || e.metaKey;
+    const text = copyHtmlOnly ? html : rawContent;
+
+    // Try the modern Clipboard API first (requires secure context: https or localhost)
+    if (navigator.clipboard?.write) {
       try {
-        await navigator.clipboard.writeText(text);
+        await navigator.clipboard.write([
+          new ClipboardItem({
+            'text/html': new Blob([html], { type: 'text/html' }),
+            'text/plain': new Blob([text], { type: 'text/plain' }),
+          }),
+        ]);
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
-      } catch (err) {
-        console.error('Failed to copy:', err);
+        return;
+      } catch {
+        // Fall through to legacy approach
       }
+    }
+
+    // Legacy fallback: works on insecure origins (plain HTTP over LAN, etc.)
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy:', err);
     }
   };
 
@@ -59,7 +74,7 @@ const ChatBubble = ({ label, children, headerExtra, className, rawContent, isMar
         <button
           onClick={handleCopy}
           className="opacity-0 group-hover/bubble:opacity-100 transition-opacity p-1 rounded hover:bg-black/10 dark:hover:bg-white/10"
-          title="Copy to clipboard"
+          title="Copy to clipboard (Ctrl+Click for HTML)"
         >
           {copied ? (
             <Check className="h-3.5 w-3.5 text-green-500" />
@@ -68,7 +83,7 @@ const ChatBubble = ({ label, children, headerExtra, className, rawContent, isMar
           )}
         </button>
       </div>
-      <div ref={contentRef}>{children}</div>
+      <div ref={contentRef} className="overflow-x-auto">{children}</div>
     </div>
   );
 };

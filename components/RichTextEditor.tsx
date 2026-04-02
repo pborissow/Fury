@@ -4,6 +4,10 @@ import { useEffect, useState, useRef, useCallback, useImperativeHandle, forwardR
 import { useEditor, EditorContent } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import CodeBlock from '@tiptap/extension-code-block';
+import { Table } from '@tiptap/extension-table';
+import { TableRow } from '@tiptap/extension-table-row';
+import { TableCell } from '@tiptap/extension-table-cell';
+import { TableHeader } from '@tiptap/extension-table-header';
 import TurndownService from 'turndown';
 import { Button } from '@/components/ui/button';
 
@@ -88,6 +92,10 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
           class: 'bg-muted p-3 rounded my-2 font-mono text-sm border border-border',
         },
       }),
+      Table.configure({ resizable: false }),
+      TableRow,
+      TableCell,
+      TableHeader,
     ],
     content: initialContent,
     immediatelyRender: false, // Fix SSR hydration issues
@@ -241,8 +249,40 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
 
     // Convert HTML to markdown so formatting (bold, lists, code blocks)
     // is preserved in prompts sent to Claude.
-    const html = editor.getHTML();
-    const markdown = turndown.turndown(html).trim();
+    // Convert <table> elements to markdown pipe tables via DOM traversal.
+    // Tables are replaced with unique markers before Turndown runs, then
+    // swapped back after — this avoids Turndown collapsing newlines or
+    // escaping pipe characters.
+    const rawHtml = editor.getHTML();
+    const div = document.createElement('div');
+    div.innerHTML = rawHtml;
+    const tableMdMap = new Map<string, string>();
+    div.querySelectorAll('table').forEach((table, idx) => {
+      const rows = table.querySelectorAll('tr');
+      const mdRows: string[] = [];
+
+      rows.forEach((row, i) => {
+        const cells = row.querySelectorAll('th, td');
+        const values = Array.from(cells).map(cell => (cell.textContent || '').trim());
+        mdRows.push('| ' + values.join(' | ') + ' |');
+        if (i === 0) {
+          mdRows.push('| ' + values.map(() => '---').join(' | ') + ' |');
+        }
+      });
+
+      const marker = `FURYTABLE${idx}FURYTABLE`;
+      tableMdMap.set(marker, mdRows.join('\n'));
+      const placeholder = document.createElement('p');
+      placeholder.textContent = marker;
+      table.replaceWith(placeholder);
+    });
+
+    let markdown = turndown.turndown(div.innerHTML).trim();
+
+    // Swap markers back with the raw table markdown
+    for (const [marker, md] of tableMdMap) {
+      markdown = markdown.replace(marker, md);
+    }
 
     onSubmit(markdown);
 

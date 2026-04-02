@@ -10,8 +10,27 @@ const CopyableCodeBlock = ({ children, ...props }: React.HTMLAttributes<HTMLPreE
   const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation();
     const text = preRef.current?.textContent || '';
+
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+        return;
+      } catch {
+        // Fall through to legacy approach
+      }
+    }
+
     try {
-      await navigator.clipboard.writeText(text);
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
