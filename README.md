@@ -25,6 +25,16 @@ A prototype IDE for AI-assisted development built with Next.js and Claude Code. 
 - **Stream** - Live stream of tool use events, text output, and errors during Claude responses
 - **File Tree** - Explore the active session's project directory (filters out `node_modules`, `.next`, `.git`, etc.)
 - **Notes** - Per-project rich text notes with auto-save (stored in `~/.claude-session-notes/`)
+- **MCP Servers** - Manage Model Context Protocol servers with a guided wizard
+
+### MCP Server Management
+- **3-step wizard** for adding MCP servers: select type → configure details → optionally generate CLAUDE.md instructions
+- **This Project (Code Search)** - Index and search project code locally using [codemogger](https://github.com/pborissow/codemogger). Select directories to index, and a codemogger MCP server is registered automatically. Claude uses `codemogger_search` for semantic and keyword code search.
+- **Local Process** - Run any custom MCP server command via stdio transport (e.g., `npx my-mcp-server`)
+- **Remote Server** - Connect to HTTP MCP endpoints. Supports pasting multiple URLs at once with auto-derived server names and duplicate detection.
+- **Edit and delete** - Hover over any server card to reveal edit (pencil) and delete (trash) buttons
+- **Scope control** - Register servers for the current project or across all projects
+- **CLAUDE.md generation** - Step 3 of the wizard generates usage instructions so Claude knows when and how to use the MCP server
 
 ### General
 - **Light/Dark theme** - Toggle via toolbar button, persisted in localStorage
@@ -40,6 +50,7 @@ A prototype IDE for AI-assisted development built with Next.js and Claude Code. 
 - **Editor**: TipTap (rich text input + notes)
 - **Canvas**: Drawflow
 - **AI**: Claude CLI (`claude` command) spawned as child processes via `SessionManager`
+- **Code Search**: codemogger (local semantic + keyword search via MCP)
 - **Fonts**: Geist Sans / Geist Mono
 
 ## Architecture
@@ -60,6 +71,8 @@ app/
     directories/route.ts# GET - Browse filesystem directories
     notes/route.ts      # GET/POST/DELETE - Per-project notes
     health/route.ts     # GET/POST - Session health check / kill stuck process
+    mcp/route.ts        # GET/POST/DELETE - List, add, and remove MCP servers
+    claude-md/route.ts  # GET/POST - Read and append to CLAUDE.md files
     workflows/route.ts  # CRUD for workflow persistence
     prompts/route.ts    # CRUD for saved prompts
     ui-state/route.ts   # GET/POST - Persist active tab & workflow
@@ -84,6 +97,7 @@ components/
   NodeChatModal.tsx      # Modal chat interface for workflow nodes
   FileTree.tsx           # Recursive file tree display
   DirectoryPicker.tsx    # Filesystem directory browser dialog
+  McpPanel.tsx           # MCP server list and add/edit/delete wizard
   RichTextEditor.tsx     # TipTap editor (chat input + notes)
   AskUserQuestionDialog.tsx # Interactive dialog for Claude's AskUserQuestion tool
   NotesEditor.tsx        # Notes-specific editor wrapper
@@ -102,6 +116,8 @@ components/
 | UI state | `.claude-ui-state/state.json` (project-local) |
 | Saved prompts | `.claude-prompts/*.json` (project-local) |
 | Session notes | `~/.claude-session-notes/*.md` (user home) |
+| MCP servers | `~/.claude.json` (user scope) or `.mcp.json` (project scope), managed by Claude CLI |
+| Code search index | `~/.codemogger/index.db` (codemogger, user home) |
 | Theme | `localStorage` (browser) |
 
 ### Transcript Database

@@ -818,6 +818,13 @@ export default function ChatTab({
       }, ...prev]);
     }
 
+    // Optimistically mark this session as live so the badge renders immediately
+    setLiveSessionIds(prev => {
+      const next = new Set(prev);
+      next.add(mySessionId);
+      return next;
+    });
+
     // Instant feedback
     setTranscriptOverlayMessages(prev => [...prev, { role: 'user' as const, content: userMessage }]);
     setTranscriptLoading(true);
@@ -1259,7 +1266,7 @@ export default function ChatTab({
               )}
             </div>
           )}
-          {rightPanelView === 'mcp' && <McpPanel />}
+          {rightPanelView === 'mcp' && <McpPanel projectPath={historyTranscriptProject} />}
         </div>
       </Panel>
     </PanelGroup>

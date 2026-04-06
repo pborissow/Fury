@@ -11,6 +11,8 @@ interface McpServer {
   url: string;
   status: 'connected' | 'needs_auth' | 'error' | 'unknown';
   statusDetail: string;
+  scope: 'project' | 'user' | 'unknown';
+  transport: 'stdio' | 'http' | 'unknown';
 }
 
 export async function GET() {
@@ -33,7 +35,7 @@ export async function GET() {
       if (!trimmed || trimmed.startsWith('Checking')) continue;
 
       // Pattern: "name: url - status"
-      const match = trimmed.match(/^(.+?):\s+(\S+)\s+-\s+(.+)$/);
+      const match = trimmed.match(/^(.+?):\s+(\S+)(?:\s+\([^)]+\))?\s+-\s+(.+)$/);
       if (match) {
         const [, name, url, statusText] = match;
         let status: McpServer['status'] = 'unknown';
@@ -49,9 +51,34 @@ export async function GET() {
           url: url.trim(),
           status,
           statusDetail: statusText.trim(),
+          scope: 'unknown',
+          transport: 'unknown',
         });
       }
     }
+
+    // Fetch scope and transport per server in parallel via `claude mcp get`
+    await Promise.all(servers.map(async (server) => {
+      try {
+        const { stdout: out, stderr: err } = await execFileAsync(
+          'claude', ['mcp', 'get', server.name],
+          { timeout: 10000, encoding: 'utf-8', env: { ...process.env, CLAUDECODE: undefined } },
+        );
+        const detail = (out || '') + (err || '');
+        if (/project/i.test(detail.match(/Scope:\s*(.+)/)?.[1] || '')) {
+          server.scope = 'project';
+        } else if (/user/i.test(detail.match(/Scope:\s*(.+)/)?.[1] || '')) {
+          server.scope = 'user';
+        }
+        const typeMatch = detail.match(/Type:\s*(\S+)/);
+        if (typeMatch) {
+          const t = typeMatch[1].toLowerCase();
+          server.transport = t === 'http' ? 'http' : t === 'stdio' ? 'stdio' : 'unknown';
+        }
+      } catch {
+        // Non-critical — leave as 'unknown'
+      }
+    }));
 
     return NextResponse.json({ servers });
   } catch (error: unknown) {
@@ -111,5 +138,29 @@ export async function POST(request: NextRequest) {
       { error: message },
       { status: 500 },
     );
+  }
+}
+
+export async function DELETE(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { name } = body;
+
+    if (!name) {
+      return NextResponse.json({ error: 'Server name is required' }, { status: 400 });
+    }
+
+    const { stdout, stderr } = await execFileAsync('claude', ['mcp', 'remove', name], {
+      timeout: 15000,
+      encoding: 'utf-8',
+      env: { ...process.env, CLAUDECODE: undefined },
+    });
+
+    const output = (stdout || '') + (stderr || '');
+    return NextResponse.json({ success: true, output: output.trim() });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    console.error('[MCP API] Error removing MCP server:', message);
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

@@ -214,7 +214,25 @@ export async function GET(request: NextRequest) {
     }
 
     // Parse the JSONL using shared parser
-    const { messages, rawLines, rawEntries } = parseTranscriptJsonl(content);
+    const { messages, rawLines, rawEntries, planSlug, planInsertAfter } = parseTranscriptJsonl(content);
+
+    // If the session wrote a plan file, inject it at the right position
+    if (planSlug && planInsertAfter != null) {
+      const planPath = join(homedir(), '.claude', 'plans', `${planSlug}.md`);
+      try {
+        const planContent = await fs.readFile(planPath, 'utf-8');
+        if (planContent.trim()) {
+          const planMessage: typeof messages[0] = {
+            role: 'assistant',
+            content: planContent.trim(),
+            timestamp: messages[planInsertAfter].timestamp,
+          };
+          messages.splice(planInsertAfter + 1, 0, planMessage);
+        }
+      } catch {
+        // Plan file doesn't exist or isn't readable — skip
+      }
+    }
 
     // --- Unprocessed prompts detection ---
     // history.jsonl entries are written the instant the user hits send,
