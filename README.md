@@ -116,7 +116,7 @@ components/
 | UI state | `.claude-ui-state/state.json` (project-local) |
 | Saved prompts | `.claude-prompts/*.json` (project-local) |
 | Session notes | `~/.claude-session-notes/*.md` (user home) |
-| MCP servers | `~/.claude.json` (user scope) or `.mcp.json` (project scope), managed by Claude CLI |
+| MCP servers | `~/.claude.json` (user scope) or `.mcp.json` (project scope), created and managed by Claude CLI via `claude mcp add/remove` |
 | Code search index | `~/.codemogger/index.db` (codemogger, user home) |
 | Theme | `localStorage` (browser) |
 

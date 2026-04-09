@@ -58,10 +58,12 @@ test.describe('MCP wizard — Code Search (codemogger)', () => {
     // Dialog title should say "Code Search"
     await expect(page.locator('[class*="font-semibold"]', { hasText: 'Code Search' })).toBeVisible();
 
-    // Name should be pre-filled with "codemogger"
-    const nameInput = page.locator('input[placeholder="codemogger"]');
+    // Name should be pre-filled with the project directory name (e.g. "Fury")
+    const nameInput = page.locator('input[placeholder="my-project"]');
     await expect(nameInput).toBeVisible();
-    await expect(nameInput).toHaveValue('codemogger');
+    const nameValue = await nameInput.inputValue();
+    console.log(`Pre-filled name: ${nameValue}`);
+    expect(nameValue.length).toBeGreaterThan(0);
 
     // Override with test name to avoid collision
     await nameInput.clear();

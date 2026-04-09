@@ -26,9 +26,10 @@ interface DirectoryPickerProps {
   onOpenChange: (open: boolean) => void;
   onSelect: (path: string) => void;
   recentDirectories?: string[];
+  initialPath?: string;
 }
 
-export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectories = [] }: DirectoryPickerProps) {
+export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectories = [], initialPath }: DirectoryPickerProps) {
   const [currentPath, setCurrentPath] = useState<string>('');
   const [directories, setDirectories] = useState<Directory[]>([]);
   const [parentPath, setParentPath] = useState<string | null>(null);
@@ -39,7 +40,7 @@ export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectorie
 
   useEffect(() => {
     if (open) {
-      loadDirectory();
+      loadDirectory(initialPath);
     }
   }, [open]);
 

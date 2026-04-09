@@ -15,13 +15,22 @@ interface McpServer {
   transport: 'stdio' | 'http' | 'unknown';
 }
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
-    const { stdout, stderr } = await execFileAsync('claude', ['mcp', 'list'], {
+    const { searchParams } = new URL(request.url);
+    const projectPath = searchParams.get('projectPath');
+
+    const execOpts: { timeout: number; encoding: 'utf-8'; env: NodeJS.ProcessEnv; cwd?: string } = {
       timeout: 15000,
       encoding: 'utf-8',
       env: { ...process.env, CLAUDECODE: undefined },
-    });
+    };
+
+    if (projectPath) {
+      execOpts.cwd = projectPath;
+    }
+
+    const { stdout, stderr } = await execFileAsync('claude', ['mcp', 'list'], execOpts);
 
     const output = (stdout || '') + (stderr || '');
     const servers: McpServer[] = [];
@@ -59,6 +68,12 @@ export async function GET() {
 
     // Fetch scope and transport per server in parallel via `claude mcp get`
     await Promise.all(servers.map(async (server) => {
+      // Claude.ai integrations (e.g. "claude.ai Gmail") — can't query via `claude mcp get`
+      if (server.name.startsWith('claude.ai ')) {
+        server.scope = 'user';
+        server.transport = 'http';
+        return;
+      }
       try {
         const { stdout: out, stderr: err } = await execFileAsync(
           'claude', ['mcp', 'get', server.name],
@@ -94,7 +109,7 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { name, transport, commandOrUrl, args, envVars, scope } = body;
+    const { name, transport, commandOrUrl, args, envVars, scope, projectPath } = body;
 
     if (!name || !commandOrUrl) {
       return NextResponse.json(
@@ -123,11 +138,18 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const { stdout, stderr } = await execFileAsync('claude', cliArgs, {
+    const execOpts: { timeout: number; encoding: 'utf-8'; env: NodeJS.ProcessEnv; cwd?: string } = {
       timeout: 15000,
       encoding: 'utf-8',
       env: { ...process.env, CLAUDECODE: undefined },
-    });
+    };
+
+    // For project scope, run in the target project directory so .mcp.json is created there
+    if (scope === 'project' && projectPath) {
+      execOpts.cwd = projectPath;
+    }
+
+    const { stdout, stderr } = await execFileAsync('claude', cliArgs, execOpts);
 
     const output = (stdout || '') + (stderr || '');
     return NextResponse.json({ success: true, output: output.trim() });
@@ -144,17 +166,24 @@ export async function POST(request: NextRequest) {
 export async function DELETE(request: NextRequest) {
   try {
     const body = await request.json();
-    const { name } = body;
+    const { name, projectPath } = body;
 
     if (!name) {
       return NextResponse.json({ error: 'Server name is required' }, { status: 400 });
     }
 
-    const { stdout, stderr } = await execFileAsync('claude', ['mcp', 'remove', name], {
+    const execOpts: { timeout: number; encoding: 'utf-8'; env: NodeJS.ProcessEnv; cwd?: string } = {
       timeout: 15000,
       encoding: 'utf-8',
       env: { ...process.env, CLAUDECODE: undefined },
-    });
+    };
+
+    // Run in project directory so claude can find project-scoped .mcp.json
+    if (projectPath) {
+      execOpts.cwd = projectPath;
+    }
+
+    const { stdout, stderr } = await execFileAsync('claude', ['mcp', 'remove', name], execOpts);
 
     const output = (stdout || '') + (stderr || '');
     return NextResponse.json({ success: true, output: output.trim() });

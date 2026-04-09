@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useCallback, useEffect } from 'react';
-import { Plus, RotateCcw, Check, AlertTriangle, Terminal, Globe, ChevronRight, FileText, Pencil, Trash2, FolderOpen, Search, X } from 'lucide-react';
+import { Plus, RotateCcw, Check, AlertTriangle, Terminal, Globe, ChevronRight, FileText, Pencil, Trash2, FolderOpen, Search, X, Monitor } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import Dialog, { ConfirmDialog } from '@/components/Dialog';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
@@ -96,9 +96,11 @@ ${rows}
 `;
 }
 
-function generateCodeSearchTemplate(directories: string[]): string {
+function generateCodeSearchTemplate(name: string, directories: string[]): string {
   const dirList = directories.map(d => `- \`${d}\``).join('\n');
-  return `# Code Search (codemogger)
+  return `# Code Search
+
+This project has a \`${name}\` MCP server providing semantic and keyword code search.
 
 Use \`codemogger_search\` BEFORE falling back to Grep or Glob when exploring the codebase.
 
@@ -129,7 +131,8 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
     setMcpLoading(true);
     setMcpError(null);
     try {
-      const res = await fetch('/api/mcp');
+      const url = projectPath ? `/api/mcp?projectPath=${encodeURIComponent(projectPath)}` : '/api/mcp';
+      const res = await fetch(url);
       const data = await res.json();
       setMcpServers(data.servers || []);
       if (data.error) setMcpError(data.error);
@@ -138,7 +141,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
     } finally {
       setMcpLoading(false);
     }
-  }, []);
+  }, [projectPath]);
 
   useEffect(() => {
     fetchMcpServers();
@@ -169,7 +172,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
       const res = await fetch('/api/mcp', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: deleteTarget.name }),
+        body: JSON.stringify({ name: deleteTarget.name, projectPath }),
       });
       const data = await res.json();
       if (!res.ok || data.error) {
@@ -182,7 +185,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
     } finally {
       setDeleteLoading(false);
     }
-  }, [deleteTarget, fetchMcpServers]);
+  }, [deleteTarget, projectPath, fetchMcpServers]);
 
   // Edit: opens wizard at step 2, pre-filled. Remove old, then re-add.
   const [editingServerName, setEditingServerName] = useState<string | null>(null);
@@ -232,9 +235,9 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
     setMcpForm(f => ({
       ...f,
       transport,
-      name: transport === 'codesearch' ? 'codemogger' : '',
+      name: transport === 'codesearch' && projectPath ? projectPath.split(/[/\\]/).filter(Boolean).pop() || '' : '',
       directories: transport === 'codesearch' && projectPath ? [projectPath] : [],
-      scope: transport === 'codesearch' ? 'user' : 'project',
+      scope: 'project',
     }));
     setWizardStep('details');
   }, [projectPath]);
@@ -255,7 +258,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
         await fetch('/api/mcp', {
           method: 'DELETE',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: editingServerName }),
+          body: JSON.stringify({ name: editingServerName, projectPath }),
         });
       }
 
@@ -281,6 +284,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
             args: `--db ${dbPath} mcp`,
             envVars: '',
             scope: mcpForm.scope,
+            projectPath,
           }),
         });
         const data = await res.json();
@@ -292,7 +296,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
         fetchMcpServers();
         setEditingServerName(null);
         setAddedServers([{ name: mcpForm.name, url: `codemogger (${mcpForm.directories.length} dirs)` }]);
-        setInstructions(generateCodeSearchTemplate(mcpForm.directories));
+        setInstructions(generateCodeSearchTemplate(mcpForm.name, mcpForm.directories));
         setWizardStep('instructions');
         return;
       }
@@ -319,6 +323,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
             ...mcpForm,
             name: server.name,
             commandOrUrl: server.url,
+            projectPath,
           }),
         });
         const data = await res.json();
@@ -349,7 +354,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
     } finally {
       setMcpAddLoading(false);
     }
-  }, [mcpForm, httpServers, newHttpServers, editingServerName, fetchMcpServers]);
+  }, [mcpForm, httpServers, newHttpServers, editingServerName, projectPath, fetchMcpServers]);
 
   // Step 3: save instructions to CLAUDE.md
   const handleSaveInstructions = useCallback(async () => {
@@ -513,7 +518,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
                     <span className="flex items-center gap-1" title={server.scope === 'project' ? 'This project only' : 'All projects'}>
                       {server.scope === 'project'
                         ? <FolderOpen className="h-3 w-3" />
-                        : <Globe className="h-3 w-3" />}
+                        : <Monitor className="h-3 w-3" />}
                       {server.scope === 'project' ? 'project' : 'all projects'}
                     </span>
                   )}
@@ -591,7 +596,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
                 type="text"
                 value={mcpForm.name}
                 onChange={(e) => setMcpForm(f => ({ ...f, name: e.target.value }))}
-                placeholder="codemogger"
+                placeholder="my-project"
                 className={inputClass}
               />
             </div>
@@ -620,22 +625,6 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
                 <Plus className="h-3 w-3 mr-1" />
                 Add directory
               </Button>
-            </div>
-            <div>
-              <label className="text-sm font-medium text-foreground block mb-1">Scope</label>
-              <select
-                value={mcpForm.scope}
-                onChange={(e) => setMcpForm(f => ({ ...f, scope: e.target.value as 'user' | 'project' }))}
-                className={inputClass}
-              >
-                <option value="project">This project</option>
-                <option value="user">All projects</option>
-              </select>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {mcpForm.scope === 'project'
-                  ? 'Only available when working in the current project directory.'
-                  : 'Available across all your projects.'}
-              </p>
             </div>
             {mcpAddError && (
               <div className="text-sm text-red-400 p-2 bg-red-500/10 rounded whitespace-pre-wrap">
@@ -817,6 +806,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
       <DirectoryPicker
         open={showDirPicker}
         onOpenChange={setShowDirPicker}
+        initialPath={projectPath || undefined}
         onSelect={(path) => {
           if (!mcpForm.directories.includes(path)) {
             setMcpForm(f => ({ ...f, directories: [...f.directories, path] }));
