@@ -1,15 +1,20 @@
 import fs from 'fs/promises';
 import { readFileSync } from 'fs';
+import { scryptSync, timingSafeEqual } from 'crypto';
 import path from 'path';
 
 export interface AppSettings {
   promptSuggestionsEnabled: boolean;
   localhostOnly: boolean;
+  authUsername: string | null;
+  authPasswordHash: string | null;
 }
 
 const DEFAULTS: AppSettings = {
   promptSuggestionsEnabled: true,
   localhostOnly: true,
+  authUsername: null,
+  authPasswordHash: null,
 };
 
 class SettingsPersistence {
@@ -55,3 +60,13 @@ class SettingsPersistence {
 }
 
 export const settingsPersistence = new SettingsPersistence();
+
+/**
+ * Verify a plaintext password against a stored salt:hash string.
+ */
+export function verifyPassword(password: string, stored: string): boolean {
+  const [salt, hash] = stored.split(':');
+  if (!salt || !hash) return false;
+  const derived = scryptSync(password, salt, 64);
+  return timingSafeEqual(derived, Buffer.from(hash, 'hex'));
+}

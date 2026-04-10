@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import ChatTab from '@/components/ChatTab';
 import CanvasTab from '@/components/CanvasTab';
-import { Sun, Moon, EllipsisVertical } from 'lucide-react';
+import { Sun, Moon, EllipsisVertical, CircleUserRound, LogOut } from 'lucide-react';
 import Dialog from '@/components/Dialog';
 import SettingsPanel from '@/components/SettingsPanel';
 
@@ -15,9 +15,67 @@ export default function Home() {
   // Settings dialog
   const [settingsOpen, setSettingsOpen] = useState(false);
 
+  // Auth state (external users only)
+  const [loggedInUser, setLoggedInUser] = useState<string | null>(null);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const userMenuRef = useRef<HTMLDivElement>(null);
+
+  // Check if current user is authenticated (external)
+  useEffect(() => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', '/api/auth/whoami', true);
+    xhr.setRequestHeader('Cache-Control', 'no-cache, no-transform');
+    xhr.onreadystatechange = () => {
+      if (xhr.readyState === 4 && xhr.status === 200) {
+        try {
+          const data = JSON.parse(xhr.responseText);
+          if (data.username) setLoggedInUser(data.username);
+        } catch {}
+      }
+    };
+    xhr.send(null);
+  }, []);
+
+  // Close user menu on outside click
+  useEffect(() => {
+    if (!userMenuOpen) return;
+    const handleClick = (e: MouseEvent) => {
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
+        setUserMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [userMenuOpen]);
+
+  const handleLogout = () => {
+    setUserMenuOpen(false);
+    // Step 1: GET /api/auth/logout?prompt=false (clear server-side, no WWW-Authenticate)
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', '/api/auth/logout?prompt=false', true);
+    xhr.setRequestHeader('Cache-Control', 'no-cache, no-transform');
+    xhr.onreadystatechange = () => {
+      if (xhr.readyState === 4) {
+        // Step 2: Overwrite browser's cached credentials with dummy ones
+        const xhr2 = new XMLHttpRequest();
+        xhr2.open('GET', '/', true, 'logout', 'logout');
+        xhr2.setRequestHeader('Cache-Control', 'no-cache, no-transform');
+        xhr2.onreadystatechange = () => {
+          if (xhr2.readyState === 4) {
+            window.location.replace('/login');
+          }
+        };
+        xhr2.send('');
+      }
+    };
+    xhr.send('');
+  };
+
   // App settings (persisted to server)
   const [promptSuggestionsEnabled, setPromptSuggestionsEnabled] = useState(true);
   const [localhostOnly, setLocalhostOnly] = useState(true);
+  const [hasCredentials, setHasCredentials] = useState(false);
+  const [authUsername, setAuthUsername] = useState('');
   const settingsLoaded = useRef(false);
 
   // Load settings on mount
@@ -25,6 +83,8 @@ export default function Home() {
     fetch('/api/settings').then(r => r.json()).then(s => {
       if (s.promptSuggestionsEnabled !== undefined) setPromptSuggestionsEnabled(s.promptSuggestionsEnabled);
       if (s.localhostOnly !== undefined) setLocalhostOnly(s.localhostOnly);
+      if (s.hasCredentials !== undefined) setHasCredentials(s.hasCredentials);
+      if (s.authUsername) setAuthUsername(s.authUsername);
       settingsLoaded.current = true;
     }).catch(() => { settingsLoaded.current = true; });
   }, []);
@@ -149,6 +209,33 @@ export default function Home() {
     <div className="h-screen w-screen bg-background flex flex-col">
       {/* Toolbar */}
       <div className="bg-card border-b border-border px-4 py-2 flex items-center justify-end gap-3">
+        {loggedInUser && (
+          <div className="relative" ref={userMenuRef}>
+            <Button
+              variant="ghost"
+              size="sm"
+              title={loggedInUser}
+              className="h-8 w-8 p-0"
+              onClick={() => setUserMenuOpen(!userMenuOpen)}
+            >
+              <CircleUserRound className="h-4 w-4" />
+            </Button>
+            {userMenuOpen && (
+              <div className="absolute right-0 top-full mt-1 w-48 rounded-md border border-border bg-card shadow-lg z-50">
+                <div className="px-3 py-2 border-b border-border">
+                  <div className="text-sm font-medium truncate">{loggedInUser}</div>
+                </div>
+                <button
+                  onClick={handleLogout}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  Sign out
+                </button>
+              </div>
+            )}
+          </div>
+        )}
         <Button
           variant="ghost"
           size="sm"
@@ -167,6 +254,9 @@ export default function Home() {
             onPromptSuggestionsChange={setPromptSuggestionsEnabled}
             localhostOnly={localhostOnly}
             onLocalhostOnlyChange={setLocalhostOnly}
+            hasCredentials={hasCredentials}
+            authUsername={authUsername}
+            onCredentialsSaved={(name) => { setHasCredentials(true); setAuthUsername(name); }}
           />
         </Dialog>
       </div>
