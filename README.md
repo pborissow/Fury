@@ -9,10 +9,12 @@ A prototype IDE for AI-assisted development built with Next.js and Claude Code. 
 - **Unified session list** - Browse all sessions from `~/.claude/history.jsonl` with live session indicators
 - **Streaming responses** - Real-time streamed output from Claude CLI with tool use activity indicators
 - **Markdown rendering** - Assistant responses rendered with syntax highlighting (via `react-markdown`, `remark-gfm`, `rehype-highlight`)
-- **Long conversation warnings** - Visual indicator when sessions exceed 50 messages
 - **Rich text input** - TipTap-based editor with code block support (Enter to send, Shift+Enter for newline)
 - **Stop/Kill controls** - Abort in-flight requests or kill stuck Claude CLI processes
 - **AskUserQuestion support** - Interactive dialog when Claude requests user input via the AskUserQuestion tool
+- **Prompt suggestions** - Detects stale/idle sessions with incomplete responses and suggests follow-up prompts (configurable)
+- **Long conversation warnings** - Visual indicator when sessions exceed 50 messages
+- **Compaction detection** - Hides context compaction messages from the transcript with visual indicator
 
 ### Canvas (Workflow Builder)
 - **Drawflow-based visual canvas** - Drag-and-drop node editor for building workflows
@@ -27,14 +29,9 @@ A prototype IDE for AI-assisted development built with Next.js and Claude Code. 
 - **Notes** - Per-project rich text notes with auto-save (stored in `~/.claude-session-notes/`)
 - **MCP Servers** - Manage Model Context Protocol servers with a guided wizard
 
-### MCP Server Management
-- **3-step wizard** for adding MCP servers: select type → configure details → optionally generate CLAUDE.md instructions
-- **This Project (Code Search)** - Index and search project code locally using [codemogger](https://github.com/pborissow/codemogger). Select directories to index, and a codemogger MCP server is registered automatically. Claude uses `codemogger_search` for semantic and keyword code search.
-- **Local Process** - Run any custom MCP server command via stdio transport (e.g., `npx my-mcp-server`)
-- **Remote Server** - Connect to HTTP MCP endpoints. Supports pasting multiple URLs at once with auto-derived server names and duplicate detection.
-- **Edit and delete** - Hover over any server card to reveal edit (pencil) and delete (trash) buttons
-- **Scope control** - Register servers for the current project or across all projects
-- **CLAUDE.md generation** - Step 3 of the wizard generates usage instructions so Claude knows when and how to use the MCP server
+### Settings
+- **Allow external connections** - Toggle to permit or block access from non-localhost IPs
+- **Prompt suggestions** - Toggle to enable/disable follow-up prompt suggestions for stale sessions
 
 ### General
 - **Light/Dark theme** - Toggle via toolbar button, persisted in localStorage
@@ -53,58 +50,6 @@ A prototype IDE for AI-assisted development built with Next.js and Claude Code. 
 - **Code Search**: codemogger (local semantic + keyword search via MCP)
 - **Fonts**: Geist Sans / Geist Mono
 
-## Architecture
-
-```
-app/
-  page.tsx              # Main UI (single-page app)
-  layout.tsx            # Root layout (metadata, fonts, dark class)
-  globals.css           # Theme variables, prose styles, animations
-  api/
-    claude/route.ts     # POST - Streams Claude CLI output via SSE
-    history/route.ts    # GET/DELETE - Read/clear ~/.claude/history.jsonl
-    transcript/route.ts # GET - Read transcript (JSONL with SQLite fallback)
-    session/route.ts    # DELETE/PATCH - Session deletion and rewind
-    events/route.ts     # GET - SSE stream for real-time updates
-    live-sessions/route.ts # GET - List currently active CLI sessions
-    tree/route.ts       # GET - Build file tree for a directory
-    directories/route.ts# GET - Browse filesystem directories
-    notes/route.ts      # GET/POST/DELETE - Per-project notes
-    health/route.ts     # GET/POST - Session health check / kill stuck process
-    mcp/route.ts        # GET/POST/DELETE - List, add, and remove MCP servers
-    claude-md/route.ts  # GET/POST - Read and append to CLAUDE.md files
-    workflows/route.ts  # CRUD for workflow persistence
-    prompts/route.ts    # CRUD for saved prompts
-    ui-state/route.ts   # GET/POST - Persist active tab & workflow
-
-lib/
-  sessionManager.ts     # Singleton that spawns/queues Claude CLI processes (--session-id/--resume)
-  db.ts                 # SQLite singleton (fury.db), migrations, startup scan
-  transcriptArchiver.ts # Archive/load/delete transcripts, reactive event listener
-  transcriptParser.ts   # Shared JSONL-to-messages parsing logic
-  eventBus.ts           # App-wide event emitter (SSE, file watchers, archiver)
-  fileWatchers.ts       # Watches history.jsonl and session JSONL files for changes
-  liveSessionScanner.ts # Periodic scan for running Claude CLI processes
-  workflowPersistence.ts # Read/write workflows to .claude-workflows/
-  uiStatePersistence.ts  # Read/write UI state to .claude-ui-state/
-  promptPersistence.ts   # Read/write saved prompts to .claude-prompts/
-  recent-directories.ts  # Extract recent dirs from history & workflows
-  utils.ts               # cn() utility, projectPathToSlug
-
-components/
-  DrawflowCanvas.tsx     # Drawflow wrapper with drag-drop node creation
-  WorkflowsPanel.tsx     # Workflow list sidebar (create/rename/delete/load)
-  NodeChatModal.tsx      # Modal chat interface for workflow nodes
-  FileTree.tsx           # Recursive file tree display
-  DirectoryPicker.tsx    # Filesystem directory browser dialog
-  McpPanel.tsx           # MCP server list and add/edit/delete wizard
-  RichTextEditor.tsx     # TipTap editor (chat input + notes)
-  AskUserQuestionDialog.tsx # Interactive dialog for Claude's AskUserQuestion tool
-  NotesEditor.tsx        # Notes-specific editor wrapper
-  PromptsPanel.tsx       # Saved prompts panel
-  ui/                    # shadcn/ui primitives (button, input, dialog, etc.)
-```
-
 ## Data Storage
 
 | Data | Location |
@@ -114,6 +59,7 @@ components/
 | **Transcript archive** | **`~/.claude/fury.db` (SQLite, Fury managed)** |
 | Workflows | `.claude-workflows/*.json` (project-local) |
 | UI state | `.claude-ui-state/state.json` (project-local) |
+| App settings | `.claude-ui-state/settings.json` (project-local) |
 | Saved prompts | `.claude-prompts/*.json` (project-local) |
 | Session notes | `~/.claude-session-notes/*.md` (user home) |
 | MCP servers | `~/.claude.json` (user scope) or `.mcp.json` (project scope), created and managed by Claude CLI via `claude mcp add/remove` |
@@ -149,15 +95,6 @@ npx tsx scripts/populate-db.ts --dry-run # Preview without writing
 npx tsx scripts/populate-db.ts --verbose # Show per-file details
 ```
 
-**Key files:**
-
-| File | Role |
-|------|------|
-| `lib/db.ts` | Database singleton, migrations, startup scan |
-| `lib/transcriptArchiver.ts` | Archive/load/delete functions, reactive event listener |
-| `lib/transcriptParser.ts` | Shared JSONL parsing logic |
-| `scripts/populate-db.ts` | Standalone population script |
-
 ## Session Lifecycle
 
 Fury does **not** maintain long-running Claude processes. Sessions are stateless on the server between messages:
@@ -178,7 +115,6 @@ Fury does **not** maintain long-running Claude processes. Sessions are stateless
 
 - Node.js 20+
 - Claude CLI installed and authenticated (`claude` command available in PATH)
-- **Important:** Claude CLI auto-deletes session transcripts after 30 days by default. To preserve chat history indefinitely, add `"cleanupPeriodDays": 99999` to `~/.claude/settings.json`.
 
 ### Install & Run
 
