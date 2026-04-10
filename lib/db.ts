@@ -68,6 +68,44 @@ async function initDb(client: Client): Promise<void> {
   } catch {
     // Column already exists — expected after first migration
   }
+
+  // Migration: backfill numCompactions metadata for existing archived sessions.
+  // Counts compaction user messages in raw_jsonl per session and stores the count.
+  // Also migrates old hasCompaction boolean to numCompactions integer.
+  try {
+    const compacted = await client.execute(`
+      SELECT r.session_id, COUNT(*) as cnt
+      FROM raw_jsonl r
+      JOIN sessions s ON s.session_id = r.session_id
+      WHERE r.content LIKE '%"content":"This session is being continued from a previous conversation that ran out of context%'
+        AND r.content LIKE '%"type":"user"%'
+        AND (s.metadata IS NULL OR s.metadata NOT LIKE '%numCompactions%')
+      GROUP BY r.session_id
+    `);
+    for (const row of compacted.rows) {
+      const sid = row.session_id as string;
+      const cnt = row.cnt as number;
+      const existing = await client.execute({
+        sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+        args: [sid],
+      });
+      let meta: Record<string, unknown> = {};
+      if (existing.rows[0]?.metadata) {
+        try { meta = JSON.parse(existing.rows[0].metadata as string); } catch {}
+      }
+      meta.numCompactions = cnt;
+      delete meta.hasCompaction;
+      await client.execute({
+        sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+        args: [JSON.stringify(meta), sid],
+      });
+    }
+    if (compacted.rows.length > 0) {
+      console.log(`[DB] Backfilled numCompactions for ${compacted.rows.length} sessions`);
+    }
+  } catch (err) {
+    console.error('[DB] numCompactions backfill error:', err);
+  }
 }
 
 /**
@@ -181,7 +219,7 @@ async function scanAndArchiveAll(client: Client): Promise<void> {
           continue;
         }
 
-        const { messages, rawLines } = parseTranscriptJsonl(content);
+        const { messages, rawLines, numCompactions } = parseTranscriptJsonl(content);
         if (messages.length === 0) {
           skipped++;
           continue;
@@ -197,7 +235,7 @@ async function scanAndArchiveAll(client: Client): Promise<void> {
         const project = info.project;
         const display = info.display || messages[0]?.content?.substring(0, 200) || sessionId;
 
-        await archiveTranscript(sessionId, project, display, content, messages, rawLines, true);
+        await archiveTranscript(sessionId, project, display, content, messages, rawLines, true, { numCompactions });
         archived++;
       } catch (err) {
         errors++;

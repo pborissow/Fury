@@ -1,6 +1,6 @@
 'use client';
 
-import { AlertTriangle, Pencil, Trash2 } from 'lucide-react';
+import { AlertTriangle, ShieldAlert, Pencil, Trash2 } from 'lucide-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import HistoryTimestamp from '@/components/HistoryTimestamp';
 import type { HistoryEntry, PendingSession } from '@/lib/types';
@@ -69,6 +69,7 @@ export default function SessionSidebar({
       {(() => {
         return history.map((entry, index) => {
           const isLive = !!entry.sessionId && liveSessionIds.has(entry.sessionId);
+          const numCompactions = (entry.metadata?.numCompactions as number) || 0;
           const isClickable = !!entry.sessionId && !!entry.project;
           const isViewing = viewingTranscriptId === entry.sessionId;
           return (
@@ -149,9 +150,15 @@ export default function SessionSidebar({
                   <span>
                     {entry.messageCount} message{entry.messageCount !== 1 ? 's' : ''}
                   </span>
-                  {entry.messageCount >= 50 && (
-                    <AlertTriangle className="h-3 w-3 text-yellow-500" />
-                  )}
+                  {numCompactions > 0 ? (
+                    <span title={`Context compacted ${numCompactions} time${numCompactions !== 1 ? 's' : ''} — consider starting a new session`}>
+                      <ShieldAlert className="h-3 w-3 text-orange-500" />
+                    </span>
+                  ) : entry.messageCount >= 50 ? (
+                    <span title="Long session">
+                      <AlertTriangle className="h-3 w-3 text-yellow-500" />
+                    </span>
+                  ) : null}
                 </div>
               )}
               <div className="mt-1 text-xs text-muted-foreground font-mono truncate" title={entry.project}>

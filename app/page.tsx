@@ -4,11 +4,48 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import ChatTab from '@/components/ChatTab';
 import CanvasTab from '@/components/CanvasTab';
-import { Sun, Moon } from 'lucide-react';
+import { Sun, Moon, EllipsisVertical } from 'lucide-react';
+import Dialog from '@/components/Dialog';
+import SettingsPanel from '@/components/SettingsPanel';
 
 export default function Home() {
   // Theme state
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
+
+  // Settings dialog
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  // App settings (persisted to server)
+  const [promptSuggestionsEnabled, setPromptSuggestionsEnabled] = useState(true);
+  const [localhostOnly, setLocalhostOnly] = useState(true);
+  const settingsLoaded = useRef(false);
+
+  // Load settings on mount
+  useEffect(() => {
+    fetch('/api/settings').then(r => r.json()).then(s => {
+      if (s.promptSuggestionsEnabled !== undefined) setPromptSuggestionsEnabled(s.promptSuggestionsEnabled);
+      if (s.localhostOnly !== undefined) setLocalhostOnly(s.localhostOnly);
+      settingsLoaded.current = true;
+    }).catch(() => { settingsLoaded.current = true; });
+  }, []);
+
+  // Persist settings when they change
+  const saveSettings = useCallback((updates: Record<string, unknown>) => {
+    if (!settingsLoaded.current) return;
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    }).catch(err => console.error('[Settings] Failed to save:', err));
+  }, []);
+
+  useEffect(() => {
+    saveSettings({ promptSuggestionsEnabled });
+  }, [promptSuggestionsEnabled, saveSettings]);
+
+  useEffect(() => {
+    saveSettings({ localhostOnly });
+  }, [localhostOnly, saveSettings]);
 
   // Tab control state
   const [activeTab, setActiveTab] = useState<'chat' | 'canvas'>('chat');
@@ -121,6 +158,17 @@ export default function Home() {
         >
           {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
         </Button>
+        <Button variant="ghost" size="sm" title="Settings" className="h-8 w-8 p-0" onClick={() => setSettingsOpen(true)}>
+          <EllipsisVertical className="h-4 w-4" />
+        </Button>
+        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen} title="Settings">
+          <SettingsPanel
+            promptSuggestionsEnabled={promptSuggestionsEnabled}
+            onPromptSuggestionsChange={setPromptSuggestionsEnabled}
+            localhostOnly={localhostOnly}
+            onLocalhostOnlyChange={setLocalhostOnly}
+          />
+        </Dialog>
       </div>
 
       {/* Main Content with Tabs */}
@@ -170,6 +218,7 @@ export default function Home() {
                   saveLayoutState({ chatVerticalLayout: sizes });
                 }}
                 isActive={activeTab === 'chat'}
+                promptSuggestionsEnabled={promptSuggestionsEnabled}
               />
             </div>
           )}

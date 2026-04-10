@@ -214,7 +214,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Parse the JSONL using shared parser
-    const { messages, rawLines, rawEntries, planSlug, planInsertAfter } = parseTranscriptJsonl(content);
+    const { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions } = parseTranscriptJsonl(content);
 
     // If the session wrote a plan file, inject it at the right position
     if (planSlug && planInsertAfter != null) {
@@ -324,10 +324,10 @@ export async function GET(request: NextRequest) {
 
     // Archive to SQLite (fire-and-forget — never blocks the response)
     const display = historyPrompts[0]?.content || messages.find(m => m.role === 'user')?.content || sanitizedSessionId;
-    archiveTranscript(sanitizedSessionId, project, display.substring(0, 200), content, messages, rawLines)
+    archiveTranscript(sanitizedSessionId, project, display.substring(0, 200), content, messages, rawLines, undefined, { numCompactions })
       .catch(err => console.error('[Transcript API] Archive error:', err));
 
-    return NextResponse.json({ messages, suggestedPrompt, unprocessedPrompt });
+    return NextResponse.json({ messages, suggestedPrompt, unprocessedPrompt, numCompactions });
   } catch (error) {
     console.error('[Transcript API] Error:', error);
     return NextResponse.json(

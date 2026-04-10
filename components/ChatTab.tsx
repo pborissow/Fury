@@ -35,6 +35,7 @@ interface ChatTabProps {
   onHorizontalLayoutChange: (sizes: number[]) => void;
   onVerticalLayoutChange: (sizes: number[]) => void;
   isActive: boolean; // pause SSE processing when tab is hidden
+  promptSuggestionsEnabled: boolean;
 }
 
 export default function ChatTab({
@@ -43,6 +44,7 @@ export default function ChatTab({
   onHorizontalLayoutChange,
   onVerticalLayoutChange,
   isActive,
+  promptSuggestionsEnabled,
 }: ChatTabProps) {
   // --- State moved from page.tsx ---
 
@@ -67,6 +69,7 @@ export default function ChatTab({
 
   // Smart prompt suggestion for incomplete responses
   const [suggestedPrompt, setSuggestedPrompt] = useState<{ text: string; context: string } | null>(null);
+
 
   // History transcript viewer state (renders in center panel)
   const [historyTranscript, setHistoryTranscript] = useState<{ role: 'user' | 'assistant'; content: string; timestamp: string }[]>([]);
@@ -1161,7 +1164,7 @@ export default function ChatTab({
                               </button>
                             </div>
                           )}
-                          {suggestedPrompt && !transcriptLoading && (
+                          {suggestedPrompt && !transcriptLoading && promptSuggestionsEnabled && (
                             <div className="flex justify-start">
                               <button
                                 onClick={() => chatEditorRef.current?.setContent(suggestedPrompt.text)}

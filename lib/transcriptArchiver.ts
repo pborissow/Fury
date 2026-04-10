@@ -60,7 +60,8 @@ export async function archiveTranscript(
   jsonlContent: string,
   messages: TranscriptMessage[],
   rawLines?: string[],
-  skipHashCheck?: boolean
+  skipHashCheck?: boolean,
+  opts?: { numCompactions?: number }
 ): Promise<void> {
   const hash = computeHash(jsonlContent);
 
@@ -123,11 +124,30 @@ export async function archiveTranscript(
     await db.batch(inserts.slice(offset, offset + CHUNK_SIZE), 'write');
   }
 
-  // All batches succeeded — stamp the real hash to mark the archive as complete
-  await db.execute({
-    sql: 'UPDATE sessions SET jsonl_hash = ? WHERE session_id = ?',
-    args: [hash, sessionId],
-  });
+  // All batches succeeded — stamp the real hash and merge metadata atomically
+  const nc = opts?.numCompactions ?? 0;
+  if (nc > 0) {
+    // Read existing metadata, set numCompactions, write back with hash
+    const metaRow = await db.execute({
+      sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+      args: [sessionId],
+    });
+    let meta: Record<string, unknown> = {};
+    if (metaRow.rows[0]?.metadata) {
+      try { meta = JSON.parse(metaRow.rows[0].metadata as string); } catch {}
+    }
+    meta.numCompactions = nc;
+    delete meta.hasCompaction; // clean up old key if present
+    await db.execute({
+      sql: 'UPDATE sessions SET jsonl_hash = ?, metadata = ? WHERE session_id = ?',
+      args: [hash, JSON.stringify(meta), sessionId],
+    });
+  } else {
+    await db.execute({
+      sql: 'UPDATE sessions SET jsonl_hash = ? WHERE session_id = ?',
+      args: [hash, sessionId],
+    });
+  }
 }
 
 /**
@@ -279,11 +299,11 @@ async function archiveSessionFromDisk(
   const hash = computeHash(content);
   if (await isCurrentlyArchived(sessionId, hash)) return;
 
-  const { messages, rawLines } = parseTranscriptJsonl(content);
+  const { messages, rawLines, numCompactions } = parseTranscriptJsonl(content);
   if (messages.length === 0) return;
 
   const label = display || messages.find(m => m.role === 'user')?.content?.substring(0, 200) || sessionId;
-  await archiveTranscript(sessionId, project, label, content, messages, rawLines, true);
+  await archiveTranscript(sessionId, project, label, content, messages, rawLines, true, { numCompactions });
 }
 
 /**

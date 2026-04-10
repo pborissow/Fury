@@ -37,6 +37,8 @@ export function parseTranscriptJsonl(content: string): {
   planSlug: string | null;
   /** Index into messages[] after which the plan bubble should be inserted */
   planInsertAfter: number | null;
+  /** Number of context compaction events in the session */
+  numCompactions: number;
 } {
   const messages: TranscriptMessage[] = [];
   const rawEntries: any[] = [];
@@ -46,6 +48,7 @@ export function parseTranscriptJsonl(content: string): {
   let inInternalExchange = false;
   let planSlug: string | null = null;
   let planWriteTimestamp: string | null = null;
+  let numCompactions = 0;
 
   for (const line of rawLines) {
     try {
@@ -90,6 +93,15 @@ export function parseTranscriptJsonl(content: string): {
         }
 
         if (typeof msg.content === 'string') {
+          // Detect and hide context compaction summary messages.
+          // These are injected as user messages whose content starts with
+          // the compaction preamble — use startsWith to avoid false positives
+          // when the string merely appears quoted inside a normal message.
+          if (msg.content.startsWith('This session is being continued from a previous conversation that ran out of context')) {
+            numCompactions++;
+            continue;
+          }
+
           messages.push({
             role: 'user',
             content: msg.content,
@@ -154,5 +166,5 @@ export function parseTranscriptJsonl(content: string): {
     }
   }
 
-  return { messages, rawLines, rawEntries, planSlug, planInsertAfter };
+  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions };
 }
