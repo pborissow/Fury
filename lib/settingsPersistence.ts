@@ -5,16 +5,32 @@ import path from 'path';
 
 export interface AppSettings {
   promptSuggestionsEnabled: boolean;
+  ttsEnabled: boolean;
   localhostOnly: boolean;
   authUsername: string | null;
   authPasswordHash: string | null;
+  anthropicApiKey: string | null;
+  summarizerProvider: 'none' | 'haiku' | 'ollama';
+  ollamaHost: string;
+  ollamaPort: string;
+  ttsProvider: 'local' | 'remote';
+  ttsRemoteHost: string;
+  ttsRemotePort: string;
 }
 
 const DEFAULTS: AppSettings = {
   promptSuggestionsEnabled: true,
+  ttsEnabled: false,
   localhostOnly: true,
   authUsername: null,
   authPasswordHash: null,
+  anthropicApiKey: null,
+  summarizerProvider: 'none',
+  ollamaHost: '',
+  ollamaPort: '11434',
+  ttsProvider: 'local',
+  ttsRemoteHost: '',
+  ttsRemotePort: '5656',
 };
 
 class SettingsPersistence {

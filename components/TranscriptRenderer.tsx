@@ -3,7 +3,7 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
-import { RotateCcw } from 'lucide-react';
+import { RotateCcw, Volume2, VolumeX, Loader2 } from 'lucide-react';
 import ChatBubble from '@/components/ChatBubble';
 import CopyableCodeBlock from '@/components/CopyableCodeBlock';
 import type { TranscriptMsg } from '@/lib/types';
@@ -15,6 +15,10 @@ interface TranscriptRendererProps {
   transcriptLoading: boolean;
   onRewindConfirm: (info: { turnIndex: number; userMessage: string; fullMessage: string; timestamp: string }) => void;
   onIntermediaryView: (messages: TranscriptMsg[]) => void;
+  ttsEnabled?: boolean;
+  ttsPlaying?: 'loading' | 'playing' | 'paused' | 'idle';
+  onTtsToggle?: () => void;
+  onTtsCancel?: () => void;
 }
 
 export default function TranscriptRenderer({
@@ -24,6 +28,10 @@ export default function TranscriptRenderer({
   transcriptLoading,
   onRewindConfirm,
   onIntermediaryView,
+  ttsEnabled,
+  ttsPlaying,
+  onTtsToggle,
+  onTtsCancel,
 }: TranscriptRendererProps) {
   // Merge overlay messages into transcript at the correct chronological position
   const overlayAsTranscript: TranscriptMsg[] = transcriptOverlayMessages.map(m => ({
@@ -58,6 +66,12 @@ export default function TranscriptRenderer({
   }
   if (currentTurn.user || currentTurn.assistant) {
     turns.push(currentTurn);
+  }
+
+  // Find the last turn that has an assistant response (for TTS button placement)
+  let lastAssistantTurnIndex = -1;
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i].assistant) { lastAssistantTurnIndex = i; break; }
   }
 
   return (
@@ -102,14 +116,38 @@ export default function TranscriptRenderer({
                 className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border transition-colors"
                 rawContent={turn.assistant.content}
                 isMarkdown
-                headerExtra={turn.intermediaries.length > 0 ? (
-                  <span
-                    className="text-[10px] text-muted-foreground bg-background border border-border rounded px-1.5 py-0.5 cursor-pointer hover:border-ring hover:text-foreground transition-colors"
-                    onClick={() => onIntermediaryView(turn.intermediaries)}
-                  >
-                    +{turn.intermediaries.length} intermediary
-                  </span>
-                ) : undefined}
+                headerExtra={<>
+                  {ttsEnabled && i === lastAssistantTurnIndex && (
+                    ttsPlaying === 'loading' ? (
+                      <button
+                        onClick={onTtsCancel}
+                        className="text-muted-foreground hover:text-foreground transition-colors"
+                        title="Cancel audio generation"
+                      >
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      </button>
+                    ) : (
+                      <button
+                        onClick={onTtsToggle}
+                        className="text-muted-foreground hover:text-foreground transition-colors"
+                        title={ttsPlaying === 'playing' ? 'Stop audio' : 'Play audio'}
+                      >
+                        {ttsPlaying === 'playing'
+                          ? <Volume2 className="h-3.5 w-3.5" />
+                          : <VolumeX className="h-3.5 w-3.5" />
+                        }
+                      </button>
+                    )
+                  )}
+                  {turn.intermediaries.length > 0 && (
+                    <span
+                      className="text-[10px] text-muted-foreground bg-background border border-border rounded px-1.5 py-0.5 cursor-pointer hover:border-ring hover:text-foreground transition-colors"
+                      onClick={() => onIntermediaryView(turn.intermediaries)}
+                    >
+                      +{turn.intermediaries.length} intermediary
+                    </span>
+                  )}
+                </>}
               >
                 <div className="prose-chat max-w-none">
                   <ReactMarkdown

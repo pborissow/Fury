@@ -37,6 +37,7 @@ export interface RichTextEditorHandle {
   setContent: (content: string) => void;
   getContent: () => string;
   getPlainText: () => string;
+  stopRecording: () => void;
 }
 
 const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(function RichTextEditor({
@@ -55,6 +56,10 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
 }, ref) {
   const [isRecording, setIsRecording] = useState(false);
   const [isSupported, setIsSupported] = useState(true);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleSubmitRef = useRef<() => void>(() => {});
+  const isRecordingRef = useRef(false);
   // Force re-render on editor transactions so toolbar active states stay current
   const [, setTick] = useState(0);
   const recognitionRef = useRef<any>(null);
@@ -187,35 +192,53 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
     getPlainText: () => {
       return editor?.getText() || '';
     },
-  }), [editor]);
+    stopRecording: () => {
+      if (recognitionRef.current && isRecording) {
+        if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+        if (sendTimerRef.current) { clearTimeout(sendTimerRef.current); sendTimerRef.current = null; }
+        recognitionRef.current.stop();
+        setIsRecording(false);
+      }
+    },
+  }), [editor, isRecording]);
 
   // Initialize speech recognition
   useEffect(() => {
     if (typeof window !== 'undefined') {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (SpeechRecognition) {
+      if (!SpeechRecognition) { setIsSupported(false); return; }
+
+      // Hide mic button if no microphone hardware is available
+      if (navigator.mediaDevices?.enumerateDevices) {
+        navigator.mediaDevices.enumerateDevices().then(devices => {
+          if (!devices.some(d => d.kind === 'audioinput')) setIsSupported(false);
+        }).catch(() => setIsSupported(false));
+      }
+
+      {
         const recognition = new SpeechRecognition();
         recognition.continuous = true;
         recognition.interimResults = true;
         recognition.lang = 'en-US';
 
         recognition.onresult = (event: any) => {
-          let interimTranscript = '';
           let finalTranscript = '';
 
           for (let i = event.resultIndex; i < event.results.length; i++) {
-            const transcript = event.results[i][0].transcript;
             if (event.results[i].isFinal) {
-              finalTranscript += transcript + ' ';
-            } else {
-              interimTranscript += transcript;
+              finalTranscript += event.results[i][0].transcript + ' ';
             }
           }
 
           if (finalTranscript && editor) {
-            // Insert the final transcript at the cursor position
             editor.commands.insertContent(finalTranscript);
           }
+
+          // Reset silence timer on any speech activity
+          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = setTimeout(() => {
+            recognition.stop();
+          }, 30_000);
         };
 
         recognition.onerror = (event: any) => {
@@ -228,12 +251,12 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
         };
 
         recognitionRef.current = recognition;
-      } else {
-        setIsSupported(false);
       }
     }
 
     return () => {
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (sendTimerRef.current) clearTimeout(sendTimerRef.current);
       if (recognitionRef.current) {
         recognitionRef.current.stop();
       }
@@ -284,6 +307,13 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
       markdown = markdown.replace(marker, md);
     }
 
+    // Stop mic recording on send
+    if (isRecording && recognitionRef.current) {
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      recognitionRef.current.stop();
+      setIsRecording(false);
+    }
+
     onSubmit(markdown);
 
     // Clear the editor after submission (unless persistContent is true)
@@ -292,16 +322,92 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
     }
   };
 
+  handleSubmitRef.current = handleSubmit;
+
+  useEffect(() => {
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
+
+  // Spoken punctuation patterns — only active during dictation
+  const PUNCTUATION_MAP: [RegExp, string][] = [
+    [/\bperiod\b/gi, '.'],
+    [/\bfull stop\b/gi, '.'],
+    [/\bquestion mark\b/gi, '?'],
+    [/\bexclamation point\b/gi, '!'],
+    [/\bexclamation mark\b/gi, '!'],
+    [/\bcomma\b/gi, ','],
+    [/\bcolon\b/gi, ':'],
+    [/\bsemicolon\b/gi, ';'],
+    [/\bsemi colon\b/gi, ';'],
+    [/\bnew paragraph\b/gi, '\n\n'],
+    [/\bnew line\b/gi, '\n'],
+    [/\bnewline\b/gi, '\n'],
+  ];
+
+  useEffect(() => {
+    if (!editor) return;
+    let replacing = false;
+    const handler = () => {
+      // Cancel pending voice-send on any new input (even outside recording)
+      if (sendTimerRef.current) {
+        clearTimeout(sendTimerRef.current);
+        sendTimerRef.current = null;
+      }
+      if (!isRecordingRef.current || replacing) return;
+      const text = editor.getText();
+      let replaced = text;
+      for (const [pattern, symbol] of PUNCTUATION_MAP) {
+        replaced = replaced.replace(pattern, symbol);
+      }
+      // Clean up space before punctuation
+      replaced = replaced.replace(/\s+([.,;:?!])/g, '$1');
+
+      // Voice "send" command — strip keyword and submit after 5s of silence
+      const sendMatch = replaced.match(/\bsend\s*$/i);
+      if (sendMatch) {
+        replaced = replaced.slice(0, sendMatch.index).trimEnd();
+        replacing = true;
+        if (replaced) {
+          editor.commands.setContent(`<p>${replaced.replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br>')}</p>`);
+        } else {
+          editor.commands.clearContent();
+        }
+        editor.commands.focus('end');
+        replacing = false;
+        sendTimerRef.current = setTimeout(() => {
+          sendTimerRef.current = null;
+          handleSubmitRef.current();
+        }, 5_000);
+        return;
+      }
+
+      if (replaced !== text) {
+        replacing = true;
+        editor.commands.setContent(`<p>${replaced.replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br>')}</p>`);
+        editor.commands.focus('end');
+        replacing = false;
+      }
+    };
+    editor.on('update', handler);
+    return () => { editor.off('update', handler); };
+  }, [editor]);
+
   const toggleRecording = () => {
     if (!recognitionRef.current) return;
 
     if (isRecording) {
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (sendTimerRef.current) { clearTimeout(sendTimerRef.current); sendTimerRef.current = null; }
       recognitionRef.current.stop();
       setIsRecording(false);
     } else {
       try {
         recognitionRef.current.start();
         setIsRecording(true);
+        // Start silence timer — stops recording if no speech within 30s
+        silenceTimerRef.current = setTimeout(() => {
+          recognitionRef.current?.stop();
+        }, 30_000);
       } catch (error) {
         console.error('Error starting speech recognition:', error);
       }
@@ -420,21 +526,20 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
       {showButtonBar && (
         <div className="border-t border-border p-2 flex justify-between items-center">
           {/* Microphone Button */}
-          {isSupported && (
-            <Button
-              onClick={toggleRecording}
-              disabled={disabled}
-              className={`h-10 w-10 rounded-full p-0 ${
-                isRecording
-                  ? 'bg-red-600 hover:bg-red-700 text-white animate-pulse'
-                  : 'bg-gray-700 hover:bg-gray-600 text-white'
-              }`}
-              title={isRecording ? 'Stop recording' : 'Start voice input'}
-            >
-              {isRecording ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
-            </Button>
-          )}
-          {!isSupported && <div className="h-10 w-10" />}
+          <Button
+            onClick={toggleRecording}
+            disabled={disabled || !isSupported}
+            className={`h-10 w-10 rounded-full p-0 ${
+              isRecording
+                ? 'bg-red-600 hover:bg-red-700 text-white animate-pulse'
+                : isSupported
+                  ? 'bg-gray-700 hover:bg-gray-600 text-white'
+                  : 'bg-gray-700 text-white opacity-40 cursor-not-allowed'
+            }`}
+            title={!isSupported ? 'No microphone detected' : isRecording ? 'Stop recording' : 'Start voice input'}
+          >
+            {isRecording ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+          </Button>
 
           {/* Send/Stop Button */}
           <Button

@@ -36,6 +36,7 @@ interface ChatTabProps {
   onVerticalLayoutChange: (sizes: number[]) => void;
   isActive: boolean; // pause SSE processing when tab is hidden
   promptSuggestionsEnabled: boolean;
+  ttsEnabled: boolean;
 }
 
 export default function ChatTab({
@@ -45,6 +46,7 @@ export default function ChatTab({
   onVerticalLayoutChange,
   isActive,
   promptSuggestionsEnabled,
+  ttsEnabled,
 }: ChatTabProps) {
   // --- State moved from page.tsx ---
 
@@ -82,6 +84,11 @@ export default function ChatTab({
   const [providerLabel, setProviderLabel] = useState<string>('');
   const transcriptLoadingRef = useRef(false);
   const transcriptStreamingRef = useRef('');
+  const ttsEnabledRef = useRef(ttsEnabled);
+  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const ttsBlobUrlRef = useRef<string | null>(null);
+  const ttsAbortRef = useRef<AbortController | null>(null);
+  const [ttsPlaying, setTtsPlaying] = useState<'loading' | 'playing' | 'paused' | 'idle'>('idle');
   const activeSessionRef = useRef<string | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const chatEditorRef = useRef<RichTextEditorHandle>(null);
@@ -142,11 +149,29 @@ export default function ChatTab({
     isActiveRef.current = isActive;
   }, [isActive]);
 
+  /** Stop any in-flight TTS fetch and playing audio, revoke blob URL. */
+  const ttsCleanup = useCallback(() => {
+    ttsAbortRef.current?.abort();
+    ttsAbortRef.current = null;
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause();
+      ttsAudioRef.current = null;
+    }
+    if (ttsBlobUrlRef.current) {
+      URL.revokeObjectURL(ttsBlobUrlRef.current);
+      ttsBlobUrlRef.current = null;
+    }
+    setTtsPlaying('idle');
+  }, []);
+
   // Track the currently-viewed session so in-flight SSE handlers can detect
   // when the user has switched away and skip state updates accordingly.
   useEffect(() => {
     activeSessionRef.current = viewingTranscriptId;
-  }, [viewingTranscriptId]);
+    // Stop TTS and dictation when switching sessions
+    ttsCleanup();
+    chatEditorRef.current?.stopRecording();
+  }, [viewingTranscriptId, ttsCleanup]);
 
   // Keep refs in sync so SSE event handlers always see the current value
   useEffect(() => {
@@ -156,6 +181,10 @@ export default function ChatTab({
   useEffect(() => {
     transcriptStreamingRef.current = transcriptStreaming;
   }, [transcriptStreaming]);
+
+  useEffect(() => {
+    ttsEnabledRef.current = ttsEnabled;
+  }, [ttsEnabled]);
 
   // Auto-scroll transcript viewer during streaming
   useEffect(() => {
@@ -521,6 +550,61 @@ export default function ChatTab({
               setHistoryTranscript(refreshData.messages);
               setTranscriptOverlayMessages([]);
               setOverlayInsertPoint(null);
+
+              // TTS: speak the last chat bubble using the same turn-grouping
+              // logic as TranscriptRenderer — within the last turn, the final
+              // assistant message is the rendered bubble; earlier ones are intermediaries.
+              if (ttsEnabledRef.current) {
+                const msgs = refreshData.messages as { role: string; content: string }[];
+                let turnBubble: { content: string } | null = null;
+                let lastTurnBubble: { content: string } | null = null;
+                for (const msg of msgs) {
+                  if (msg.role === 'user') {
+                    // New turn — commit previous turn's bubble
+                    if (turnBubble) lastTurnBubble = turnBubble;
+                    turnBubble = null;
+                  } else if (msg.role === 'assistant') {
+                    turnBubble = msg;
+                  }
+                }
+                // The last turn's bubble is either the open turn or the last committed one
+                const bubble = turnBubble || lastTurnBubble;
+                if (bubble?.content) {
+                  ttsCleanup();
+                  const abort = new AbortController();
+                  ttsAbortRef.current = abort;
+                  setTtsPlaying('loading');
+                  fetch('/api/tts', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: bubble.content }),
+                    signal: abort.signal,
+                  })
+                    .then(res => {
+                      if (ttsAbortRef.current !== abort) return; // superseded
+                      if (!res.ok) throw new Error('TTS failed');
+                      return res.blob();
+                    })
+                    .then(blob => {
+                      if (!blob || ttsAbortRef.current !== abort) return; // superseded
+                      const url = URL.createObjectURL(blob);
+                      ttsBlobUrlRef.current = url;
+                      const audio = new Audio(url);
+                      ttsAudioRef.current = audio;
+                      audio.onended = () => setTtsPlaying('idle');
+                      audio.play().catch(err => {
+                        console.error('[TTS] playback failed:', err);
+                        setTtsPlaying('idle');
+                      });
+                      setTtsPlaying('playing');
+                    })
+                    .catch(err => {
+                      if (ttsAbortRef.current !== abort) return; // superseded
+                      if (err.name !== 'AbortError') console.error('[TTS]', err);
+                      setTtsPlaying('idle');
+                    });
+                }
+              }
             }
           })
           .catch(() => {});
@@ -1147,6 +1231,72 @@ export default function ChatTab({
                             transcriptLoading={transcriptLoading}
                             onRewindConfirm={setRewindConfirm}
                             onIntermediaryView={setIntermediaryMessages}
+                            ttsEnabled={ttsEnabled}
+                            ttsPlaying={ttsPlaying}
+                            onTtsToggle={() => {
+                              const audio = ttsAudioRef.current;
+                              if (audio) {
+                                if (audio.paused) {
+                                  audio.currentTime = 0;
+                                  audio.play().catch(err => {
+                                    console.error('[TTS] playback failed:', err);
+                                    setTtsPlaying('idle');
+                                  });
+                                  setTtsPlaying('playing');
+                                } else {
+                                  audio.pause();
+                                  setTtsPlaying('paused');
+                                }
+                              } else {
+                                // Replay: re-generate from last bubble (same turn logic as TranscriptRenderer)
+                                let turnBubble: { content: string } | null = null;
+                                let lastTurnBubble: { content: string } | null = null;
+                                for (const msg of historyTranscript) {
+                                  if (msg.role === 'user') {
+                                    if (turnBubble) lastTurnBubble = turnBubble;
+                                    turnBubble = null;
+                                  } else if (msg.role === 'assistant') {
+                                    turnBubble = msg;
+                                  }
+                                }
+                                const bubble = turnBubble || lastTurnBubble;
+                                if (!bubble?.content) return;
+                                ttsCleanup();
+                                const abort = new AbortController();
+                                ttsAbortRef.current = abort;
+                                setTtsPlaying('loading');
+                                fetch('/api/tts', {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ text: bubble.content }),
+                                  signal: abort.signal,
+                                })
+                                  .then(res => {
+                                    if (ttsAbortRef.current !== abort) return;
+                                    if (!res.ok) throw new Error('TTS failed');
+                                    return res.blob();
+                                  })
+                                  .then(blob => {
+                                    if (!blob || ttsAbortRef.current !== abort) return;
+                                    const url = URL.createObjectURL(blob);
+                                    ttsBlobUrlRef.current = url;
+                                    const a = new Audio(url);
+                                    ttsAudioRef.current = a;
+                                    a.onended = () => setTtsPlaying('idle');
+                                    a.play().catch(err => {
+                                      console.error('[TTS] playback failed:', err);
+                                      setTtsPlaying('idle');
+                                    });
+                                    setTtsPlaying('playing');
+                                  })
+                                  .catch(err => {
+                                    if (ttsAbortRef.current !== abort) return;
+                                    if (err.name !== 'AbortError') console.error('[TTS]', err);
+                                    setTtsPlaying('idle');
+                                  });
+                              }
+                            }}
+                            onTtsCancel={() => ttsCleanup()}
                           />
                           {transcriptLoading && (
                             <div className="flex justify-start">

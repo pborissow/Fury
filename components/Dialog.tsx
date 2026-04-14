@@ -34,6 +34,8 @@ interface DialogProps {
   minHeight?: number;
   /** Enable resize handles (default true) */
   resizable?: boolean;
+  /** Remove default padding from content area (default false) */
+  noPadding?: boolean;
 }
 
 export default function Dialog({
@@ -48,6 +50,7 @@ export default function Dialog({
   minWidth = 320,
   minHeight = 200,
   resizable = true,
+  noPadding = false,
 }: DialogProps) {
   const [size, setSize] = useState({ width: defaultWidth, height: defaultHeight });
   const [position, setPosition] = useState({ x: 0, y: 0 });
@@ -139,7 +142,7 @@ export default function Dialog({
             </div>
 
             {/* Content */}
-            <div className="flex-1 overflow-auto min-h-0 p-4 flex flex-col">
+            <div className={`flex-1 overflow-auto min-h-0 flex flex-col${noPadding ? '' : ' p-4'}`}>
               {children}
             </div>
 

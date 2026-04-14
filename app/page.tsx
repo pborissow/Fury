@@ -6,7 +6,7 @@ import ChatTab from '@/components/ChatTab';
 import CanvasTab from '@/components/CanvasTab';
 import { Sun, Moon, EllipsisVertical, CircleUserRound, LogOut } from 'lucide-react';
 import Dialog from '@/components/Dialog';
-import SettingsPanel from '@/components/SettingsPanel';
+import SettingsPanel, { type ServiceSettings } from '@/components/SettingsPanel';
 
 export default function Home() {
   // Theme state
@@ -73,18 +73,39 @@ export default function Home() {
 
   // App settings (persisted to server)
   const [promptSuggestionsEnabled, setPromptSuggestionsEnabled] = useState(true);
+  const [ttsEnabled, setTtsEnabled] = useState(false);
   const [localhostOnly, setLocalhostOnly] = useState(true);
   const [hasCredentials, setHasCredentials] = useState(false);
   const [authUsername, setAuthUsername] = useState('');
+  const [services, setServices] = useState<ServiceSettings>({
+    summarizerProvider: 'none',
+    hasAnthropicApiKey: false,
+    ollamaHost: '',
+    ollamaPort: '11434',
+    ttsProvider: 'local',
+    ttsRemoteHost: '',
+    ttsRemotePort: '5656',
+  });
   const settingsLoaded = useRef(false);
 
   // Load settings on mount
   useEffect(() => {
     fetch('/api/settings').then(r => r.json()).then(s => {
       if (s.promptSuggestionsEnabled !== undefined) setPromptSuggestionsEnabled(s.promptSuggestionsEnabled);
+      if (s.ttsEnabled !== undefined) setTtsEnabled(s.ttsEnabled);
       if (s.localhostOnly !== undefined) setLocalhostOnly(s.localhostOnly);
       if (s.hasCredentials !== undefined) setHasCredentials(s.hasCredentials);
       if (s.authUsername) setAuthUsername(s.authUsername);
+      setServices(prev => ({
+        ...prev,
+        summarizerProvider: s.summarizerProvider ?? prev.summarizerProvider,
+        hasAnthropicApiKey: s.hasAnthropicApiKey ?? prev.hasAnthropicApiKey,
+        ollamaHost: s.ollamaHost ?? prev.ollamaHost,
+        ollamaPort: s.ollamaPort ?? prev.ollamaPort,
+        ttsProvider: s.ttsProvider ?? prev.ttsProvider,
+        ttsRemoteHost: s.ttsRemoteHost ?? prev.ttsRemoteHost,
+        ttsRemotePort: s.ttsRemotePort ?? prev.ttsRemotePort,
+      }));
       settingsLoaded.current = true;
     }).catch(() => { settingsLoaded.current = true; });
   }, []);
@@ -102,6 +123,10 @@ export default function Home() {
   useEffect(() => {
     saveSettings({ promptSuggestionsEnabled });
   }, [promptSuggestionsEnabled, saveSettings]);
+
+  useEffect(() => {
+    saveSettings({ ttsEnabled });
+  }, [ttsEnabled, saveSettings]);
 
   useEffect(() => {
     saveSettings({ localhostOnly });
@@ -248,15 +273,19 @@ export default function Home() {
         <Button variant="ghost" size="sm" title="Settings" className="h-8 w-8 p-0" onClick={() => setSettingsOpen(true)}>
           <EllipsisVertical className="h-4 w-4" />
         </Button>
-        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen} title="Settings">
+        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen} title="Settings" noPadding>
           <SettingsPanel
             promptSuggestionsEnabled={promptSuggestionsEnabled}
             onPromptSuggestionsChange={setPromptSuggestionsEnabled}
+            ttsEnabled={ttsEnabled}
+            onTtsChange={setTtsEnabled}
             localhostOnly={localhostOnly}
             onLocalhostOnlyChange={setLocalhostOnly}
             hasCredentials={hasCredentials}
             authUsername={authUsername}
             onCredentialsSaved={(name) => { setHasCredentials(true); setAuthUsername(name); }}
+            services={services}
+            onServicesChanged={(updates) => setServices(prev => ({ ...prev, ...updates }))}
           />
         </Dialog>
       </div>
@@ -309,6 +338,7 @@ export default function Home() {
                 }}
                 isActive={activeTab === 'chat'}
                 promptSuggestionsEnabled={promptSuggestionsEnabled}
+                ttsEnabled={ttsEnabled}
               />
             </div>
           )}
