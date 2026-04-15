@@ -44,7 +44,7 @@ export async function GET(request: NextRequest) {
       if (!trimmed || trimmed.startsWith('Checking')) continue;
 
       // Pattern: "name: url - status"
-      const match = trimmed.match(/^(.+?):\s+(\S+)(?:\s+\([^)]+\))?\s+-\s+(.+)$/);
+      const match = trimmed.match(/^(.+?):\s+(.+?)\s+-\s+(.+)$/);
       if (match) {
         const [, name, url, statusText] = match;
         let status: McpServer['status'] = 'unknown';
@@ -77,7 +77,7 @@ export async function GET(request: NextRequest) {
       try {
         const { stdout: out, stderr: err } = await execFileAsync(
           'claude', ['mcp', 'get', server.name],
-          { timeout: 10000, encoding: 'utf-8', env: { ...process.env, CLAUDECODE: undefined } },
+          { timeout: 10000, encoding: 'utf-8', env: { ...process.env, CLAUDECODE: undefined }, ...(projectPath ? { cwd: projectPath } : {}) },
         );
         const detail = (out || '') + (err || '');
         if (/project/i.test(detail.match(/Scope:\s*(.+)/)?.[1] || '')) {
