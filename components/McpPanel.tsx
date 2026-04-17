@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useCallback, useEffect } from 'react';
-import { Plus, RotateCcw, Check, AlertTriangle, Terminal, Globe, ChevronRight, FileText, Pencil, Trash2, FolderOpen, Search, X, Monitor } from 'lucide-react';
+import { useState, useCallback, useEffect, useMemo } from 'react';
+import { Plus, RotateCcw, Check, AlertTriangle, Terminal, Globe, ChevronRight, FileText, Pencil, Trash2, FolderOpen, Search, X, Eye } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import Dialog, { ConfirmDialog } from '@/components/Dialog';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
@@ -146,6 +146,33 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
   useEffect(() => {
     fetchMcpServers();
   }, [fetchMcpServers]);
+
+  // Sort: project-scoped first, then user, then unknown; alphabetical within each.
+  const sortedMcpServers = useMemo(() => {
+    const rank = { project: 0, user: 1, unknown: 2 } as const;
+    return [...mcpServers].sort((a, b) => {
+      const r = rank[a.scope ?? 'unknown'] - rank[b.scope ?? 'unknown'];
+      return r !== 0 ? r : a.name.localeCompare(b.name);
+    });
+  }, [mcpServers]);
+
+  // Live updates: refetch when the backend cache changes for our projectPath
+  useEffect(() => {
+    const es = new EventSource('/api/events');
+    const handler = (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        const eventPath = data?.projectPath ?? null;
+        const ourPath = projectPath ?? null;
+        if (eventPath === ourPath) fetchMcpServers();
+      } catch { /* ignore */ }
+    };
+    es.addEventListener('mcp-updated', handler as EventListener);
+    return () => {
+      es.removeEventListener('mcp-updated', handler as EventListener);
+      es.close();
+    };
+  }, [projectPath, fetchMcpServers]);
 
   // Wizard state
   const [showAddMcp, setShowAddMcp] = useState(false);
@@ -472,7 +499,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
           </div>
         ) : (
           <div className="space-y-2">
-            {mcpServers.map((server) => (
+            {sortedMcpServers.map((server) => (
               <div key={server.name} className="group/mcp relative p-3 rounded-lg border border-border bg-muted/30">
                 <div className="absolute top-1.5 right-1.5 opacity-0 group-hover/mcp:opacity-100 transition-opacity flex items-center gap-0.5 z-10">
                   <button
@@ -515,11 +542,9 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
                     </span>
                   )}
                   {server.scope && server.scope !== 'unknown' && (
-                    <span className="flex items-center gap-1" title={server.scope === 'project' ? 'This project only' : 'All projects'}>
-                      {server.scope === 'project'
-                        ? <FolderOpen className="h-3 w-3" />
-                        : <Monitor className="h-3 w-3" />}
-                      {server.scope === 'project' ? 'project' : 'all projects'}
+                    <span className="flex items-center gap-1" title={server.scope === 'project' ? 'This project only' : 'Global (all projects)'}>
+                      <Eye className="h-3 w-3" />
+                      {server.scope === 'project' ? 'project' : 'global'}
                     </span>
                   )}
                 </div>
@@ -747,7 +772,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
                 className={inputClass}
               >
                 <option value="project">This project</option>
-                <option value="user">All projects</option>
+                <option value="user">Global</option>
               </select>
               <p className="mt-1 text-xs text-muted-foreground">
                 {mcpForm.scope === 'project'

@@ -40,13 +40,19 @@ export interface ProviderSwitchedEvent {
   message: string;
 }
 
+export interface McpUpdatedEvent {
+  type: 'mcp:updated';
+  projectPath: string | null;
+}
+
 export type AppEvent =
   | LiveSessionsEvent
   | HistoryUpdatedEvent
   | SessionStreamEvent
   | SessionHealthEvent
   | TranscriptUpdatedEvent
-  | ProviderSwitchedEvent;
+  | ProviderSwitchedEvent
+  | McpUpdatedEvent;
 
 class AppEventBus extends EventEmitter {
   emitApp(payload: AppEvent): boolean {

@@ -3,6 +3,7 @@ import { eventBus, AppEvent } from '@/lib/eventBus';
 import { liveSessionScanner } from '@/lib/liveSessionScanner';
 import { fileWatchers } from '@/lib/fileWatchers';
 import { startArchiveListener } from '@/lib/transcriptArchiver';
+import { mcpCache } from '@/lib/mcpCache';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -16,6 +17,7 @@ export async function GET(request: NextRequest) {
   liveSessionScanner.start();
   fileWatchers.startHistoryWatcher();
   startArchiveListener();
+  mcpCache.start();
 
   // If the client wants transcript updates for a specific session, start watching
   if (watchSessionId && watchProject) {
@@ -77,6 +79,10 @@ export async function GET(request: NextRequest) {
 
           case 'provider:switched':
             send('provider-switched', payload);
+            break;
+
+          case 'mcp:updated':
+            send('mcp-updated', payload);
             break;
         }
       };

@@ -1,8 +1,8 @@
 import { test, expect } from '@playwright/test';
 
-const TEST_SERVER_NAME = 'blender';
-const TEST_COMMAND = 'uvx';
-const TEST_ARGS = 'blender-mcp';
+const TEST_SERVER_NAME = 'pw-test-stdio';
+const TEST_COMMAND = 'echo';
+const TEST_ARGS = 'pw-stdio-placeholder';
 
 async function openMcpPanel(page: import('@playwright/test').Page) {
   await page.goto('/');
