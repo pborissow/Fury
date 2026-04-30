@@ -7,6 +7,7 @@ const VOICE = 'af_heart';
 const MODEL_LOAD_TIMEOUT_MS = 90_000;
 const GENERATION_TIMEOUT_MS = 120_000;
 const REMOTE_TIMEOUT_MS = 30_000;
+const OLLAMA_MODEL_SELECT_TIMEOUT_MS = 5_000;
 const MAX_TEXT_LENGTH = 50_000;
 const SUMMARY_THRESHOLD = 300;
 
@@ -24,6 +25,70 @@ function sanitizePort(port: string): string {
     throw new Error(`Invalid port: ${port}`);
   }
   return String(n);
+}
+
+function parseParamSize(paramSize: string): number {
+  const match = paramSize.match(/^([\d.]+)\s*([bBmMkK])/);
+  if (!match) return 0;
+  const num = parseFloat(match[1]);
+  const unit = match[2].toUpperCase();
+  if (unit === 'B') return num * 1e9;
+  if (unit === 'M') return num * 1e6;
+  if (unit === 'K') return num * 1e3;
+  return num;
+}
+
+interface OllamaModelInfo {
+  name: string;
+  size: number;
+  details?: { parameter_size?: string };
+}
+
+function pickBestModel(models: OllamaModelInfo[]): OllamaModelInfo {
+  return models.sort((a, b) => {
+    const aParams = parseParamSize(a.details?.parameter_size ?? '');
+    const bParams = parseParamSize(b.details?.parameter_size ?? '');
+    if (aParams !== bParams) return bParams - aParams;
+    return b.size - a.size;
+  })[0];
+}
+
+async function selectOllamaModel(host: string, port: string): Promise<string> {
+  const h = sanitizeHost(host);
+  const p = sanitizePort(port);
+  const baseUrl = `http://${h}:${p}`;
+
+  async function fetchModels(endpoint: string): Promise<OllamaModelInfo[]> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), OLLAMA_MODEL_SELECT_TIMEOUT_MS);
+    try {
+      const res = await fetch(`${baseUrl}${endpoint}`, { signal: controller.signal });
+      if (!res.ok) return [];
+      const data = await res.json();
+      return data.models ?? [];
+    } catch {
+      return [];
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const loaded = await fetchModels('/api/ps');
+  if (loaded.length > 0) {
+    const best = pickBestModel(loaded);
+    console.log(`[TTS] Ollama model: ${best.name} (loaded, ${best.details?.parameter_size ?? '?'})`);
+    return best.name;
+  }
+
+  const downloaded = await fetchModels('/api/tags');
+  if (downloaded.length > 0) {
+    const best = pickBestModel(downloaded);
+    console.log(`[TTS] Ollama model: ${best.name} (downloaded, ${best.details?.parameter_size ?? '?'})`);
+    return best.name;
+  }
+
+  console.warn('[TTS] No Ollama models found, falling back to llama3.2:3b');
+  return 'llama3.2:3b';
 }
 
 let ttsInstance: KokoroTTS | null = null;
@@ -59,7 +124,10 @@ export function warmupTTS(): void {
 
 export function prepareTextForSpeech(text: string): string {
   return text
-    .replace(/```[\s\S]*?```/g, ' (code block omitted) ')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/~(\d)/g, 'approximately $1')
+    .replace(/\bdemos\b/gi, 'demonstrations')
+    .replace(/\(lines?\s*\d+[\s\-–,\d]*\)/gi, '')
     .replace(/\|[^\n]+\|/g, '')
     .replace(/[-|:]{3,}/g, '')
     .replace(/#{1,6}\s+/g, '')
@@ -86,14 +154,24 @@ function truncateForSpeech(clean: string): string {
   return clean.substring(0, cutoff + 1) + ' See details below.';
 }
 
-async function summarizeWithHaiku(text: string, apiKey: string): Promise<string> {
+const TTS_SYSTEM_PROMPT =
+  'You are preparing your own responses for text-to-speech playback. ' +
+  'Speak in first person ("I" / "we") as the assistant who performed the work described. ' +
+  'Output ONLY the result — never start with "Here\'s a summary" or similar preamble. ' +
+  'No markdown, no formatting.';
+
+const TTS_SUMMARIZE_PROMPT = 'Summarize this in 2-3 sentences for audio playback:\n\n';
+const TTS_NATURALIZE_PROMPT = 'Rewrite this so it sounds natural when spoken aloud. Keep it brief, same meaning:\n\n';
+
+async function summarizeWithHaiku(text: string, apiKey: string, prompt: string): Promise<string> {
   const client = new Anthropic({ apiKey });
   const response = await client.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 200,
+    system: TTS_SYSTEM_PROMPT,
     messages: [{
       role: 'user',
-      content: `Summarize the following in 2-3 sentences for text-to-speech. Write in natural speaking style, no markdown or formatting:\n\n${text}`,
+      content: `${prompt}${text}`,
     }],
   });
   const block = response.content[0];
@@ -101,9 +179,10 @@ async function summarizeWithHaiku(text: string, apiKey: string): Promise<string>
   throw new Error('Empty AI summary');
 }
 
-async function summarizeWithOllama(text: string, host: string, port: string): Promise<string> {
+async function summarizeWithOllama(text: string, host: string, port: string, prompt: string): Promise<string> {
   const h = sanitizeHost(host);
   const p = sanitizePort(port);
+  const model = await selectOllamaModel(host, port);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REMOTE_TIMEOUT_MS);
   try {
@@ -111,11 +190,11 @@ async function summarizeWithOllama(text: string, host: string, port: string): Pr
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'llama3.2:3b',
-        messages: [{
-          role: 'user',
-          content: `Summarize the following in 2-3 sentences for text-to-speech. Write in natural speaking style, no markdown or formatting:\n\n${text}`,
-        }],
+        model,
+        messages: [
+          { role: 'system', content: TTS_SYSTEM_PROMPT },
+          { role: 'user', content: `${prompt}${text}` },
+        ],
         stream: false,
         options: { temperature: 0.3 },
       }),
@@ -160,23 +239,27 @@ function encodeWav(samples: Float32Array, sampleRate: number): Buffer {
 }
 
 async function summarizeText(clean: string, settings: AppSettings): Promise<{ text: string; method: string }> {
-  if (clean.length <= SUMMARY_THRESHOLD) return { text: clean, method: 'short' };
+  const isShort = clean.length <= SUMMARY_THRESHOLD;
+  const prompt = isShort ? TTS_NATURALIZE_PROMPT : TTS_SUMMARIZE_PROMPT;
 
   if (settings.summarizerProvider === 'haiku' && settings.anthropicApiKey) {
     try {
-      return { text: await summarizeWithHaiku(clean, settings.anthropicApiKey), method: 'haiku' };
+      return { text: await summarizeWithHaiku(clean, settings.anthropicApiKey, prompt), method: isShort ? 'haiku-natural' : 'haiku' };
     } catch (err) {
-      console.warn('[TTS] Haiku summarization failed, falling back to truncation:', err);
+      console.warn('[TTS] Haiku failed, falling back:', err);
     }
   }
 
   if (settings.summarizerProvider === 'ollama' && settings.ollamaHost) {
     try {
-      return { text: await summarizeWithOllama(clean, settings.ollamaHost, settings.ollamaPort), method: 'ollama' };
+      return { text: await summarizeWithOllama(clean, settings.ollamaHost, settings.ollamaPort, prompt), method: isShort ? 'ollama-natural' : 'ollama' };
     } catch (err) {
-      console.warn('[TTS] Ollama summarization failed, falling back to truncation:', err);
+      console.warn('[TTS] Ollama failed, falling back:', err);
     }
   }
+
+  // No LLM available — short text spoken as-is, long text truncated
+  if (isShort) return { text: clean, method: 'short' };
 
   return { text: truncateForSpeech(clean), method: 'truncate' };
 }
@@ -216,7 +299,7 @@ async function generateRemoteAudio(spoken: string, host: string, port: string, s
   const timer = setTimeout(() => controller.abort(), REMOTE_TIMEOUT_MS);
   if (signal) signal.addEventListener('abort', () => controller.abort(), { once: true });
   try {
-    const res = await fetch(`http://${h}:${p}/api/tts`, {
+    const res = await fetch(`http://${h}:${p}/kokoro/tts`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: spoken }),
