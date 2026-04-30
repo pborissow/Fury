@@ -3,8 +3,9 @@
 import React, { useState, useRef, useCallback } from 'react';
 import { XIcon } from 'lucide-react';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
-import { Resizable } from 're-resizable';
 import { Button } from '@/components/ui/button';
+
+type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 
 export type ButtonVariant = 'default' | 'destructive' | 'outline' | 'secondary' | 'ghost';
 
@@ -90,9 +91,69 @@ export default function Dialog({
     dragRef.current = null;
   }, []);
 
-  const resizeEnable = resizable
-    ? { right: true, bottom: true, bottomRight: true, top: false, topRight: false, topLeft: false, left: false, bottomLeft: false }
-    : { right: false, bottom: false, bottomRight: false, top: false, topRight: false, topLeft: false, left: false, bottomLeft: false };
+  // --- Resize ---
+  const resizeRef = useRef<{
+    dir: ResizeDir;
+    startX: number; startY: number;
+    startW: number; startH: number;
+    startPX: number; startPY: number;
+  } | null>(null);
+
+  const handleResizeStart = useCallback((dir: ResizeDir, e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    resizeRef.current = {
+      dir, startX: e.clientX, startY: e.clientY,
+      startW: size.width, startH: size.height,
+      startPX: position.x, startPY: position.y,
+    };
+  }, [size, position]);
+
+  const handleResizeMove = useCallback((e: React.PointerEvent) => {
+    if (!resizeRef.current) return;
+    e.preventDefault();
+    const { dir, startX, startY, startW, startH, startPX, startPY } = resizeRef.current;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+
+    let newW = startW, newH = startH;
+    if (dir.includes('e')) newW = startW + dx;
+    else if (dir.includes('w')) newW = startW - dx;
+    if (dir.includes('s')) newH = startH + dy;
+    else if (dir.includes('n')) newH = startH - dy;
+
+    newW = Math.max(minWidth, newW);
+    newH = Math.max(minHeight, newH);
+
+    // Compensate for center-based positioning so the opposite edge stays fixed
+    const dw = newW - startW;
+    const dh = newH - startH;
+    let newX = startPX, newY = startPY;
+    if (dir.includes('e')) newX = startPX + dw / 2;
+    else if (dir.includes('w')) newX = startPX - dw / 2;
+    if (dir.includes('s')) newY = startPY + dh / 2;
+    else if (dir.includes('n')) newY = startPY - dh / 2;
+
+    setSize({ width: newW, height: newH });
+    setPosition({ x: newX, y: newY });
+  }, [minWidth, minHeight]);
+
+  const handleResizeEnd = useCallback(() => {
+    resizeRef.current = null;
+  }, []);
+
+  const HANDLE = 6;
+  const resizeHandles: { dir: ResizeDir; cursor: string; style: React.CSSProperties }[] = resizable ? [
+    { dir: 'n',  cursor: 'ns-resize',   style: { top: -HANDLE / 2, left: HANDLE, right: HANDLE, height: HANDLE } },
+    { dir: 's',  cursor: 'ns-resize',   style: { bottom: -HANDLE / 2, left: HANDLE, right: HANDLE, height: HANDLE } },
+    { dir: 'e',  cursor: 'ew-resize',   style: { right: -HANDLE / 2, top: HANDLE, bottom: HANDLE, width: HANDLE } },
+    { dir: 'w',  cursor: 'ew-resize',   style: { left: -HANDLE / 2, top: HANDLE, bottom: HANDLE, width: HANDLE } },
+    { dir: 'nw', cursor: 'nwse-resize', style: { top: -HANDLE / 2, left: -HANDLE / 2, width: HANDLE * 2, height: HANDLE * 2 } },
+    { dir: 'ne', cursor: 'nesw-resize', style: { top: -HANDLE / 2, right: -HANDLE / 2, width: HANDLE * 2, height: HANDLE * 2 } },
+    { dir: 'sw', cursor: 'nesw-resize', style: { bottom: -HANDLE / 2, left: -HANDLE / 2, width: HANDLE * 2, height: HANDLE * 2 } },
+    { dir: 'se', cursor: 'nwse-resize', style: { bottom: -HANDLE / 2, right: -HANDLE / 2, width: HANDLE * 2, height: HANDLE * 2 } },
+  ] : [];
 
   return (
     <DialogPrimitive.Root open={open} onOpenChange={handleOpenChange}>
@@ -110,18 +171,13 @@ export default function Dialog({
           onInteractOutside={(e) => e.preventDefault()}
           onEscapeKeyDown={(e) => e.preventDefault()}
         >
-          <Resizable
-            size={size}
-            onResizeStop={(_e, _dir, _ref, delta) => {
-              setSize({ width: size.width + delta.width, height: size.height + delta.height });
+          <div
+            className="bg-card rounded-lg border flex flex-col overflow-hidden relative"
+            style={{
+              width: size.width, height: size.height,
+              maxWidth: '95vw', maxHeight: '95vh',
+              boxShadow: '0 8px 40px rgba(0, 0, 0, 0.8), 0 2px 12px rgba(0, 0, 0, 0.6)',
             }}
-            minWidth={minWidth}
-            minHeight={minHeight}
-            maxWidth="95vw"
-            maxHeight="95vh"
-            className="bg-card rounded-lg border flex flex-col overflow-hidden"
-            style={{ boxShadow: '0 8px 40px rgba(0, 0, 0, 0.8), 0 2px 12px rgba(0, 0, 0, 0.6)' }}
-            enable={resizeEnable}
           >
             {/* Draggable header */}
             <div
@@ -162,7 +218,18 @@ export default function Dialog({
                 ))}
               </div>
             )}
-          </Resizable>
+
+            {/* Resize handles */}
+            {resizeHandles.map(({ dir, cursor, style }) => (
+              <div
+                key={dir}
+                style={{ position: 'absolute', zIndex: 10, cursor, ...style }}
+                onPointerDown={(e) => handleResizeStart(dir, e)}
+                onPointerMove={handleResizeMove}
+                onPointerUp={handleResizeEnd}
+              />
+            ))}
+          </div>
         </DialogPrimitive.Content>
       </DialogPrimitive.Portal>
     </DialogPrimitive.Root>
