@@ -6,9 +6,9 @@ describe('prepareTextForSpeech', () => {
     const input = 'Hello ```js\nconsole.log("x")\n``` world';
     const result = prepareTextForSpeech(input);
     expect(result).toContain('Hello');
-    expect(result).toContain('code block omitted');
     expect(result).toContain('world');
     expect(result).not.toContain('console.log');
+    expect(result).not.toContain('code block');
   });
 
   it('strips markdown tables', () => {
@@ -109,7 +109,7 @@ describe('prepareTextForSpeech', () => {
     expect(result).toContain('bold');
     expect(result).toContain('inline');
     expect(result).toContain('First item');
-    expect(result).toContain('code block omitted');
+    expect(result).not.toContain('code block');
     expect(result).toContain('link');
     expect(result).toContain('tts');
     expect(result).not.toContain('```');

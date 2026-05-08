@@ -73,6 +73,6 @@ describe('POST /api/tts', () => {
     mockGenerateSpeech.mockResolvedValue(Buffer.from('wav'));
 
     await POST(makeRequest({ text: 'Test input' }));
-    expect(mockGenerateSpeech).toHaveBeenCalledWith('Test input', expect.anything());
+    expect(mockGenerateSpeech).toHaveBeenCalledWith('Test input', expect.anything(), expect.anything());
   });
 });
