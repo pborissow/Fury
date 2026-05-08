@@ -7,6 +7,7 @@ import { projectPathToSlug } from './utils';
 import { eventBus } from './eventBus';
 import { killProcessTree } from './killProcessTree';
 import { detectUsageLimit, handleUsageLimitDetected } from './providerSwitch';
+import { scrubSessionFile } from './imageScrubber';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -298,6 +299,14 @@ class SessionManager {
           console.log(`[SessionManager] Working directory: ${session.projectPath}`);
         }
 
+        // The spawn-and-attach logic is wrapped so we can defer it until
+        // after the JSONL scrub completes (otherwise the CLI may read the
+        // un-scrubbed file and rebuild a 32MB+ API request). When the scrub
+        // resolves we invoke launchCli from a Promise's `.finally`, which is
+        // a different async context than the outer try/catch — so launchCli
+        // owns its own error handling and routes failures to `reject` directly.
+        const launchCli = () => {
+        try {
         // Pass prompt via stdin to avoid OS command-line length limits.
         // Strip CLAUDECODE env var so the child process doesn't think it's
         // nested inside another Claude Code session (which would cause it to
@@ -567,6 +576,34 @@ class SessionManager {
           eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, error: error.message });
           reject(error);
         });
+        } catch (error) {
+          // Catch synchronous throws inside launchCli (e.g. spawn failure on
+          // Windows for malformed args). Without this the error would escape
+          // into the .finally promise chain that nothing awaits, hanging the
+          // request forever.
+          reject(error as Error);
+        }
+        }; // end launchCli
+
+        // Strip stale base64 images from the JSONL before launching the CLI.
+        // Images live forever in the conversation history otherwise and push
+        // large sessions past the 32MB API request limit. Always launch the
+        // CLI, even if scrubbing fails — this is best-effort cleanup.
+        if (isExistingSession) {
+          scrubSessionFile(session.sessionId, cwd, { keepRecentTurns: 0 })
+            .then(result => {
+              if (result && result.scrubbed > 0) {
+                const mb = (result.bytesSaved / 1024 / 1024).toFixed(1);
+                console.log(`[SessionManager] Scrubbed ${result.scrubbed} stale image(s) from ${session.sessionId} (${mb} MB saved)`);
+              }
+            })
+            .catch(err => {
+              console.error(`[SessionManager] Image scrub failed for ${session.sessionId}:`, err);
+            })
+            .finally(launchCli);
+        } else {
+          launchCli();
+        }
       } catch (error) {
         reject(error as Error);
       }
