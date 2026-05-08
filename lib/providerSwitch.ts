@@ -54,9 +54,12 @@ export interface BedrockConfig {
  * Pull the Bedrock connection config from user-saved settings.
  * Returns null if the configuration is incomplete (missing profile, region,
  * or model) — callers should treat that as "Bedrock not available".
+ *
+ * Accepts an optional pre-loaded `AppSettings` to avoid redundant file
+ * reads when the caller already has the settings in hand.
  */
-async function loadBedrockConfigFromSettings(): Promise<BedrockConfig | null> {
-  const s: AppSettings = await settingsPersistence.loadSettings();
+async function loadBedrockConfigFromSettings(preloaded?: AppSettings): Promise<BedrockConfig | null> {
+  const s: AppSettings = preloaded ?? await settingsPersistence.loadSettings();
   if (!s.bedrockAwsProfile?.trim() || !s.bedrockAwsRegion?.trim() || !s.bedrockModel?.trim()) {
     return null;
   }
@@ -382,13 +385,25 @@ export async function switchToBedrock(
   config: Partial<BedrockConfig> = {},
   meta: SwitchMeta = {},
 ): Promise<SwitchResult> {
-  const fromSettings = await loadBedrockConfigFromSettings();
-  if (!fromSettings) {
-    throw new Error(
-      'Bedrock is not configured. Open Settings → Services → Bedrock and set the AWS profile, region, and model first.',
-    );
+  let cfg: BedrockConfig;
+  if (config.awsProfile && config.awsRegion && config.model) {
+    // Full config provided by caller — skip redundant settings load.
+    cfg = {
+      awsProfile: config.awsProfile,
+      awsRegion: config.awsRegion,
+      model: config.model,
+      smallFastModel: config.smallFastModel || config.model,
+      awsAuthRefresh: config.awsAuthRefresh,
+    };
+  } else {
+    const fromSettings = await loadBedrockConfigFromSettings();
+    if (!fromSettings) {
+      throw new Error(
+        'Bedrock is not configured. Open Settings → Services → Bedrock and set the AWS profile, region, and model first.',
+      );
+    }
+    cfg = { ...fromSettings, ...config };
   }
-  const cfg: BedrockConfig = { ...fromSettings, ...config };
   const settings = await loadSettings();
   const prev: Provider = isBedrock(settings) ? 'bedrock' : 'anthropic';
   const bakPath = await backupSettings();
@@ -478,7 +493,8 @@ export async function handleUsageLimitDetected(
     return null;
   }
 
-  const bedrockCfg = await loadBedrockConfigFromSettings();
+  // Reuse the already-loaded settings to avoid a redundant file read.
+  const bedrockCfg = await loadBedrockConfigFromSettings(userSettings);
   if (!bedrockCfg) {
     console.log('[ProviderSwitch] Usage limit detected but Bedrock service is not fully configured.');
     return null;
@@ -506,8 +522,10 @@ export async function handleUsageLimitDetected(
       ? info.resetTimeMs + SWITCH_BACK_BUFFER_MS
       : undefined;
 
+  // Pass the full bedrockCfg so switchToBedrock skips its own
+  // redundant loadBedrockConfigFromSettings() call.
   const result = await switchToBedrock(
-    {},
+    bedrockCfg,
     {
       trigger: 'auto-failover',
       rawResetTime: info.resetTimeRaw,

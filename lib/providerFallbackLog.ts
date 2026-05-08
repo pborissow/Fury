@@ -75,21 +75,35 @@ async function ensureDir(): Promise<void> {
 }
 
 /**
+ * Per-process write queue. Serializes all appends so concurrent async
+ * callers within the same Node process cannot interleave bytes.
+ *
+ * This is necessary on Windows where `O_APPEND` does not guarantee
+ * atomicity the way POSIX does. Cross-process atomicity would require
+ * file locking, but within a single Fury server instance this queue
+ * is sufficient.
+ */
+let writeQueue: Promise<void> = Promise.resolve();
+
+/**
  * Append a single entry. Each entry is written as one JSON line so the
  * file remains a valid JSONL stream even on partial writes.
  *
- * Concurrency note: relies on POSIX `O_APPEND` atomicity for line-sized
- * writes — safe on macOS/Linux. On Windows the OS does not guarantee
- * append atomicity, so two concurrent failover events from different
- * Claude sessions could interleave bytes. If/when this ships on
- * Windows, replace with a per-process serialization queue.
+ * Writes are serialized via `writeQueue` to prevent interleaved bytes
+ * on Windows. On macOS/Linux POSIX `O_APPEND` already guarantees this,
+ * but the queue is harmless there and keeps behavior consistent.
  */
 export async function appendFallbackLogEntry(
   entry: FallbackLogEntry,
 ): Promise<void> {
-  await ensureDir();
   const line = JSON.stringify(entry) + '\n';
-  await appendFile(getLogPath(), line, 'utf-8');
+  const op = writeQueue.then(async () => {
+    await ensureDir();
+    await appendFile(getLogPath(), line, 'utf-8');
+  });
+  // Don't let a failed write block subsequent writes.
+  writeQueue = op.catch(() => {});
+  await op;
 }
 
 /**
