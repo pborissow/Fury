@@ -384,10 +384,16 @@ export default function ChatTab({
 
     es.onerror = () => {
       if (es.readyState === EventSource.CONNECTING) {
+        // Re-fetch state to cover any events we missed while the SSE
+        // connection was dropped (e.g. provider switch-back fired during
+        // a server restart).
         fetch('/api/live-sessions').then(res => res.json()).then(data => {
           setLiveSessionIds(new Set(data.liveSessionIds || []));
         }).catch(() => {});
         fetchHistory();
+        fetch('/api/provider').then(res => res.json()).then(status => {
+          setProviderLabel(formatProviderLabel(status));
+        }).catch(() => {});
       }
     };
 

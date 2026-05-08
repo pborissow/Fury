@@ -14,6 +14,12 @@ export interface ServiceSettings {
   ttsProvider: 'local' | 'remote';
   ttsRemoteHost: string;
   ttsRemotePort: string;
+  bedrockAwsProfile: string;
+  bedrockAwsRegion: string;
+  bedrockModel: string;
+  bedrockSmallFastModel: string;
+  bedrockAuthRefreshCmd: string;
+  bedrockClaudeFailoverEnabled: boolean;
 }
 
 interface SettingsPanelProps {
@@ -52,7 +58,7 @@ export default function SettingsPanel({
   const [isNewEnable, setIsNewEnable] = useState(false);
 
   // Service editor dialog state
-  const [serviceDialog, setServiceDialog] = useState<'summarizer' | 'tts' | null>(null);
+  const [serviceDialog, setServiceDialog] = useState<'summarizer' | 'tts' | 'bedrock' | null>(null);
   const [savingService, setSavingService] = useState(false);
 
   // Summarizer editor form state
@@ -66,6 +72,13 @@ export default function SettingsPanel({
   const [editTtsProvider, setEditTtsProvider] = useState<'local' | 'remote'>('local');
   const [editTtsHost, setEditTtsHost] = useState('');
   const [editTtsPort, setEditTtsPort] = useState('');
+
+  // Bedrock editor form state
+  const [editBedrockProfile, setEditBedrockProfile] = useState('');
+  const [editBedrockRegion, setEditBedrockRegion] = useState('');
+  const [editBedrockModel, setEditBedrockModel] = useState('');
+  const [editBedrockSmallFastModel, setEditBedrockSmallFastModel] = useState('');
+  const [editBedrockAuthCmd, setEditBedrockAuthCmd] = useState('');
 
   // --- Credential dialog handlers ---
 
@@ -136,6 +149,30 @@ export default function SettingsPanel({
     setServiceDialog('tts');
   };
 
+  const openBedrockEditor = () => {
+    setEditBedrockProfile(services.bedrockAwsProfile);
+    setEditBedrockRegion(services.bedrockAwsRegion);
+    setEditBedrockModel(services.bedrockModel);
+    setEditBedrockSmallFastModel(services.bedrockSmallFastModel);
+    setEditBedrockAuthCmd(services.bedrockAuthRefreshCmd);
+    setServiceDialog('bedrock');
+  };
+
+  const handleBedrockFailoverChange = async (enabled: boolean) => {
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bedrockClaudeFailoverEnabled: enabled }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const updated = await res.json();
+      onServicesChanged({ bedrockClaudeFailoverEnabled: updated.bedrockClaudeFailoverEnabled });
+    } catch (err) {
+      console.error('[Settings] Failed to toggle Claude failover:', err);
+    }
+  };
+
   const handleSaveSummarizer = async () => {
     setSavingService(true);
     try {
@@ -200,6 +237,45 @@ export default function SettingsPanel({
     }
   };
 
+  const handleSaveBedrock = async () => {
+    setSavingService(true);
+    try {
+      const body: Record<string, unknown> = {
+        bedrockAwsProfile: editBedrockProfile.trim(),
+        bedrockAwsRegion: editBedrockRegion.trim(),
+        bedrockModel: editBedrockModel.trim(),
+        bedrockSmallFastModel: editBedrockSmallFastModel.trim(),
+        bedrockAuthRefreshCmd: editBedrockAuthCmd.trim(),
+      };
+      // If the user clears the connection, the failover toggle becomes
+      // meaningless — turn it off as part of the same save.
+      const stillConfigured = !!(body.bedrockAwsProfile && body.bedrockAwsRegion && body.bedrockModel);
+      if (!stillConfigured && services.bedrockClaudeFailoverEnabled) {
+        body.bedrockClaudeFailoverEnabled = false;
+      }
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const updated = await res.json();
+      onServicesChanged({
+        bedrockAwsProfile: updated.bedrockAwsProfile,
+        bedrockAwsRegion: updated.bedrockAwsRegion,
+        bedrockModel: updated.bedrockModel,
+        bedrockSmallFastModel: updated.bedrockSmallFastModel,
+        bedrockAuthRefreshCmd: updated.bedrockAuthRefreshCmd,
+        bedrockClaudeFailoverEnabled: updated.bedrockClaudeFailoverEnabled,
+      });
+      setServiceDialog(null);
+    } catch (err) {
+      console.error('[Settings] Failed to save Bedrock:', err);
+    } finally {
+      setSavingService(false);
+    }
+  };
+
   // --- Service status labels ---
 
   const summarizerLabel = services.summarizerProvider === 'none'
@@ -212,6 +288,11 @@ export default function SettingsPanel({
     ? 'Local'
     : (services.ttsRemoteHost ? `Remote @ ${services.ttsRemoteHost}:${services.ttsRemotePort}` : 'Remote (not configured)');
 
+  const bedrockConfigured = !!(services.bedrockAwsProfile && services.bedrockAwsRegion && services.bedrockModel);
+  const bedrockLabel = !bedrockConfigured
+    ? 'Not configured'
+    : `Profile: ${services.bedrockAwsProfile} · failover: ${services.bedrockClaudeFailoverEnabled ? 'on' : 'off'}`;
+
   // --- Validation ---
 
   const summarizerValid = editSummarizerProvider === 'none'
@@ -219,6 +300,10 @@ export default function SettingsPanel({
     || (editSummarizerProvider === 'ollama' && !!editOllamaHost.trim());
 
   const ttsValid = editTtsProvider === 'local' || !!editTtsHost.trim();
+
+  const editBedrockConfigured = !!(editBedrockProfile.trim() && editBedrockRegion.trim() && editBedrockModel.trim());
+  const editBedrockEmpty = !editBedrockProfile.trim() && !editBedrockRegion.trim() && !editBedrockModel.trim();
+  const bedrockValid = editBedrockEmpty || editBedrockConfigured;
 
   const [settingsTab, setSettingsTab] = useState<'features' | 'services'>('features');
 
@@ -290,6 +375,30 @@ export default function SettingsPanel({
                 onCheckedChange={onTtsChange}
               />
             </div>
+            <div className="flex items-center justify-between py-3">
+              <div className="pr-4">
+                <div className="text-sm font-medium">Claude failover</div>
+                <div className="text-xs text-muted-foreground mt-0.5">
+                  Auto-switch to Bedrock when Anthropic usage limits are hit, then switch back after the limit resets
+                  {!bedrockConfigured && (
+                    <>
+                      {' · '}
+                      <button
+                        onClick={openBedrockEditor}
+                        className="text-blue-500 dark:text-blue-400 hover:underline"
+                      >
+                        Configure Bedrock
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+              <Switch
+                checked={services.bedrockClaudeFailoverEnabled}
+                onCheckedChange={handleBedrockFailoverChange}
+                disabled={!bedrockConfigured}
+              />
+            </div>
           </div>
       )}
 
@@ -315,6 +424,18 @@ export default function SettingsPanel({
                 <div className="text-sm font-medium">Text to Speech</div>
                 <div className="text-xs text-muted-foreground mt-0.5">
                   {ttsLabel}
+                </div>
+              </div>
+              <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />
+            </button>
+            <button
+              onClick={openBedrockEditor}
+              className="w-full flex items-center justify-between py-3 text-left hover:bg-muted/50 transition-colors -mx-1 px-1 rounded"
+            >
+              <div className="pr-4">
+                <div className="text-sm font-medium">Bedrock</div>
+                <div className="text-xs text-muted-foreground mt-0.5">
+                  {bedrockLabel}
                 </div>
               </div>
               <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />
@@ -549,6 +670,84 @@ export default function SettingsPanel({
                 />
               </div>
             )}
+          </div>
+        </div>
+      </Dialog>
+
+      {/* Bedrock editor */}
+      <Dialog
+        open={serviceDialog === 'bedrock'}
+        onOpenChange={(open) => { if (!open) setServiceDialog(null); }}
+        title="Bedrock"
+        defaultWidth={460}
+        defaultHeight={520}
+        minWidth={380}
+        minHeight={440}
+        resizable={false}
+        buttons={[
+          { label: 'Cancel', onClick: () => setServiceDialog(null), variant: 'ghost' },
+          {
+            label: savingService ? 'Saving...' : 'Save',
+            onClick: handleSaveBedrock,
+            disabled: !bedrockValid || savingService,
+          },
+        ]}
+      >
+        <div className="space-y-3">
+          <div className="text-xs text-muted-foreground">
+            Connect Claude Code to Anthropic models hosted on Amazon Bedrock. Leave all fields blank to disable.
+          </div>
+          <div className="space-y-2">
+            <div>
+              <div className="text-xs font-medium mb-1">AWS profile</div>
+              <Input
+                placeholder="my-bedrock-profile"
+                value={editBedrockProfile}
+                onChange={(e) => setEditBedrockProfile(e.target.value)}
+                autoComplete="off"
+                className="text-sm"
+              />
+            </div>
+            <div>
+              <div className="text-xs font-medium mb-1">AWS region</div>
+              <Input
+                placeholder="us-east-1"
+                value={editBedrockRegion}
+                onChange={(e) => setEditBedrockRegion(e.target.value)}
+                autoComplete="off"
+                className="text-sm"
+              />
+            </div>
+            <div>
+              <div className="text-xs font-medium mb-1">Model ID</div>
+              <Input
+                placeholder="us.anthropic.claude-sonnet-4-6"
+                value={editBedrockModel}
+                onChange={(e) => setEditBedrockModel(e.target.value)}
+                autoComplete="off"
+                className="text-sm"
+              />
+            </div>
+            <div>
+              <div className="text-xs font-medium mb-1">Small/fast model ID <span className="text-muted-foreground font-normal">(optional)</span></div>
+              <Input
+                placeholder="us.anthropic.claude-haiku-4-5-20251001-v1:0"
+                value={editBedrockSmallFastModel}
+                onChange={(e) => setEditBedrockSmallFastModel(e.target.value)}
+                autoComplete="off"
+                className="text-sm"
+              />
+            </div>
+            <div>
+              <div className="text-xs font-medium mb-1">Auth refresh command <span className="text-muted-foreground font-normal">(optional)</span></div>
+              <Input
+                placeholder="aws sso login --profile my-bedrock-profile"
+                value={editBedrockAuthCmd}
+                onChange={(e) => setEditBedrockAuthCmd(e.target.value)}
+                autoComplete="off"
+                className="text-sm"
+              />
+            </div>
           </div>
         </div>
       </Dialog>

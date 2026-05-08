@@ -358,13 +358,33 @@ class SessionManager {
           }
         }, 5000);
 
+        // Helper: check any text for a usage-limit message and trigger failover
+        let usageLimitTriggered = false;
+        const checkUsageLimit = (text: string, source: string) => {
+          if (usageLimitTriggered) return; // only trigger once per process
+          const info = detectUsageLimit(text);
+          if (info.detected) {
+            usageLimitTriggered = true;
+            console.log(`[SessionManager] *** USAGE LIMIT DETECTED (${source}) ***`);
+            console.log(`[SessionManager]   Raw text: ${text.substring(0, 200)}`);
+            console.log(`[SessionManager]   Reset: ${info.resetTimeRaw || 'unknown'}`);
+            handleUsageLimitDetected(info).catch(err =>
+              console.error('[SessionManager] Failed to auto-switch provider:', err),
+            );
+          }
+        };
+
+        // Accumulate stderr so we can inspect it on non-zero exit
+        let stderrAccumulator = '';
+
         // Stream the output - parse JSON stream from Claude CLI
         let buffer = '';
         let lastTextBlockIndex = -1; // Track text blocks to add separation
         claude.stdout.on('data', (data) => {
           // Update activity timestamp whenever we receive data
           session.lastActivity = Date.now();
-          buffer += data.toString();
+          const rawChunk = data.toString();
+          buffer += rawChunk;
           const lines = buffer.split('\n');
           buffer = lines.pop() || ''; // Keep incomplete line in buffer
 
@@ -372,6 +392,50 @@ class SessionManager {
             if (line.trim()) {
               try {
                 const json = JSON.parse(line);
+
+                // Check structured JSON errors for usage-limit messages.
+                // The CLI emits limit errors in a few different shapes:
+                //   1. {"type":"error", "error":{"message":"..."}}
+                //   2. {"type":"error", "message":"..."}
+                //   3. {"type":"assistant", "error":"rate_limit",
+                //        "message":{"model":"<synthetic>",
+                //                   "content":[{"type":"text","text":"You've hit your limit · resets 5:40pm (...)"}]}}
+                // Shape (3) is the one Claude Code actually uses, and the
+                // parseable reset time lives inside the synthetic
+                // assistant content rather than in the `error` field.
+                const errorText =
+                  json.error?.message || json.error?.text ||
+                  (typeof json.error === 'string' ? json.error : '') ||
+                  (json.type === 'error' && json.message ? json.message : '');
+                // Use `!= null` so `error: null` is treated as "no
+                // error" and we don't dump the full payload or scan
+                // synthetic content for a non-existent error.
+                const hasErrorIndicator = json.error != null || json.type === 'error';
+                if (hasErrorIndicator) {
+                  console.log('[SessionManager] Full JSON error payload:', JSON.stringify(json));
+                  // For shape (3), the parseable reset time lives inside
+                  // the synthetic assistant content. Build the most
+                  // informative text we can BEFORE running detection so
+                  // checkUsageLimit's "trigger once" guard latches on
+                  // the version that includes the reset time.
+                  let syntheticText = '';
+                  if (Array.isArray(json.message?.content)) {
+                    syntheticText = json.message.content
+                      .filter((b: any) => b?.type === 'text' && typeof b.text === 'string')
+                      .map((b: any) => b.text)
+                      .join(' ')
+                      .trim();
+                  }
+                  // Prefer the richest text we have: synthetic content
+                  // (most informative, contains "resets …") falls back
+                  // to the structured error message text, which falls
+                  // back to the bare token (e.g. "rate_limit").
+                  const detectionText = syntheticText || errorText;
+                  if (detectionText) {
+                    console.log(`[SessionManager] Error event text for detection: ${detectionText.substring(0, 200)}`);
+                    checkUsageLimit(detectionText, syntheticText ? 'stdout-synthetic-assistant' : 'stdout-json-error');
+                  }
+                }
 
                 // Handle stream_event type with nested event
                 if (json.type === 'stream_event' && json.event) {
@@ -434,13 +498,7 @@ class SessionManager {
               } catch (e) {
                 console.error('Failed to parse JSON line:', line, e);
                 // Non-JSON output may contain usage-limit messages
-                const usageLimit = detectUsageLimit(line);
-                if (usageLimit.detected) {
-                  console.log('[SessionManager] Usage limit detected in stdout — triggering provider switch');
-                  handleUsageLimitDetected(usageLimit).catch(err =>
-                    console.error('[SessionManager] Failed to auto-switch provider:', err),
-                  );
-                }
+                checkUsageLimit(line, 'stdout-raw');
               }
             }
           }
@@ -451,16 +509,11 @@ class SessionManager {
           // Update activity even on stderr
           session.lastActivity = Date.now();
           const errorMessage = data.toString();
-          console.error('Claude CLI error:', errorMessage);
+          stderrAccumulator += errorMessage;
+          console.error('Claude CLI stderr:', errorMessage);
 
           // Detect usage-limit messages and auto-switch to Bedrock
-          const usageLimit = detectUsageLimit(errorMessage);
-          if (usageLimit.detected) {
-            console.log('[SessionManager] Usage limit detected in stderr — triggering provider switch');
-            handleUsageLimitDetected(usageLimit).catch(err =>
-              console.error('[SessionManager] Failed to auto-switch provider:', err),
-            );
-          }
+          checkUsageLimit(errorMessage, 'stderr');
         });
 
         // Use 'exit' instead of 'close' for process lifecycle management.
@@ -479,6 +532,16 @@ class SessionManager {
           if (session.streamBuffer) {
             session.streamBuffer.isActive = false;
           }
+
+          // On non-zero exit, log everything and do a final usage-limit
+          // check against accumulated stderr (covers cases where the
+          // message arrived in chunks that didn't individually match).
+          if (code !== 0 && code !== null && !session.stoppedByUser) {
+            console.log(`[SessionManager] CLI exited with code ${code} — stderr dump:`);
+            console.log(stderrAccumulator || '(empty)');
+            checkUsageLimit(stderrAccumulator, 'stderr-on-exit');
+          }
+
           // If the user explicitly stopped this process, treat it as a
           // clean exit regardless of the exit code.
           if (session.stoppedByUser) {

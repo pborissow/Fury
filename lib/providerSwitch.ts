@@ -14,6 +14,21 @@ import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { eventBus } from './eventBus';
+import { settingsPersistence, type AppSettings } from './settingsPersistence';
+import {
+  appendFallbackLogEntry,
+  getPendingSwitchBack,
+  type SwitchTrigger,
+} from './providerFallbackLog';
+
+/** Metadata passed to switchTo* for audit-log purposes. */
+export interface SwitchMeta {
+  trigger?: SwitchTrigger;
+  rawResetTime?: string;
+  scheduledReturnAt?: number;
+  reason?: string;
+  note?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -35,13 +50,24 @@ export interface BedrockConfig {
   awsAuthRefresh?: string;
 }
 
-const DEFAULT_BEDROCK_CONFIG: BedrockConfig = {
-  awsProfile: 'bg-dev-bedrock',
-  awsRegion: 'us-east-1',
-  model: 'us.anthropic.claude-sonnet-4-6',
-  smallFastModel: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
-  awsAuthRefresh: 'aws sso login --profile bg-dev-bedrock',
-};
+/**
+ * Pull the Bedrock connection config from user-saved settings.
+ * Returns null if the configuration is incomplete (missing profile, region,
+ * or model) — callers should treat that as "Bedrock not available".
+ */
+async function loadBedrockConfigFromSettings(): Promise<BedrockConfig | null> {
+  const s: AppSettings = await settingsPersistence.loadSettings();
+  if (!s.bedrockAwsProfile?.trim() || !s.bedrockAwsRegion?.trim() || !s.bedrockModel?.trim()) {
+    return null;
+  }
+  return {
+    awsProfile: s.bedrockAwsProfile.trim(),
+    awsRegion: s.bedrockAwsRegion.trim(),
+    model: s.bedrockModel.trim(),
+    smallFastModel: (s.bedrockSmallFastModel || s.bedrockModel).trim(),
+    awsAuthRefresh: s.bedrockAuthRefreshCmd?.trim() || undefined,
+  };
+}
 
 // Keys that belong to Bedrock routing (removed when switching to Anthropic)
 const BEDROCK_ENV_KEYS = new Set([
@@ -61,18 +87,30 @@ const BEDROCK_ENV_KEYS = new Set([
 // ---------------------------------------------------------------------------
 
 /**
- * Pattern that matches the "out of extra usage" message from Anthropic.
- * Captures the reset time string (e.g. "12pm (America/New_York)").
+ * Pattern that captures the reset time from a usage-limit message.
+ * Matches both wordings the CLI is known to emit:
+ *   - "you're out of extra usage. resets 12pm (America/New_York)"
+ *   - "You've hit your limit · resets 5:40pm (America/New_York)"
+ * Capture group 1 is the raw reset-time string (e.g. "5:40pm (America/New_York)").
  */
 const USAGE_LIMIT_PATTERN =
-  /out of extra usage.*?resets?\s+(.+?(?:\([\w/]+\))?)\s*$/i;
+  /(?:out of extra usage|hit your limit).*?resets?\s+(.+?(?:\s*\([\w/]+\))?)\s*$/i;
 
-/** Secondary patterns for other common limit messages */
+/**
+ * Secondary patterns for limit messages where we may not be able to
+ * parse a reset time. Includes both human-readable phrases and the
+ * machine token form (e.g. "rate_limit") that the CLI emits as a
+ * top-level `error` field on synthetic assistant events.
+ */
 const RATE_LIMIT_PATTERNS = [
   /you'?re out of extra usage/i,
+  /you'?ve hit your limit/i,
+  /hit your limit/i,
   /usage limit reached/i,
   /rate limit exceeded/i,
   /exceeded your current usage/i,
+  /\brate[\s_-]?limit\b/i,
+  /\busage[\s_-]?limit\b/i,
 ];
 
 export interface UsageLimitInfo {
@@ -83,8 +121,21 @@ export interface UsageLimitInfo {
 }
 
 /**
- * Check whether a chunk of text (stdout or stderr) contains a usage-limit
- * message. Returns structured info including the parsed reset time.
+ * Check whether a chunk of text contains a usage-limit message.
+ *
+ * **Call-site contract:** `RATE_LIMIT_PATTERNS` includes broad token
+ * forms (`rate_limit`, `usage_limit`) that can collide with normal
+ * assistant prose if matched against arbitrary model output. Only call
+ * this with text that is already known to be an *error signal* — e.g.
+ * the contents of a `json.error` field, stderr, or the `text` blocks
+ * of a synthetic `<synthetic>`-model assistant message that came
+ * alongside an `error` indicator. `sessionManager.ts` enforces this by
+ * gating the synthetic-content branch on `hasErrorIndicator`. Anyone
+ * adding a new caller must preserve that contract or the failover
+ * will start firing on legitimate user/assistant text.
+ *
+ * Returns structured info including the parsed reset time when the
+ * full-form "resets HH:MM(am|pm) (TZ)" suffix is present.
  */
 export function detectUsageLimit(text: string): UsageLimitInfo {
   const match = text.match(USAGE_LIMIT_PATTERN);
@@ -245,8 +296,14 @@ export interface SwitchResult {
 /**
  * Switch to Anthropic (direct API) by removing Bedrock env vars from
  * settings.json and stashing them for later restore.
+ *
+ * `meta.trigger` defaults to `'manual'` — pass `'scheduled'` from the
+ * auto-return timer or `'rehydrated-past-due'` from boot rehydration so
+ * the audit log distinguishes those cases.
  */
-export async function switchToAnthropic(): Promise<SwitchResult> {
+export async function switchToAnthropic(
+  meta: SwitchMeta = {},
+): Promise<SwitchResult> {
   const settings = await loadSettings();
   const prev: Provider = isBedrock(settings) ? 'bedrock' : 'anthropic';
   const bakPath = await backupSettings();
@@ -299,6 +356,15 @@ export async function switchToAnthropic(): Promise<SwitchResult> {
     message: result.message,
   } as any);
 
+  await appendFallbackLogEntry({
+    type: 'switched-to-anthropic',
+    ts: Date.now(),
+    trigger: meta.trigger ?? 'manual',
+    note: meta.note,
+  }).catch(err =>
+    console.error('[ProviderSwitch] Failed to append fallback-log entry:', err),
+  );
+
   console.log(`[ProviderSwitch] ${result.message}`);
   return result;
 }
@@ -306,11 +372,23 @@ export async function switchToAnthropic(): Promise<SwitchResult> {
 /**
  * Switch to Amazon Bedrock by restoring env vars from the stash file,
  * or using the provided (or default) config if no stash exists.
+ *
+ * `meta.trigger` defaults to `'manual'`. `handleUsageLimitDetected`
+ * calls this with `trigger: 'auto-failover'` plus a `scheduledReturnAt`
+ * so the audit log carries enough information to rehydrate the
+ * switch-back timer after a server restart.
  */
 export async function switchToBedrock(
   config: Partial<BedrockConfig> = {},
+  meta: SwitchMeta = {},
 ): Promise<SwitchResult> {
-  const cfg = { ...DEFAULT_BEDROCK_CONFIG, ...config };
+  const fromSettings = await loadBedrockConfigFromSettings();
+  if (!fromSettings) {
+    throw new Error(
+      'Bedrock is not configured. Open Settings → Services → Bedrock and set the AWS profile, region, and model first.',
+    );
+  }
+  const cfg: BedrockConfig = { ...fromSettings, ...config };
   const settings = await loadSettings();
   const prev: Provider = isBedrock(settings) ? 'bedrock' : 'anthropic';
   const bakPath = await backupSettings();
@@ -356,6 +434,18 @@ export async function switchToBedrock(
     message: result.message,
   } as any);
 
+  await appendFallbackLogEntry({
+    type: 'switched-to-bedrock',
+    ts: Date.now(),
+    trigger: meta.trigger ?? 'manual',
+    rawResetTime: meta.rawResetTime,
+    scheduledReturnAt: meta.scheduledReturnAt,
+    reason: meta.reason,
+    note: meta.note,
+  }).catch(err =>
+    console.error('[ProviderSwitch] Failed to append fallback-log entry:', err),
+  );
+
   console.log(`[ProviderSwitch] ${result.message}`);
   return result;
 }
@@ -365,6 +455,14 @@ export async function switchToBedrock(
 // ---------------------------------------------------------------------------
 
 let switchBackTimer: ReturnType<typeof setTimeout> | null = null;
+/**
+ * Absolute epoch-ms at which `switchBackTimer` is scheduled to fire,
+ * mirrored here so synchronous callers (e.g. the GET /api/provider
+ * route) can report the target without async file I/O. Kept in lock-
+ * step with `switchBackTimer` by `armSwitchBackTimer` and
+ * `cancelScheduledSwitchBack`.
+ */
+let switchBackTargetMs: number | null = null;
 
 /**
  * Called when a usage limit is detected. Switches to Bedrock immediately
@@ -373,6 +471,19 @@ let switchBackTimer: ReturnType<typeof setTimeout> | null = null;
 export async function handleUsageLimitDetected(
   info: UsageLimitInfo,
 ): Promise<SwitchResult | null> {
+  const userSettings = await settingsPersistence.loadSettings();
+
+  if (!userSettings.bedrockClaudeFailoverEnabled) {
+    console.log('[ProviderSwitch] Usage limit detected but Claude failover is disabled in settings.');
+    return null;
+  }
+
+  const bedrockCfg = await loadBedrockConfigFromSettings();
+  if (!bedrockCfg) {
+    console.log('[ProviderSwitch] Usage limit detected but Bedrock service is not fully configured.');
+    return null;
+  }
+
   const status = await getProviderStatus();
 
   // Already on Bedrock — nothing to do
@@ -386,46 +497,161 @@ export async function handleUsageLimitDetected(
     console.log(`[ProviderSwitch] Anthropic resets at: ${info.resetTimeRaw}`);
   }
 
-  const result = await switchToBedrock();
+  // Compute the scheduled-return time once so it can be both written
+  // into the audit log (for durable rehydration) and used to arm the
+  // in-memory timer.
+  const SWITCH_BACK_BUFFER_MS = 2 * 60_000;
+  const scheduledReturnAt =
+    typeof info.resetTimeMs === 'number' && info.resetTimeMs > Date.now()
+      ? info.resetTimeMs + SWITCH_BACK_BUFFER_MS
+      : undefined;
 
-  // Schedule switch-back if we know the reset time
-  if (info.resetTimeMs) {
-    const delayMs = info.resetTimeMs - Date.now();
-    if (delayMs > 0) {
-      // Add 2-minute buffer after the stated reset time
-      const bufferedDelay = delayMs + 2 * 60_000;
-      console.log(
-        `[ProviderSwitch] Scheduling switch-back to Anthropic in ${Math.round(bufferedDelay / 60_000)} minutes`,
-      );
+  const result = await switchToBedrock(
+    {},
+    {
+      trigger: 'auto-failover',
+      rawResetTime: info.resetTimeRaw,
+      scheduledReturnAt,
+      reason: 'anthropic-rate-limit',
+    },
+  );
 
-      if (switchBackTimer) clearTimeout(switchBackTimer);
-      switchBackTimer = setTimeout(async () => {
-        console.log('[ProviderSwitch] Reset time reached — switching back to Anthropic.');
-        try {
-          await switchToAnthropic();
-          eventBus.emitApp({
-            type: 'provider:switched',
-            provider: 'anthropic',
-            message: 'Auto-switched back to Anthropic after usage limit reset.',
-          } as any);
-        } catch (err) {
-          console.error('[ProviderSwitch] Failed to auto-switch back:', err);
-        }
-        switchBackTimer = null;
-      }, bufferedDelay);
-    }
+  // Arm the in-memory switch-back timer. Note this is purely an
+  // optimization — the durable record already exists in the fallback
+  // log, so a server restart between now and the reset time is
+  // recovered by `rehydrateSwitchBackTimer()` on boot.
+  if (scheduledReturnAt) {
+    armSwitchBackTimer(scheduledReturnAt);
   }
 
   return result;
 }
 
 /**
+ * Arm (or re-arm) the in-memory switch-back timer for the given
+ * absolute target time. Replaces any existing timer.
+ *
+ * The timer is best-effort: durability is provided by the fallback log
+ * + `rehydrateSwitchBackTimer()`. If `targetMs` is in the past this
+ * function switches back immediately.
+ */
+function armSwitchBackTimer(targetMs: number, trigger: SwitchTrigger = 'scheduled'): void {
+  const delayMs = Math.max(0, targetMs - Date.now());
+  console.log(
+    `[ProviderSwitch] Arming switch-back to Anthropic in ${Math.round(delayMs / 60_000)} minutes (target ${new Date(targetMs).toISOString()})`,
+  );
+
+  if (switchBackTimer) clearTimeout(switchBackTimer);
+  switchBackTargetMs = targetMs;
+  switchBackTimer = setTimeout(async () => {
+    console.log('[ProviderSwitch] Reset time reached — switching back to Anthropic.');
+    try {
+      // Defend against stale timers: if the user (or a different code
+      // path) already returned us to Anthropic, just clear state.
+      const status = await getProviderStatus();
+      if (status.current === 'anthropic') {
+        console.log('[ProviderSwitch] Already on Anthropic — skipping auto switch-back.');
+      } else {
+        await switchToAnthropic({ trigger });
+        eventBus.emitApp({
+          type: 'provider:switched',
+          provider: 'anthropic',
+          message: 'Auto-switched back to Anthropic after usage limit reset.',
+        } as any);
+      }
+    } catch (err) {
+      console.error('[ProviderSwitch] Failed to auto-switch back:', err);
+    }
+    switchBackTimer = null;
+    switchBackTargetMs = null;
+  }, delayMs);
+}
+
+/**
+ * Read the durable fallback log on boot and either re-arm the
+ * switch-back timer or, if the scheduled time has already passed,
+ * switch back immediately.
+ *
+ * Idempotent — calling more than once is safe (re-uses or replaces the
+ * existing timer). Should be called once after the HTTP server is
+ * listening so any errors don't block startup.
+ */
+export async function rehydrateSwitchBackTimer(): Promise<void> {
+  try {
+    const pending = await getPendingSwitchBack();
+    if (!pending) {
+      console.log('[ProviderSwitch] No pending switch-back found in fallback log.');
+      return;
+    }
+
+    const status = await getProviderStatus();
+    if (status.current === 'anthropic') {
+      // The system is already on Anthropic — log was never resolved.
+      // Append a resolution entry so the log is consistent and we
+      // don't keep matching this stale pending on every boot. Use a
+      // distinct trigger so the audit trail is honest about the fact
+      // that no actual provider change happened here.
+      console.log('[ProviderSwitch] Pending switch-back found but provider is already Anthropic; recording resolution.');
+      await appendFallbackLogEntry({
+        type: 'switched-to-anthropic',
+        ts: Date.now(),
+        trigger: 'rehydrated-already-resolved',
+        note: 'Provider was already Anthropic on boot; no switch needed.',
+      }).catch(() => undefined);
+      return;
+    }
+
+    // We're on Bedrock and the log says we should be returning at
+    // `scheduledReturnAt`. Pre-flight the failover gates so we don't
+    // try to flip if the user has since disabled the feature or
+    // unconfigured Bedrock.
+    const userSettings = await settingsPersistence.loadSettings();
+    if (!userSettings.bedrockClaudeFailoverEnabled) {
+      console.log('[ProviderSwitch] Pending switch-back exists but failover is now disabled — leaving on Bedrock.');
+      return;
+    }
+
+    if (pending.scheduledReturnAt <= Date.now()) {
+      console.log(
+        `[ProviderSwitch] Pending switch-back is past-due (target ${new Date(pending.scheduledReturnAt).toISOString()}) — switching back now.`,
+      );
+      try {
+        await switchToAnthropic({
+          trigger: 'rehydrated-past-due',
+          note: `Originally triggered ${new Date(pending.triggeredAt).toISOString()}; reset time was ${pending.rawResetTime || 'unknown'}.`,
+        });
+        eventBus.emitApp({
+          type: 'provider:switched',
+          provider: 'anthropic',
+          message: 'Switched back to Anthropic after usage limit reset (recovered from server restart).',
+        } as any);
+      } catch (err) {
+        console.error('[ProviderSwitch] Failed to switch back during rehydrate:', err);
+      }
+      return;
+    }
+
+    // Scheduled return is still in the future — re-arm the timer.
+    armSwitchBackTimer(pending.scheduledReturnAt);
+  } catch (err) {
+    console.error('[ProviderSwitch] rehydrateSwitchBackTimer error:', err);
+  }
+}
+
+/**
  * Cancel any pending switch-back timer (e.g. if the user manually switches).
+ *
+ * Note: this only clears the in-memory timer. The durable record in
+ * `provider-fallback-log.jsonl` is implicitly resolved by whichever
+ * `switchToAnthropic`/`switchToBedrock` call follows; if no further
+ * switch is made, the next `switchTo*` (or `rehydrateSwitchBackTimer`
+ * on boot) will close out the audit trail.
  */
 export function cancelScheduledSwitchBack(): void {
   if (switchBackTimer) {
     clearTimeout(switchBackTimer);
     switchBackTimer = null;
+    switchBackTargetMs = null;
     console.log('[ProviderSwitch] Cancelled scheduled switch-back.');
   }
 }
@@ -433,5 +659,6 @@ export function cancelScheduledSwitchBack(): void {
 export function getSwitchBackScheduled(): { scheduled: boolean; resetTimeMs?: number } {
   return {
     scheduled: switchBackTimer !== null,
+    resetTimeMs: switchBackTargetMs ?? undefined,
   };
 }

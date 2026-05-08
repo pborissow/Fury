@@ -34,7 +34,19 @@ app.prepare().then(() => {
     upgrade(req, socket, head);
   });
 
-  server.listen(port, hostname, () => {
+  server.listen(port, hostname, async () => {
     console.log(`> Ready on http://localhost:${port} (${dev ? 'development' : 'production'})`);
+
+    // Rehydrate any pending Anthropic switch-back from the durable
+    // fallback log. This recovers the auto-failover scheduler across
+    // server restarts, deploys, and crashes — without it, a process
+    // restart between the failover firing and the reset time leaves
+    // the user parked on Bedrock indefinitely.
+    try {
+      const { rehydrateSwitchBackTimer } = await import('./lib/providerSwitch');
+      await rehydrateSwitchBackTimer();
+    } catch (err) {
+      console.error('[server] Failed to rehydrate provider switch-back timer:', err);
+    }
   });
 });

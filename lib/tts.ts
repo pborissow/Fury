@@ -326,6 +326,9 @@ export async function generateSpeech(text: string, signal?: AbortSignal, setting
     anthropicApiKey: null, ttsProvider: 'local', ttsRemoteHost: '', ttsRemotePort: '5656',
     promptSuggestionsEnabled: true, ttsEnabled: false, localhostOnly: true,
     authUsername: null, authPasswordHash: null,
+    bedrockAwsProfile: '', bedrockAwsRegion: '', bedrockModel: '',
+    bedrockSmallFastModel: '', bedrockAuthRefreshCmd: '',
+    bedrockClaudeFailoverEnabled: false,
   };
   const s = settings || defaultSettings;
 

@@ -44,7 +44,27 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Cancel any pending auto-switch-back when the user switches manually
+    const before = await getProviderStatus();
+    if (before.current === provider) {
+      // Redundant click on the current provider. Short-circuit:
+      //  1. Don't cancel the in-memory auto-switch-back timer.
+      //  2. Don't append a `switched-to-*` entry to the fallback log.
+      // Either side-effect would mask a pending auto-failover return:
+      // a manual `switched-to-bedrock` entry with no `scheduledReturnAt`
+      // is the newest matching event for `getPendingSwitchBack()`,
+      // which silently bails — auto-return then never fires, even
+      // across server restarts.
+      return NextResponse.json({
+        previousProvider: before.current,
+        newProvider: provider,
+        backupPath: '',
+        message: `Already on ${provider}; no change.`,
+      });
+    }
+
+    // Genuine provider change: cancel any pending in-memory timer.
+    // (The durable record is implicitly resolved by the new
+    // switched-to-* log entry that switchTo* appends below.)
     cancelScheduledSwitchBack();
 
     const result =

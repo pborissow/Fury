@@ -85,6 +85,12 @@ export default function Home() {
     ttsProvider: 'local',
     ttsRemoteHost: '',
     ttsRemotePort: '5656',
+    bedrockAwsProfile: '',
+    bedrockAwsRegion: 'us-east-1',
+    bedrockModel: 'us.anthropic.claude-sonnet-4-6',
+    bedrockSmallFastModel: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+    bedrockAuthRefreshCmd: '',
+    bedrockClaudeFailoverEnabled: false,
   });
   const settingsLoaded = useRef(false);
 
@@ -105,6 +111,12 @@ export default function Home() {
         ttsProvider: s.ttsProvider ?? prev.ttsProvider,
         ttsRemoteHost: s.ttsRemoteHost ?? prev.ttsRemoteHost,
         ttsRemotePort: s.ttsRemotePort ?? prev.ttsRemotePort,
+        bedrockAwsProfile: s.bedrockAwsProfile ?? prev.bedrockAwsProfile,
+        bedrockAwsRegion: s.bedrockAwsRegion ?? prev.bedrockAwsRegion,
+        bedrockModel: s.bedrockModel ?? prev.bedrockModel,
+        bedrockSmallFastModel: s.bedrockSmallFastModel ?? prev.bedrockSmallFastModel,
+        bedrockAuthRefreshCmd: s.bedrockAuthRefreshCmd ?? prev.bedrockAuthRefreshCmd,
+        bedrockClaudeFailoverEnabled: s.bedrockClaudeFailoverEnabled ?? prev.bedrockClaudeFailoverEnabled,
       }));
       settingsLoaded.current = true;
     }).catch(() => { settingsLoaded.current = true; });

@@ -28,6 +28,9 @@ const ALLOWED_KEYS = [
   'authUsername', 'anthropicApiKey',
   'summarizerProvider', 'ollamaHost', 'ollamaPort',
   'ttsProvider', 'ttsRemoteHost', 'ttsRemotePort',
+  'bedrockAwsProfile', 'bedrockAwsRegion', 'bedrockModel',
+  'bedrockSmallFastModel', 'bedrockAuthRefreshCmd',
+  'bedrockClaudeFailoverEnabled',
 ] as const;
 
 export async function POST(request: Request) {

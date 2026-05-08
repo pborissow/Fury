@@ -16,6 +16,12 @@ export interface AppSettings {
   ttsProvider: 'local' | 'remote';
   ttsRemoteHost: string;
   ttsRemotePort: string;
+  bedrockAwsProfile: string;
+  bedrockAwsRegion: string;
+  bedrockModel: string;
+  bedrockSmallFastModel: string;
+  bedrockAuthRefreshCmd: string;
+  bedrockClaudeFailoverEnabled: boolean;
 }
 
 const DEFAULTS: AppSettings = {
@@ -31,6 +37,12 @@ const DEFAULTS: AppSettings = {
   ttsProvider: 'local',
   ttsRemoteHost: '',
   ttsRemotePort: '5656',
+  bedrockAwsProfile: '',
+  bedrockAwsRegion: 'us-east-1',
+  bedrockModel: 'us.anthropic.claude-sonnet-4-6',
+  bedrockSmallFastModel: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+  bedrockAuthRefreshCmd: '',
+  bedrockClaudeFailoverEnabled: false,
 };
 
 class SettingsPersistence {
