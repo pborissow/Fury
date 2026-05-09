@@ -468,9 +468,6 @@ export default function ChatTab({
         .catch(() => {});
     });
 
-    // Track AskUserQuestion tool use across stream events
-    let pendingAskUserQuestion: AskUserQuestionState['input'] | null = null;
-
     // Handle session:stream events — the single path for all stream data.
     // NOTE: These events only fire for sessions managed by Fury's sessionManager.
     // External CLI sessions rely on transcript-updated (file watcher) for updates.
@@ -484,13 +481,6 @@ export default function ChatTab({
       if (!transcriptLoadingRef.current) return;
 
       if (data.text) {
-        // If Claude streams more text after calling AskUserQuestion, the
-        // question was already handled (e.g. the CLI responded with an error
-        // and Claude continued). Clear the pending dialog so the normal
-        // transcript-refresh completion path runs instead.
-        if (pendingAskUserQuestion) {
-          pendingAskUserQuestion = null;
-        }
         setTranscriptStreaming(prev => prev + data.text);
         setStreamEvents(prev => {
           const last = prev[prev.length - 1];
@@ -505,9 +495,14 @@ export default function ChatTab({
           setStreamEvents(prev => [...prev, { type: 'tool_start' as const, name: tool.name, ts: Date.now() }]);
         } else if (tool.status === 'complete') {
           setStreamEvents(prev => [...prev, { type: 'tool_complete' as const, name: tool.name, input: tool.input, ts: Date.now() }]);
-          // Capture AskUserQuestion for handling when processing completes
+          // Surface AskUserQuestion immediately. In `--print` mode the CLI
+          // auto-errors this tool with "Answer questions?" within ~150ms,
+          // and Claude usually responds with a fallback text bubble like
+          // "Holding for your input." Waiting until session completion to
+          // open the dialog meant that fallback text would race ahead and
+          // we'd never show the structured question.
           if (tool.name === 'AskUserQuestion' && tool.input?.questions) {
-            pendingAskUserQuestion = tool.input;
+            setAskUserQuestion({ input: tool.input });
           }
         }
       } else if (data.toolResult) {
@@ -530,23 +525,8 @@ export default function ChatTab({
         setTranscriptLoading(true);
       }
 
-      // If processing just ended, handle completion.
+      // If processing just ended, refresh transcript from JSONL.
       if (!data.isProcessing && transcriptLoadingRef.current) {
-        // If AskUserQuestion was detected during this turn, save accumulated
-        // text as an overlay message and open the dialog instead of refreshing.
-        if (pendingAskUserQuestion) {
-          const currentText = transcriptStreamingRef.current;
-          if (currentText) {
-            setTranscriptOverlayMessages(prev => [...prev, { role: 'assistant' as const, content: currentText }]);
-          }
-          setTranscriptStreaming('');
-          setTranscriptLoading(false);
-          setAskUserQuestion({ input: pendingAskUserQuestion });
-          pendingAskUserQuestion = null;
-          return;
-        }
-
-        // Normal completion: refresh transcript from JSONL.
         setTranscriptLoading(false);
         setTranscriptStreaming('');
         fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
@@ -1081,9 +1061,31 @@ export default function ChatTab({
     }
   };
 
-  const handleAskUserQuestionResponse = (answers: string) => {
+  const handleAskUserQuestionResponse = async (answers: string) => {
     setAskUserQuestion(null);
     if (!answers.trim()) return;
+
+    // After AskUserQuestion auto-errors in --print mode Claude almost always
+    // streams a "Holding for your input" fallback before the CLI exits.
+    // Kill that in-flight work before sending the user's answer so the next
+    // turn starts from a clean state instead of inheriting the wasted tokens.
+    const mySessionId = viewingTranscriptId;
+    if (mySessionId && transcriptLoadingRef.current) {
+      try {
+        await fetch('/api/health', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: mySessionId, action: 'stop' }),
+        });
+      } catch (error) {
+        console.error('Failed to stop in-flight session before sending answer:', error);
+      }
+      // The session-health SSE event will also flip these, but clear locally
+      // so handleTranscriptSend's `transcriptLoading` early-return doesn't trip.
+      setTranscriptLoading(false);
+      setTranscriptStreaming('');
+    }
+
     handleTranscriptSend(answers);
   };
 

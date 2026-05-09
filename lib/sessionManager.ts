@@ -1,13 +1,12 @@
 import { spawn, ChildProcess } from 'child_process';
-import { existsSync, realpathSync } from 'fs';
 import { appendFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
-import { projectPathToSlug } from './utils';
 import { eventBus } from './eventBus';
 import { killProcessTree } from './killProcessTree';
 import { detectUsageLimit, handleUsageLimitDetected } from './providerSwitch';
 import { scrubSessionFile } from './imageScrubber';
+import { findSessionJsonlDir } from './sessionPaths';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -18,36 +17,6 @@ interface QueuedMessage {
   prompt: string;
   resolve: (value: void | PromiseLike<void>) => void;
   reject: (error: Error) => void;
-}
-
-/**
- * Check if a Claude CLI session JSONL file already exists for a given session ID and project.
- */
-/**
- * Find the project slug directory that contains a session JSONL.
- * Returns the slug directory path, or null if not found.
- * Handles symlink/mapped drive mismatches by trying the resolved path
- * and scanning project directories as a last resort.
- */
-function findSessionJsonlDir(sessionId: string, projectPath: string): string | null {
-  const base = join(homedir(), '.claude', 'projects');
-  const slug = projectPathToSlug(projectPath);
-  const primary = join(base, slug);
-  if (existsSync(join(primary, `${sessionId}.jsonl`))) return primary;
-
-  // Try the resolved real path (handles symlinks/mapped drives)
-  try {
-    const resolved = realpathSync(projectPath);
-    if (resolved !== projectPath) {
-      const altSlug = projectPathToSlug(resolved);
-      if (altSlug !== slug) {
-        const alt = join(base, altSlug);
-        if (existsSync(join(alt, `${sessionId}.jsonl`))) return alt;
-      }
-    }
-  } catch { /* ignore */ }
-
-  return null;
 }
 
 function sessionJsonlExists(sessionId: string, projectPath: string): boolean {
@@ -261,23 +230,13 @@ class SessionManager {
         // --session-id creates a new session (fails if JSONL already exists).
         // --resume continues an existing session (fails if JSONL doesn't exist).
         let cwd = session.projectPath || process.cwd();
-        const jsonlDir = findSessionJsonlDir(session.sessionId, cwd);
-        const isExistingSession = jsonlDir !== null;
+        const jsonlLocation = findSessionJsonlDir(session.sessionId, cwd);
+        const isExistingSession = jsonlLocation !== null;
 
-        if (isExistingSession) {
-          // Ensure cwd matches the path the JSONL is stored under, since
-          // symlinks/mapped drives can cause the history path and JSONL slug
-          // to differ. If the primary slug didn't match, the resolved path did,
-          // so use that as cwd so Claude CLI finds its own session file.
-          const primarySlug = projectPathToSlug(cwd);
-          const base = join(homedir(), '.claude', 'projects');
-          if (!existsSync(join(base, primarySlug, `${session.sessionId}.jsonl`))) {
-            try {
-              const resolved = realpathSync(cwd);
-              if (resolved !== cwd) cwd = resolved;
-            } catch { /* keep original */ }
-          }
-        }
+        // Use the cwd Claude CLI itself recorded in the JSONL, so its slug
+        // derivation round-trips to the same project dir on resume. This
+        // catches symlinks and Windows subst-mapped drives in one shot.
+        if (jsonlLocation) cwd = jsonlLocation.canonicalCwd;
 
         const args = [
           '--print',
@@ -472,20 +431,19 @@ class SessionManager {
                     }
                   }
                 }
-                // Handle assistant message type with complete content
+                // Handle assistant message type with complete content.
+                // Text blocks were already delivered as streaming deltas via
+                // `stream_event content_block_delta` above — re-emitting them
+                // from the assistant envelope would double every paragraph in
+                // the buffer. The exception is synthetic messages (CLI-injected
+                // usage-limit notices) which skip the streaming path entirely.
                 else if (json.type === 'assistant' && json.message?.content) {
-                  for (let i = 0; i < json.message.content.length; i++) {
-                    const block = json.message.content[i];
-                    if (block.type === 'text' && block.text) {
-                      // Add separator between text blocks if this isn't the first one
-                      if (i > 0 && json.message.content[i - 1]?.type === 'text') {
-                        bufferText('\n\n');
-                        eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, text: '\n\n' });
-                      }
+                  const isSynthetic = json.message.model === '<synthetic>';
+                  for (const block of json.message.content) {
+                    if (block.type === 'text' && block.text && isSynthetic) {
                       bufferText(block.text);
                       eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, text: block.text });
                     }
-                    // Handle tool use in complete message
                     else if (block.type === 'tool_use') {
                       bufferEvent({ type: 'tool_complete', name: block.name, input: block.input, ts: Date.now() });
                       eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, toolUse: { name: block.name, status: 'complete', input: block.input } });

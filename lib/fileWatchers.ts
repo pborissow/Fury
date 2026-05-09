@@ -4,6 +4,7 @@ import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { eventBus } from './eventBus';
 import { projectPathToSlug } from './utils';
+import { findSessionJsonlDir } from './sessionPaths';
 
 class FileWatchers {
   private historyWatcher: fs.FSWatcher | null = null;
@@ -57,15 +58,23 @@ class FileWatchers {
   }
 
   private tryWatchFile(sessionId: string, project: string) {
+    // Resolve the actual JSONL location — the supplied `project` path may not
+    // slugify to where the file actually lives (Windows subst-mapped drives,
+    // symlinks, history.jsonl recording a path that differs from the cwd
+    // Claude CLI normalized to). Without this lookup, the watcher would be
+    // attached to a directory that doesn't exist and silently never fire.
+    const located = findSessionJsonlDir(sessionId, project);
+    if (located) {
+      const jsonlPath = join(located.dir, `${sessionId}.jsonl`);
+      this.attachFileWatcher(sessionId, project, jsonlPath);
+      return;
+    }
+
+    // File doesn't exist yet (brand-new session) — watch the parent directory
+    // derived from the supplied project path for its creation.
     const slug = projectPathToSlug(project);
     const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sessionId}.jsonl`);
-
-    if (existsSync(jsonlPath)) {
-      this.attachFileWatcher(sessionId, project, jsonlPath);
-    } else {
-      // File doesn't exist yet — watch the parent directory for its creation
-      this.watchDirForFile(sessionId, project, jsonlPath);
-    }
+    this.watchDirForFile(sessionId, project, jsonlPath);
   }
 
   private attachFileWatcher(sessionId: string, project: string, jsonlPath: string) {
