@@ -186,41 +186,59 @@ function parseResetTime(raw?: string): number | undefined {
   if (meridiem === 'pm' && hours !== 12) hours += 12;
   if (meridiem === 'am' && hours === 12) hours = 0;
 
-  // Build a date string for today in the given timezone
+  // Build the "today" date string in the target timezone, then convert
+  // (date + parsed time) into a true UTC epoch.
+  //
+  // The math expressed below is:
+  //   1. Date.UTC(...)  → epoch ms as if the parsed clock-time were UTC.
+  //                       This is the *naive* UTC value, regardless of
+  //                       what the JS runtime's local timezone happens
+  //                       to be. Using `new Date(isoish)` would parse
+  //                       as runtime-local time and give the wrong
+  //                       answer on any non-UTC machine.
+  //   2. subtract `offsetMinutes`  → shift to true UTC. For zones west
+  //                                  of UTC (offset negative, e.g.
+  //                                  EDT = -240) this *adds* hours,
+  //                                  which is correct: 4:50pm EDT is
+  //                                  20:50 UTC.
   try {
     const now = new Date();
-    // Format today's date in the target timezone
+    // Format today's date in the target timezone (handles the case
+    // where the user's runtime is on a different calendar day than
+    // the target timezone, e.g. UTC after midnight vs NY before).
     const dateInTz = new Intl.DateTimeFormat('en-CA', {
       timeZone: tz,
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
     }).format(now);
+    const [year, month, day] = dateInTz.split('-').map(n => parseInt(n, 10));
+    if (!year || !month || !day) return undefined;
 
-    // Build ISO string: "2026-03-26T12:00:00"
-    const pad = (n: number) => n.toString().padStart(2, '0');
-    const isoish = `${dateInTz}T${pad(hours)}:${pad(minutes)}:00`;
-
-    // Use a formatter to find the UTC offset for that timezone at that time
+    // Find the UTC offset that the target timezone is using *at the
+    // current moment* (so we get the right offset across DST changes).
     const formatter = new Intl.DateTimeFormat('en-US', {
       timeZone: tz,
       timeZoneName: 'shortOffset',
     });
     const parts = formatter.formatToParts(now);
     const offsetPart = parts.find(p => p.type === 'timeZoneName')?.value || '';
-    // offsetPart looks like "GMT-5" or "GMT+5:30"
-    const offsetMatch = offsetPart.match(/GMT([+-]?)(\d{1,2})(?::(\d{2}))?/);
+    // offsetPart looks like "GMT-5", "GMT+5:30", or just "GMT" for UTC.
+    const offsetMatch = offsetPart.match(/GMT([+-])?(\d{1,2})?(?::(\d{2}))?/);
     let offsetMinutes = 0;
-    if (offsetMatch) {
+    if (offsetMatch && offsetMatch[2]) {
       const sign = offsetMatch[1] === '-' ? -1 : 1;
       offsetMinutes = sign * (parseInt(offsetMatch[2], 10) * 60 + parseInt(offsetMatch[3] || '0', 10));
     }
 
-    // Parse as local time, then adjust by the offset
-    const localDate = new Date(isoish);
-    const utcMs = localDate.getTime() - offsetMinutes * 60_000;
+    // Naive UTC: pretend the clock time is already UTC.
+    const naiveUtcMs = Date.UTC(year, month - 1, day, hours, minutes, 0);
+    // True UTC: shift by the target zone's offset.
+    const utcMs = naiveUtcMs - offsetMinutes * 60_000;
 
-    // If the computed time is in the past, assume it's tomorrow
+    // If the computed time is in the past, assume the message refers
+    // to tomorrow (handles end-of-day rollover where Anthropic says
+    // "resets 12am" right after midnight in the target zone).
     if (utcMs <= Date.now()) {
       return utcMs + 24 * 60 * 60_000;
     }
@@ -674,9 +692,42 @@ export function cancelScheduledSwitchBack(): void {
   }
 }
 
-export function getSwitchBackScheduled(): { scheduled: boolean; resetTimeMs?: number } {
-  return {
-    scheduled: switchBackTimer !== null,
-    resetTimeMs: switchBackTargetMs ?? undefined,
-  };
+/**
+ * Report whether a switch-back is currently scheduled, and when.
+ *
+ * Prefers the in-memory timer state (cheap, accurate when the timer
+ * was armed in this same module instance). Falls back to the durable
+ * fallback log when in-memory state is empty — necessary in Next.js
+ * dev mode, where different route handlers can be loaded with
+ * separate module-graph instances of `lib/providerSwitch.ts`. In that
+ * case, an `armSwitchBackTimer` call from the `/api/claude` flow
+ * leaves no trace in the `/api/provider` GET handler's module
+ * instance, but the durable log is shared (it's a file on disk) and
+ * will report the pending state correctly.
+ *
+ * In production (`next start`) module instances are shared, so the
+ * in-memory check always succeeds and the log fallback is unused.
+ */
+export async function getSwitchBackScheduled(): Promise<{
+  scheduled: boolean;
+  resetTimeMs?: number;
+}> {
+  if (switchBackTimer) {
+    return {
+      scheduled: true,
+      resetTimeMs: switchBackTargetMs ?? undefined,
+    };
+  }
+  try {
+    const pending = await getPendingSwitchBack();
+    if (pending) {
+      return {
+        scheduled: true,
+        resetTimeMs: pending.scheduledReturnAt,
+      };
+    }
+  } catch (err) {
+    console.error('[ProviderSwitch] getSwitchBackScheduled log read failed:', err);
+  }
+  return { scheduled: false };
 }

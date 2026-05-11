@@ -416,12 +416,9 @@ describe('POST /api/provider — redundant-click regression', () => {
 // ---------------------------------------------------------------------------
 
 describe('getSwitchBackScheduled', () => {
-  it('returns scheduled=false when no timer is armed', async () => {
+  it('returns scheduled=false when no timer is armed and the log is empty', async () => {
     const { getSwitchBackScheduled } = await import('@/lib/providerSwitch');
-    expect(getSwitchBackScheduled()).toEqual({
-      scheduled: false,
-      resetTimeMs: undefined,
-    });
+    expect(await getSwitchBackScheduled()).toEqual({ scheduled: false });
   });
 
   it('returns scheduled=true with the actual target time after rehydrate arms a future timer', async () => {
@@ -437,15 +434,54 @@ describe('getSwitchBackScheduled', () => {
     await rehydrateSwitchBackTimer();
 
     const { getSwitchBackScheduled } = await import('@/lib/providerSwitch');
-    const result = getSwitchBackScheduled();
+    const result = await getSwitchBackScheduled();
     expect(result.scheduled).toBe(true);
     expect(result.resetTimeMs).toBe(targetMs);
 
     cancelScheduledSwitchBack();
-    expect(getSwitchBackScheduled()).toEqual({
-      scheduled: false,
-      resetTimeMs: undefined,
+    // After cancel, the in-memory timer is gone — but the durable log
+    // still has an unresolved pending entry, so the fallback should
+    // report scheduled=true with the same target time. This is the
+    // dev-mode-module-singleton mitigation at work.
+    const afterCancel = await getSwitchBackScheduled();
+    expect(afterCancel.scheduled).toBe(true);
+    expect(afterCancel.resetTimeMs).toBe(targetMs);
+  });
+
+  it('falls back to the durable log when in-memory state is empty (dev-mode module-singleton mitigation)', async () => {
+    // Simulate the dev-mode case: a different module instance armed
+    // the timer (or none did), but the durable log knows about the
+    // pending switch-back. We never call armSwitchBackTimer in this
+    // test, so in-memory state stays empty.
+    const targetMs = Date.now() + 30 * 60_000;
+    appendLogEntry({
+      type: 'switched-to-bedrock',
+      ts: Date.now() - 10 * 60_000,
+      trigger: 'auto-failover',
+      scheduledReturnAt: targetMs,
     });
+
+    const { getSwitchBackScheduled } = await import('@/lib/providerSwitch');
+    const result = await getSwitchBackScheduled();
+    expect(result.scheduled).toBe(true);
+    expect(result.resetTimeMs).toBe(targetMs);
+  });
+
+  it('returns scheduled=false when the latest log event resolves the failover', async () => {
+    appendLogEntry({
+      type: 'switched-to-bedrock',
+      ts: Date.now() - 60 * 60_000,
+      trigger: 'auto-failover',
+      scheduledReturnAt: Date.now() - 30 * 60_000,
+    });
+    appendLogEntry({
+      type: 'switched-to-anthropic',
+      ts: Date.now() - 25 * 60_000,
+      trigger: 'manual',
+    });
+
+    const { getSwitchBackScheduled } = await import('@/lib/providerSwitch');
+    expect(await getSwitchBackScheduled()).toEqual({ scheduled: false });
   });
 });
 

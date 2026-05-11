@@ -15,7 +15,7 @@ export const runtime = 'nodejs';
 export async function GET() {
   try {
     const status = await getProviderStatus();
-    const switchBack = getSwitchBackScheduled();
+    const switchBack = await getSwitchBackScheduled();
     return NextResponse.json({ ...status, ...switchBack });
   } catch (error) {
     console.error('[Provider API] GET error:', error);

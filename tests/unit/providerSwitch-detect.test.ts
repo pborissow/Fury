@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { detectUsageLimit } from '@/lib/providerSwitch';
 
 describe('detectUsageLimit', () => {
@@ -26,6 +26,80 @@ describe('detectUsageLimit', () => {
     // Reset time must be in the future (the parser bumps to tomorrow if
     // the computed time is already past).
     expect(r.resetTimeMs!).toBeGreaterThan(Date.now());
+  });
+
+  // -------------------------------------------------------------------
+  // parseResetTime — numeric correctness across timezones and DST
+  //
+  // Regression for the original TZ math bug where `new Date(isoish)`
+  // (which parses as runtime-local time) gave a result offset by
+  // `2 × runtime_offset` from the correct UTC value. On an EDT runtime
+  // a 4:50pm EDT reset got computed as 8:50pm EDT, scheduling the
+  // auto-return 4 hours late.
+  //
+  // Each test pins `Date.now()` to an explicit "current" moment so the
+  // assertion is deterministic regardless of when the tests run, and
+  // asserts the *exact* expected epoch-ms.
+  // -------------------------------------------------------------------
+
+  describe('parseResetTime numeric correctness (via detectUsageLimit)', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function pinNow(iso: string) {
+      // Fake timers so both `Date.now()` and `new Date()` see the
+      // pinned moment. The implementation uses `new Date()` to anchor
+      // the "today in target tz" calculation, so spying only on
+      // `Date.now()` would silently fall back to wall-clock time.
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(iso));
+    }
+
+    it('America/New_York during EDT — 4:50pm resolves to 20:50Z (not 24:50Z)', () => {
+      // 4:49:32 PM EDT, 28 seconds before the stated reset.
+      pinNow('2026-05-11T20:49:32Z');
+      const r = detectUsageLimit("You've hit your limit · resets 4:50pm (America/New_York)");
+      expect(r.resetTimeMs).toBe(Date.UTC(2026, 4, 11, 20, 50, 0));
+    });
+
+    it('America/New_York during EST (winter) — 11:30am uses the -5 offset', () => {
+      // 11:29am EST, January.
+      pinNow('2026-01-15T16:29:00Z');
+      const r = detectUsageLimit("You've hit your limit · resets 11:30am (America/New_York)");
+      // 11:30am EST = 16:30 UTC.
+      expect(r.resetTimeMs).toBe(Date.UTC(2026, 0, 15, 16, 30, 0));
+    });
+
+    it('America/Los_Angeles during PDT — 9:00pm uses the -7 offset', () => {
+      // 8:59pm PDT.
+      pinNow('2026-07-04T03:59:00Z');
+      const r = detectUsageLimit("You've hit your limit · resets 9pm (America/Los_Angeles)");
+      // 9:00pm PDT on 7/3 = 04:00 UTC on 7/4.
+      expect(r.resetTimeMs).toBe(Date.UTC(2026, 6, 4, 4, 0, 0));
+    });
+
+    it('Europe/London during BST — 10:15am uses the +1 offset', () => {
+      // 10:14am BST.
+      pinNow('2026-06-15T09:14:00Z');
+      const r = detectUsageLimit("You've hit your limit · resets 10:15am (Europe/London)");
+      // 10:15am BST = 09:15 UTC.
+      expect(r.resetTimeMs).toBe(Date.UTC(2026, 5, 15, 9, 15, 0));
+    });
+
+    it('UTC zone — clock time equals UTC time', () => {
+      pinNow('2026-03-01T11:59:00Z');
+      const r = detectUsageLimit("You've hit your limit · resets 12pm (UTC)");
+      expect(r.resetTimeMs).toBe(Date.UTC(2026, 2, 1, 12, 0, 0));
+    });
+
+    it('rolls over to tomorrow when the computed reset is already in the past', () => {
+      // Now is 5:00pm EDT. Reset says "4:50pm" (10 minutes ago today).
+      pinNow('2026-05-11T21:00:00Z');
+      const r = detectUsageLimit("You've hit your limit · resets 4:50pm (America/New_York)");
+      const todayAt450 = Date.UTC(2026, 4, 11, 20, 50, 0); // already past
+      expect(r.resetTimeMs).toBe(todayAt450 + 24 * 60 * 60_000);
+    });
   });
 
   it('detects the bare "rate_limit" machine token emitted as a top-level error field', () => {
