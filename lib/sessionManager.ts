@@ -164,13 +164,21 @@ class SessionManager {
     } finally {
       session.currentProcess = null;
 
-      // If stopProcessing() or killSession() already handled state cleanup,
-      // don't duplicate it here — just bail out.
-      if (session.stoppedByUser || !this.sessions.has(session.sessionId)) {
-        session.stoppedByUser = false;
-        console.log(`[SessionManager] Skipping finally cleanup — session was stopped/killed`);
+      // If killSession() removed the session entirely, there's nothing to
+      // clean up on it. (stopProcessing() leaves the session in the map, so
+      // we still flow through the normal cleanup below — duplicate state
+      // resets are cheap and prevent orphan `isProcessing=true` if
+      // stopProcessing's tail ran into an exception before it reset state.)
+      if (!this.sessions.has(session.sessionId)) {
+        console.log(`[SessionManager] Session was killed — skipping finally cleanup`);
         return;
       }
+
+      // Consume the stoppedByUser flag if set. It gates the exit handler's
+      // resolve vs. reject decision; once finally runs the flag has served
+      // its purpose and must reset so the next turn isn't classified as
+      // user-stopped.
+      session.stoppedByUser = false;
 
       // Keep stream buffer alive so the frontend can restore state if the user
       // switches back after completion. Mark inactive and set a TTL for cleanup.
@@ -582,6 +590,37 @@ class SessionManager {
     }
 
     const now = Date.now();
+
+    // Self-correct an impossible state: isProcessing=true while there's no
+    // child process AND no recorded start time means the spawn finished
+    // (exit handler clears startedAt; finally nulls currentProcess) but the
+    // isProcessing flag was never flipped. Without this, the UI sits on
+    // bouncing dots forever — a stuck session that can only be cleared by
+    // calling action:'kill'. Treat it as finished and emit session:health
+    // so any listening UI catches up.
+    if (
+      session.isProcessing &&
+      !session.currentProcess &&
+      session.startedAt === undefined
+    ) {
+      console.warn(
+        `[SessionManager] Orphan isProcessing=true detected for ${sessionId} — auto-correcting`
+      );
+      session.isProcessing = false;
+      if (session.streamBuffer) {
+        session.streamBuffer.isActive = false;
+        if (!session.streamBuffer.completedAt) {
+          session.streamBuffer.completedAt = now;
+        }
+      }
+      eventBus.emitApp({
+        type: 'session:health',
+        sessionId,
+        isProcessing: false,
+        isStuck: false,
+      });
+    }
+
     const timeSinceActivity = now - session.lastActivity;
     const processingTime = session.startedAt ? now - session.startedAt : undefined;
 

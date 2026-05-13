@@ -495,14 +495,23 @@ export default function ChatTab({
           setStreamEvents(prev => [...prev, { type: 'tool_start' as const, name: tool.name, ts: Date.now() }]);
         } else if (tool.status === 'complete') {
           setStreamEvents(prev => [...prev, { type: 'tool_complete' as const, name: tool.name, input: tool.input, ts: Date.now() }]);
-          // Surface AskUserQuestion immediately. In `--print` mode the CLI
-          // auto-errors this tool with "Answer questions?" within ~150ms,
-          // and Claude usually responds with a fallback text bubble like
-          // "Holding for your input." Waiting until session completion to
-          // open the dialog meant that fallback text would race ahead and
-          // we'd never show the structured question.
+          // Surface AskUserQuestion immediately AND halt the CLI. In
+          // `--print` mode the CLI auto-errors this tool with "Answer
+          // questions?" within ~150ms, and Claude reacts by streaming a
+          // fallback ("Holding for your input"), sometimes re-asking, or
+          // continuing with more tool calls. None of that should run while
+          // a modal question is on screen — kill the in-flight process so
+          // the dialog is genuinely blocking. When the user answers, the
+          // response gets sent as a fresh resume turn.
           if (tool.name === 'AskUserQuestion' && tool.input?.questions) {
             setAskUserQuestion({ input: tool.input });
+            fetch('/api/health', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sessionId: mySessionId, action: 'stop' }),
+            }).catch(err =>
+              console.error('Failed to stop session on AskUserQuestion:', err)
+            );
           }
         }
       } else if (data.toolResult) {
@@ -1065,10 +1074,10 @@ export default function ChatTab({
     setAskUserQuestion(null);
     if (!answers.trim()) return;
 
-    // After AskUserQuestion auto-errors in --print mode Claude almost always
-    // streams a "Holding for your input" fallback before the CLI exits.
-    // Kill that in-flight work before sending the user's answer so the next
-    // turn starts from a clean state instead of inheriting the wasted tokens.
+    // The CLI was already killed when the dialog opened, but defensively
+    // re-issue stop if loading is still flagged (e.g. session-health hadn't
+    // arrived yet when the user answered quickly) and clear local state so
+    // handleTranscriptSend's `transcriptLoading` early-return doesn't trip.
     const mySessionId = viewingTranscriptId;
     if (mySessionId && transcriptLoadingRef.current) {
       try {
@@ -1080,8 +1089,6 @@ export default function ChatTab({
       } catch (error) {
         console.error('Failed to stop in-flight session before sending answer:', error);
       }
-      // The session-health SSE event will also flip these, but clear locally
-      // so handleTranscriptSend's `transcriptLoading` early-return doesn't trip.
       setTranscriptLoading(false);
       setTranscriptStreaming('');
     }
