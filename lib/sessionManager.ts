@@ -455,6 +455,20 @@ class SessionManager {
                     else if (block.type === 'tool_use') {
                       bufferEvent({ type: 'tool_complete', name: block.name, input: block.input, ts: Date.now() });
                       eventBus.emitApp({ type: 'session:stream', sessionId: session.sessionId, toolUse: { name: block.name, status: 'complete', input: block.input } });
+
+                      // AskUserQuestion is auto-errored by the CLI in `--print`
+                      // mode (Claude has no interactive stdin to read from).
+                      // Kill the CLI server-side so it can't churn through
+                      // tokens generating "Holding for your input" / more tool
+                      // calls while the user is on another session. The dialog
+                      // is surfaced via the SSE tool_complete event (if viewing)
+                      // or via parser.pendingAskUserQuestion on navigation.
+                      if (block.name === 'AskUserQuestion' && block.input?.questions?.length) {
+                        console.log(`[SessionManager] AskUserQuestion detected for ${session.sessionId} — stopping CLI`);
+                        this.stopProcessing(session.sessionId).catch(err =>
+                          console.error('[SessionManager] Failed to stop on AskUserQuestion:', err)
+                        );
+                      }
                     }
                   }
                 }

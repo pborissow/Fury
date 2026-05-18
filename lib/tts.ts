@@ -1,6 +1,7 @@
 import { KokoroTTS, TextSplitterStream } from 'kokoro-js';
 import Anthropic from '@anthropic-ai/sdk';
 import type { AppSettings } from '@/lib/settingsPersistence';
+import type { TurnMeta } from '@/lib/transcriptParser';
 
 const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX';
 const VOICE = 'af_heart';
@@ -10,6 +11,8 @@ const REMOTE_TIMEOUT_MS = 30_000;
 const OLLAMA_MODEL_SELECT_TIMEOUT_MS = 5_000;
 const MAX_TEXT_LENGTH = 50_000;
 const SUMMARY_THRESHOLD = 300;
+const PASS2_WORD_LIMIT = 80;
+const SEE_DETAILS = 'See details below.';
 
 function sanitizeHost(host: string): string {
   const clean = host.replace(/[^a-zA-Z0-9.\-[\]]/g, '');
@@ -162,6 +165,47 @@ const TTS_SYSTEM_PROMPT =
 
 const TTS_SUMMARIZE_PROMPT = 'Summarize this in 2-3 sentences for audio playback:\n\n';
 const TTS_NATURALIZE_PROMPT = 'Rewrite this so it sounds natural when spoken aloud. Keep it brief, same meaning:\n\n';
+const TTS_TIGHTEN_PROMPT = `Your previous summary is still too long for audio playback. Rewrite it in ${PASS2_WORD_LIMIT} words or fewer, keeping all key points but dropping minor details. No lists, no numbering, plain prose only:\n\n`;
+const TTS_HEADLINE_PROMPT = 'In one short sentence under 20 words, say what this work accomplished. Do not mention file names or counts. Do not start with "this", "the", or "a". Output only the sentence:\n\n';
+const IMPL_HEADLINE_MIN_CHARS = 200;
+
+function countWords(s: string): number {
+  return s.trim().split(/\s+/).filter(Boolean).length;
+}
+
+function postProcessSummary(s: string): string {
+  return s
+    .replace(/^\s*[-*]\s+/gm, '')
+    .replace(/^\s*\d+[.)]\s+/gm, '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\n+/g, '. ')
+    // Drop the ":." artifact that appears when a line ending in ":" is
+    // followed by a newline (the newline becomes a period above).
+    .replace(/:\s*\./g, '.')
+    .replace(/\.\s*\./g, '.')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/**
+ * Return the first sentence of a string. Trims to the first period,
+ * exclamation, or question mark followed by whitespace (or end of string),
+ * ignoring punctuation that immediately follows a colon or another period
+ * (artifacts left over from postProcessSummary).
+ */
+function firstSentence(s: string): string {
+  const m = s.match(/^.*?[^:.!?\s][.!?](?=\s|$)/);
+  return m ? m[0] : s;
+}
+
+function withSeeDetails(s: string): string {
+  const stripped = s
+    .replace(/\s*[Ss]ee\s+(more\s+)?details?\s+below\.?\s*$/, '')
+    .replace(/[.!?]+\s*$/, '')
+    .trim();
+  return `${stripped}. ${SEE_DETAILS}`;
+}
 
 async function summarizeWithHaiku(text: string, apiKey: string, prompt: string): Promise<string> {
   const client = new Anthropic({ apiKey });
@@ -238,30 +282,96 @@ function encodeWav(samples: Float32Array, sampleRate: number): Buffer {
   return buffer;
 }
 
-async function summarizeText(clean: string, settings: AppSettings): Promise<{ text: string; method: string }> {
-  const isShort = clean.length <= SUMMARY_THRESHOLD;
-  const prompt = isShort ? TTS_NATURALIZE_PROMPT : TTS_SUMMARIZE_PROMPT;
-
+async function callSummarizer(
+  text: string,
+  prompt: string,
+  settings: AppSettings,
+): Promise<{ text: string; provider: 'haiku' | 'ollama' } | null> {
   if (settings.summarizerProvider === 'haiku' && settings.anthropicApiKey) {
     try {
-      return { text: await summarizeWithHaiku(clean, settings.anthropicApiKey, prompt), method: isShort ? 'haiku-natural' : 'haiku' };
+      return { text: await summarizeWithHaiku(text, settings.anthropicApiKey, prompt), provider: 'haiku' };
     } catch (err) {
       console.warn('[TTS] Haiku failed, falling back:', err);
     }
   }
-
   if (settings.summarizerProvider === 'ollama' && settings.ollamaHost) {
     try {
-      return { text: await summarizeWithOllama(clean, settings.ollamaHost, settings.ollamaPort, prompt), method: isShort ? 'ollama-natural' : 'ollama' };
+      return { text: await summarizeWithOllama(text, settings.ollamaHost, settings.ollamaPort, prompt), provider: 'ollama' };
     } catch (err) {
       console.warn('[TTS] Ollama failed, falling back:', err);
     }
   }
+  return null;
+}
 
-  // No LLM available — short text spoken as-is, long text truncated
-  if (isShort) return { text: clean, method: 'short' };
+function basename(p: string): string {
+  return p.split(/[/\\]/).pop() || p;
+}
 
-  return { text: truncateForSpeech(clean), method: 'truncate' };
+function implementationFilePhrase(meta: TurnMeta): string {
+  const n = meta.writeFileCount;
+  const first = meta.firstWriteFile ? basename(meta.firstWriteFile) : null;
+  if (n === 1 && first) return `I updated ${first}`;
+  if (n >= 2 && first) return `I updated ${n} files, starting with ${first}`;
+  return `I updated ${n} files`;
+}
+
+async function summarizeText(clean: string, settings: AppSettings, turnMeta?: TurnMeta): Promise<{ text: string; method: string }> {
+  // Implementation report path: when the turn touched any files, template
+  // the file count deterministically. For longer responses also pull a
+  // 1-sentence "what was accomplished" headline so the audio carries some
+  // context, not just a filename. Short responses skip the LLM entirely.
+  if (turnMeta && turnMeta.writeFileCount >= 1) {
+    const filePhrase = implementationFilePhrase(turnMeta);
+    let body = filePhrase;
+    let method = 'impl-template';
+    if (clean.length > IMPL_HEADLINE_MIN_CHARS) {
+      const hl = await callSummarizer(clean, TTS_HEADLINE_PROMPT, settings);
+      if (hl && hl.text.trim()) {
+        const headline = firstSentence(postProcessSummary(hl.text));
+        // Only use the headline if it survives trimming and stays under a
+        // reasonable size (Mistral occasionally returns a verbose first
+        // sentence; in that case the pure template is better).
+        const words = countWords(headline);
+        if (words > 0 && words <= 30) {
+          body = `${headline.replace(/[.!?]+\s*$/, '')}. ${filePhrase}`;
+          method = `impl-template+${hl.provider}`;
+        }
+      }
+    }
+    return { text: withSeeDetails(body), method };
+  }
+
+  const isShort = clean.length <= SUMMARY_THRESHOLD;
+  const prompt = isShort ? TTS_NATURALIZE_PROMPT : TTS_SUMMARIZE_PROMPT;
+
+  const pass1 = await callSummarizer(clean, prompt, settings);
+
+  if (!pass1) {
+    // No LLM available — short text spoken as-is, long text truncated
+    if (isShort) return { text: clean, method: 'short' };
+    return { text: truncateForSpeech(clean), method: 'truncate' };
+  }
+
+  if (isShort) {
+    return { text: pass1.text, method: `${pass1.provider}-natural` };
+  }
+
+  // Long path: tighten with a second pass if pass 1 is still verbose,
+  // then strip any list markers the model left behind and append the
+  // "See details below." cue deterministically (never trust the model
+  // to add it consistently).
+  let body = pass1.text;
+  let method: string = pass1.provider;
+  if (countWords(body) > PASS2_WORD_LIMIT) {
+    const pass2 = await callSummarizer(body, TTS_TIGHTEN_PROMPT, settings);
+    if (pass2) {
+      body = pass2.text;
+      method = `${pass1.provider}-2pass`;
+    }
+  }
+  body = postProcessSummary(body);
+  return { text: withSeeDetails(body), method };
 }
 
 async function generateLocalAudio(spoken: string, signal?: AbortSignal): Promise<Buffer> {
@@ -312,7 +422,7 @@ async function generateRemoteAudio(spoken: string, host: string, port: string, s
   }
 }
 
-export async function generateSpeech(text: string, signal?: AbortSignal, settings?: AppSettings): Promise<Buffer> {
+export async function generateSpeech(text: string, signal?: AbortSignal, settings?: AppSettings, turnMeta?: TurnMeta): Promise<Buffer> {
   if (text.length > MAX_TEXT_LENGTH) {
     throw new Error(`Text too long (${text.length} chars, max ${MAX_TEXT_LENGTH})`);
   }
@@ -332,7 +442,7 @@ export async function generateSpeech(text: string, signal?: AbortSignal, setting
   };
   const s = settings || defaultSettings;
 
-  const { text: spoken, method } = await summarizeText(clean, s);
+  const { text: spoken, method } = await summarizeText(clean, s, turnMeta);
   const t1 = Date.now();
 
   let wav: Buffer;

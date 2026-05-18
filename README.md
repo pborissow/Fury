@@ -39,6 +39,53 @@ A prototype IDE for AI-assisted development built with Next.js and Claude Code. 
 - **Resizable panels** - All panels are drag-resizable via `react-resizable-panels`
 - **UI state persistence** - Active tab and workflow selection restored across page reloads
 
+## Voice Input & TTS Playback (Optional)
+
+Fury supports voice dictation for prompts and text-to-speech playback of Claude's responses. Both are off by default.
+
+### Dictation
+
+Microphone button in the chat editor uses the browser's Web Speech API. Spoken
+punctuation ("period", "comma", "question mark", "new paragraph", etc.) is
+converted inline. Say **"send"** to submit (5-second delay allows corrections).
+Recording auto-stops after 30 seconds of silence.
+
+- **Browsers:** Chrome or Edge (Firefox does not implement Web Speech)
+- **Locale:** hardcoded to `en-US`
+- **Privacy note:** Chrome/Edge route audio through their cloud speech service —
+  no local STT server is involved
+
+### TTS Playback
+
+Toggle in Settings. The pipeline cleans markdown out of the response, optionally
+summarizes it, then synthesizes audio with Kokoro-82M.
+
+**Synthesizer (`ttsProvider` in settings):**
+
+| Mode | Setup |
+|------|-------|
+| `local` | None — bundled `kokoro-js` runs Kokoro-82M in the Node process |
+| `remote` | Set `ttsRemoteHost` / `ttsRemotePort` to a server exposing `POST /kokoro/tts` (body `{ text }`, returns WAV) |
+
+Voice is `af_heart` (American female). Kokoro-82M v1.0 supports English only —
+no Russian or other non-bundled languages.
+
+**Summarizer (`summarizerProvider` in settings):** Optional but recommended for
+long responses.
+
+| Mode | Setup |
+|------|-------|
+| `none` | None — long responses are truncated at the first sentence after 300 chars |
+| `haiku` | Set `anthropicApiKey` — uses `claude-haiku-4-5` |
+| `ollama` | Set `ollamaHost` / `ollamaPort` — picks the largest loaded model, POSTs to `/api/chat` |
+
+The summarizer is context-aware: turns that wrote to files get a deterministic
+template ("I updated X. See details below.") and skip the LLM entirely; longer
+responses go through a two-pass tighten + list-stripping pipeline.
+
+**Source:** `lib/tts.ts`, `app/api/tts/route.ts`, `components/RichTextEditor.tsx`
+(dictation).
+
 ## Tech Stack
 
 - **Framework**: Next.js 16 (App Router, Turbopack)

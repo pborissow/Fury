@@ -19,6 +19,7 @@ import LabelEditDialog from '@/components/LabelEditDialog';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
 import { getRecentDirectories } from '@/lib/recent-directories';
 import type { Message, TranscriptMsg, HistoryEntry, PendingSession, AskUserQuestionState } from '@/lib/types';
+import type { TurnMeta } from '@/lib/transcriptParser';
 
 // Generate a UUID v4
 const generateUUID = () => {
@@ -74,7 +75,7 @@ export default function ChatTab({
 
 
   // History transcript viewer state (renders in center panel)
-  const [historyTranscript, setHistoryTranscript] = useState<{ role: 'user' | 'assistant'; content: string; timestamp: string }[]>([]);
+  const [historyTranscript, setHistoryTranscript] = useState<{ role: 'user' | 'assistant'; content: string; timestamp: string; turnMeta?: TurnMeta }[]>([]);
   const [viewingTranscriptId, setViewingTranscriptId] = useState<string | null>(null);
   const [historyTranscriptLoading, setHistoryTranscriptLoading] = useState(false);
   const [historyTranscriptProject, setHistoryTranscriptProject] = useState<string | null>(null);
@@ -262,6 +263,14 @@ export default function ChatTab({
         // can review and re-send it.
         if (data.unprocessedPrompt) {
           setTimeout(() => chatEditorRef.current?.setContent(data.unprocessedPrompt), 100);
+        }
+
+        // Replay any AskUserQuestion the CLI auto-errored in --print mode
+        // that hasn't been answered by a subsequent user prompt. Without
+        // this, navigating away from a session while AskUserQuestion was
+        // in flight loses the dialog forever.
+        if (data.pendingAskUserQuestion) {
+          setAskUserQuestion({ input: data.pendingAskUserQuestion });
         }
       }
       setHistoryTranscript(transcriptMessages);
@@ -495,23 +504,13 @@ export default function ChatTab({
           setStreamEvents(prev => [...prev, { type: 'tool_start' as const, name: tool.name, ts: Date.now() }]);
         } else if (tool.status === 'complete') {
           setStreamEvents(prev => [...prev, { type: 'tool_complete' as const, name: tool.name, input: tool.input, ts: Date.now() }]);
-          // Surface AskUserQuestion immediately AND halt the CLI. In
-          // `--print` mode the CLI auto-errors this tool with "Answer
-          // questions?" within ~150ms, and Claude reacts by streaming a
-          // fallback ("Holding for your input"), sometimes re-asking, or
-          // continuing with more tool calls. None of that should run while
-          // a modal question is on screen — kill the in-flight process so
-          // the dialog is genuinely blocking. When the user answers, the
-          // response gets sent as a fresh resume turn.
+          // Surface AskUserQuestion immediately. SessionManager fires the
+          // CLI kill on the server side when it parses the same tool_use
+          // block, so we don't need to issue the stop here — that's
+          // necessary so the kill still happens when the user is viewing
+          // a different session at the moment the tool fires.
           if (tool.name === 'AskUserQuestion' && tool.input?.questions) {
             setAskUserQuestion({ input: tool.input });
-            fetch('/api/health', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ sessionId: mySessionId, action: 'stop' }),
-            }).catch(err =>
-              console.error('Failed to stop session on AskUserQuestion:', err)
-            );
           }
         }
       } else if (data.toolResult) {
@@ -550,9 +549,9 @@ export default function ChatTab({
               // logic as TranscriptRenderer — within the last turn, the final
               // assistant message is the rendered bubble; earlier ones are intermediaries.
               if (ttsEnabledRef.current) {
-                const msgs = refreshData.messages as { role: string; content: string }[];
-                let turnBubble: { content: string } | null = null;
-                let lastTurnBubble: { content: string } | null = null;
+                const msgs = refreshData.messages as { role: string; content: string; turnMeta?: TurnMeta }[];
+                let turnBubble: { content: string; turnMeta?: TurnMeta } | null = null;
+                let lastTurnBubble: { content: string; turnMeta?: TurnMeta } | null = null;
                 for (const msg of msgs) {
                   if (msg.role === 'user') {
                     // New turn — commit previous turn's bubble
@@ -572,7 +571,7 @@ export default function ChatTab({
                   fetch('/api/tts', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ text: bubble.content }),
+                    body: JSON.stringify({ text: bubble.content, turnMeta: bubble.turnMeta }),
                     signal: abort.signal,
                   })
                     .then(res => {
@@ -1264,8 +1263,8 @@ export default function ChatTab({
                                 }
                               } else {
                                 // Replay: re-generate from last bubble (same turn logic as TranscriptRenderer)
-                                let turnBubble: { content: string } | null = null;
-                                let lastTurnBubble: { content: string } | null = null;
+                                let turnBubble: { content: string; turnMeta?: TurnMeta } | null = null;
+                                let lastTurnBubble: { content: string; turnMeta?: TurnMeta } | null = null;
                                 for (const msg of historyTranscript) {
                                   if (msg.role === 'user') {
                                     if (turnBubble) lastTurnBubble = turnBubble;
@@ -1283,7 +1282,7 @@ export default function ChatTab({
                                 fetch('/api/tts', {
                                   method: 'POST',
                                   headers: { 'Content-Type': 'application/json' },
-                                  body: JSON.stringify({ text: bubble.content }),
+                                  body: JSON.stringify({ text: bubble.content, turnMeta: bubble.turnMeta }),
                                   signal: abort.signal,
                                 })
                                   .then(res => {

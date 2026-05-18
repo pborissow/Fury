@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { generateSpeech } from '@/lib/tts';
 import { settingsPersistence } from '@/lib/settingsPersistence';
+import type { TurnMeta } from '@/lib/transcriptParser';
 
 const REQUEST_TIMEOUT_MS = 180_000;
 const MAX_TEXT_LENGTH = 50_000;
@@ -10,7 +11,7 @@ export async function POST(request: Request) {
   const timer = setTimeout(() => timeoutController.abort(), REQUEST_TIMEOUT_MS);
 
   try {
-    const { text } = await request.json();
+    const { text, turnMeta } = await request.json() as { text: string; turnMeta?: TurnMeta };
     if (!text || typeof text !== 'string') {
       return NextResponse.json({ error: 'Missing text' }, { status: 400 });
     }
@@ -19,7 +20,7 @@ export async function POST(request: Request) {
     }
 
     const settings = await settingsPersistence.loadSettings();
-    const wav = await generateSpeech(text, timeoutController.signal, settings);
+    const wav = await generateSpeech(text, timeoutController.signal, settings, turnMeta);
     return new NextResponse(new Uint8Array(wav), {
       headers: {
         'Content-Type': 'audio/wav',

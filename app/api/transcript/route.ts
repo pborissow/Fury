@@ -214,7 +214,7 @@ export async function GET(request: NextRequest) {
     }
 
     // Parse the JSONL using shared parser
-    const { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions } = parseTranscriptJsonl(content);
+    const { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion } = parseTranscriptJsonl(content);
 
     // If the session wrote a plan file, inject it at the right position
     if (planSlug && planInsertAfter != null) {
@@ -327,7 +327,7 @@ export async function GET(request: NextRequest) {
     archiveTranscript(sanitizedSessionId, project, display.substring(0, 200), content, messages, rawLines, undefined, { numCompactions })
       .catch(err => console.error('[Transcript API] Archive error:', err));
 
-    return NextResponse.json({ messages, suggestedPrompt, unprocessedPrompt, numCompactions });
+    return NextResponse.json({ messages, suggestedPrompt, unprocessedPrompt, numCompactions, pendingAskUserQuestion });
   } catch (error) {
     console.error('[Transcript API] Error:', error);
     return NextResponse.json(

@@ -5,11 +5,27 @@
  * so parsing behavior is consistent everywhere.
  */
 
+/**
+ * Per-turn tool composition, attached to the final assistant text message
+ * of each turn. Used by the TTS pipeline to pick a context-appropriate
+ * summary strategy (e.g. an implementation report can be templated from
+ * file counts rather than asking an LLM to re-derive them from prose).
+ */
+export interface TurnMeta {
+  writeFileCount: number;
+  firstWriteFile?: string;
+  totalTools: number;
+  toolCounts: Record<string, number>;
+}
+
 export interface TranscriptMessage {
   role: 'user' | 'assistant';
   content: string;
   timestamp: string;
+  turnMeta?: TurnMeta;
 }
+
+const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
 export function isInternalContent(content: string): boolean {
   const trimmed = content.trim();
@@ -39,6 +55,12 @@ export function parseTranscriptJsonl(content: string): {
   planInsertAfter: number | null;
   /** Number of context compaction events in the session */
   numCompactions: number;
+  /** Input from the most recent AskUserQuestion tool_use that has not yet
+   *  been answered by a subsequent real user prompt. The CLI auto-errors
+   *  this tool in `--print` mode, so the dialog has to be synthesized from
+   *  the JSONL — without persisting this, navigating away from a session
+   *  while AskUserQuestion is in flight drops the dialog. */
+  pendingAskUserQuestion: any | null;
 } {
   const messages: TranscriptMessage[] = [];
   const rawEntries: any[] = [];
@@ -49,6 +71,31 @@ export function parseTranscriptJsonl(content: string): {
   let planSlug: string | null = null;
   let planWriteTimestamp: string | null = null;
   let numCompactions = 0;
+
+  // Accumulate tool_use across the current turn (between real user
+  // messages). Snapshotted onto pendingAssistant.turnMeta at push time.
+  let turnToolCounts: Record<string, number> = {};
+  let turnWriteFiles = new Set<string>();
+  let turnFirstWriteFile: string | undefined;
+  let turnTotalTools = 0;
+  const resetTurnTools = () => {
+    turnToolCounts = {};
+    turnWriteFiles = new Set<string>();
+    turnFirstWriteFile = undefined;
+    turnTotalTools = 0;
+  };
+  const snapshotTurnMeta = (): TurnMeta | undefined => {
+    if (turnTotalTools === 0) return undefined;
+    return {
+      writeFileCount: turnWriteFiles.size,
+      firstWriteFile: turnFirstWriteFile,
+      totalTools: turnTotalTools,
+      toolCounts: { ...turnToolCounts },
+    };
+  };
+  // Track the latest AskUserQuestion input seen; cleared whenever a real
+  // user-turn message comes after it (which means the user already answered).
+  let pendingAskUserQuestion: any | null = null;
 
   for (const line of rawLines) {
     try {
@@ -88,6 +135,7 @@ export function parseTranscriptJsonl(content: string): {
         inInternalExchange = false;
 
         if (pendingAssistant) {
+          pendingAssistant.turnMeta = snapshotTurnMeta();
           messages.push(pendingAssistant);
           pendingAssistant = null;
         }
@@ -102,24 +150,49 @@ export function parseTranscriptJsonl(content: string): {
             continue;
           }
 
+          // A real user prompt resolves any pending AskUserQuestion.
+          pendingAskUserQuestion = null;
+
           messages.push({
             role: 'user',
             content: msg.content,
             timestamp: entry.timestamp,
           });
+          // New turn starting — drop any tool counts accumulated during
+          // the previous turn.
+          resetTurnTools();
         }
       } else if (entry.type === 'assistant') {
         if (inInternalExchange) continue;
         if (!Array.isArray(msg.content)) continue;
 
         // Detect plan file write (Write tool targeting ~/.claude/plans/)
-        if (planSlug && planWriteTimestamp === null) {
-          for (const block of msg.content) {
-            if (block.type === 'tool_use' && block.name === 'Write' &&
-                typeof block.input?.file_path === 'string' &&
-                block.input.file_path.replace(/\\/g, '/').includes('.claude/plans/')) {
-              planWriteTimestamp = entry.timestamp;
-              break;
+        // and capture the latest AskUserQuestion input. The CLI auto-errors
+        // AskUserQuestion in --print mode, so the dialog has to be replayed
+        // from the JSONL if the user wasn't viewing this session when the
+        // tool fired.
+        for (const block of msg.content) {
+          if (planSlug && planWriteTimestamp === null &&
+              block.type === 'tool_use' && block.name === 'Write' &&
+              typeof block.input?.file_path === 'string' &&
+              block.input.file_path.replace(/\\/g, '/').includes('.claude/plans/')) {
+            planWriteTimestamp = entry.timestamp;
+          }
+          if (block.type === 'tool_use' && block.name === 'AskUserQuestion' &&
+              block.input?.questions?.length) {
+            pendingAskUserQuestion = block.input;
+          }
+          // Accumulate tool composition for the current turn. Snapshotted
+          // onto the next pendingAssistant push as TurnMeta.
+          if (block.type === 'tool_use' && typeof block.name === 'string') {
+            turnToolCounts[block.name] = (turnToolCounts[block.name] || 0) + 1;
+            turnTotalTools++;
+            if (WRITE_TOOLS.has(block.name) && typeof block.input?.file_path === 'string') {
+              const fp = block.input.file_path;
+              if (!turnWriteFiles.has(fp)) {
+                turnWriteFiles.add(fp);
+                if (!turnFirstWriteFile) turnFirstWriteFile = fp;
+              }
             }
           }
         }
@@ -151,6 +224,7 @@ export function parseTranscriptJsonl(content: string): {
   }
 
   if (pendingAssistant) {
+    pendingAssistant.turnMeta = snapshotTurnMeta();
     messages.push(pendingAssistant);
   }
 
@@ -166,5 +240,5 @@ export function parseTranscriptJsonl(content: string): {
     }
   }
 
-  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions };
+  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion };
 }
