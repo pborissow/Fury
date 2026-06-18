@@ -261,12 +261,19 @@ export default function ChatTab({
   const HISTORY_PAGE_SIZE = 25;
 
   // --- fetchHistory ---
+  // A non-append refresh (the default) is fired on `history-updated` SSE,
+  // SSE reconnect, mount, and after deletes — events that arrive often while
+  // chatting. To avoid collapsing previously-loaded pages back to the first
+  // 25, ask the API for at least as many entries as we already display.
   const fetchHistory = async (opts?: { append?: boolean }) => {
     const append = opts?.append === true;
     const offset = append ? historyLengthRef.current : 0;
+    const limit = append
+      ? HISTORY_PAGE_SIZE
+      : Math.max(HISTORY_PAGE_SIZE, historyLengthRef.current);
     if (append) setIsLoadingMoreHistory(true); else setIsLoadingHistory(true);
     try {
-      const res = await fetch(`/api/history?limit=${HISTORY_PAGE_SIZE}&offset=${offset}`);
+      const res = await fetch(`/api/history?limit=${limit}&offset=${offset}`);
       if (res.ok) {
         const data = await res.json();
         const incoming: HistoryEntry[] = data.entries || [];
@@ -341,6 +348,8 @@ export default function ChatTab({
     setIsStuck(false);
     setStuckReason(undefined);
     setCurrentModel(null);
+    setSubmitStartTime(null);
+    setSubmitEndTime(null);
 
     // Restore draft for the target session (or clear)
     const savedDraft = sessionDraftsRef.current.get(sessionId) || '';
@@ -920,6 +929,8 @@ export default function ChatTab({
     setTranscriptLoading(false);
     setTranscriptPartial(false);
     setCurrentModel(null);
+    setSubmitStartTime(null);
+    setSubmitEndTime(null);
 
     // Track this as a pending session so it persists in the sidebar
     setPendingNewSessions(prev => [...prev, { sessionId: newId, project: path, title: 'New Session', createdAt: Date.now() }]);
@@ -955,6 +966,8 @@ export default function ChatTab({
     setStuckReason(undefined);
     setHistoryTranscriptLoading(false);
     setCurrentModel(null);
+    setSubmitStartTime(null);
+    setSubmitEndTime(null);
 
     // Restore draft for this pending session
     const savedDraft = sessionDraftsRef.current.get(pending.sessionId) || '';
