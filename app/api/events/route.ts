@@ -99,6 +99,12 @@ export async function GET(request: NextRequest) {
             emitLiveSessionsIfChanged();
             break;
 
+          case 'session:model':
+            if (watchSessionId && payload.sessionId === watchSessionId) {
+              send('session-model', payload);
+            }
+            break;
+
           case 'transcript:updated':
             if (watchSessionId && payload.sessionId === watchSessionId) {
               send('transcript-updated', payload);

@@ -28,6 +28,12 @@ export interface SessionHealthEvent {
   stuckReason?: string;
 }
 
+export interface SessionModelEvent {
+  type: 'session:model';
+  sessionId: string;
+  model: string;
+}
+
 export interface TranscriptUpdatedEvent {
   type: 'transcript:updated';
   sessionId: string;
@@ -50,6 +56,7 @@ export type AppEvent =
   | HistoryUpdatedEvent
   | SessionStreamEvent
   | SessionHealthEvent
+  | SessionModelEvent
   | TranscriptUpdatedEvent
   | ProviderSwitchedEvent
   | McpUpdatedEvent;

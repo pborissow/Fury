@@ -61,6 +61,9 @@ export function parseTranscriptJsonl(content: string): {
    *  the JSONL — without persisting this, navigating away from a session
    *  while AskUserQuestion is in flight drops the dialog. */
   pendingAskUserQuestion: any | null;
+  /** Model id (e.g. "claude-opus-4-7") from the most recent non-synthetic
+   *  assistant message. Null if no real assistant message was emitted. */
+  currentModel: string | null;
 } {
   const messages: TranscriptMessage[] = [];
   const rawEntries: any[] = [];
@@ -71,6 +74,7 @@ export function parseTranscriptJsonl(content: string): {
   let planSlug: string | null = null;
   let planWriteTimestamp: string | null = null;
   let numCompactions = 0;
+  let currentModel: string | null = null;
 
   // Accumulate tool_use across the current turn (between real user
   // messages). Snapshotted onto pendingAssistant.turnMeta at push time.
@@ -166,6 +170,12 @@ export function parseTranscriptJsonl(content: string): {
         if (inInternalExchange) continue;
         if (!Array.isArray(msg.content)) continue;
 
+        // Track the most recent real model id for this session — skipping
+        // synthetic messages (usage-limit notices, compaction stubs).
+        if (typeof msg.model === 'string' && msg.model && msg.model !== '<synthetic>') {
+          currentModel = msg.model;
+        }
+
         // Detect plan file write (Write tool targeting ~/.claude/plans/)
         // and capture the latest AskUserQuestion input. The CLI auto-errors
         // AskUserQuestion in --print mode, so the dialog has to be replayed
@@ -240,5 +250,5 @@ export function parseTranscriptJsonl(content: string): {
     }
   }
 
-  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion };
+  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion, currentModel };
 }

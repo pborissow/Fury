@@ -85,7 +85,9 @@ export default function ChatTab({
   const [transcriptOverlayMessages, setTranscriptOverlayMessages] = useState<Message[]>([]);
   const [transcriptStreaming, setTranscriptStreaming] = useState('');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
-  const [providerLabel, setProviderLabel] = useState<string>('');
+  const [providerSource, setProviderSource] = useState<'Anthropic' | 'Bedrock' | null>(null);
+  const [providerConfiguredModel, setProviderConfiguredModel] = useState<string | null>(null);
+  const [currentModel, setCurrentModel] = useState<string | null>(null);
   const transcriptLoadingRef = useRef(false);
   const transcriptStreamingRef = useRef('');
   const ttsEnabledRef = useRef(ttsEnabled);
@@ -153,6 +155,23 @@ export default function ChatTab({
   const scrollTranscriptToBottom = () => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
+
+  // Pretty-print a Claude model id ("claude-opus-4-7" → "Claude Opus 4.7").
+  // Returns null if the id doesn't match the expected shape so the caller
+  // can fall back to a coarser label.
+  const formatModelName = (raw: string | null): string | null => {
+    if (!raw) return null;
+    const match = raw.match(/claude-(\w+)-(\d+)-(\d+)/i);
+    if (!match) return null;
+    return `Claude ${match[1][0].toUpperCase()}${match[1].slice(1)} ${match[2]}.${match[3]}`;
+  };
+
+  // Compose the status-bar label. Prefer the per-session model (from the
+  // CLI init event or the most recent assistant turn); fall back to the
+  // ANTHROPIC_MODEL env var (set in Bedrock mode); finally fall back to
+  // a generic "Claude".
+  const modelLabel = formatModelName(currentModel) || formatModelName(providerConfiguredModel) || 'Claude';
+  const providerLabel = providerSource ? `${modelLabel} (${providerSource})` : '';
 
   // --- Ref sync effects ---
 
@@ -321,6 +340,7 @@ export default function ChatTab({
     setSuggestedPrompt(null);
     setIsStuck(false);
     setStuckReason(undefined);
+    setCurrentModel(null);
 
     // Restore draft for the target session (or clear)
     const savedDraft = sessionDraftsRef.current.get(sessionId) || '';
@@ -347,6 +367,10 @@ export default function ChatTab({
         // in flight loses the dialog forever.
         if (data.pendingAskUserQuestion) {
           setAskUserQuestion({ input: data.pendingAskUserQuestion });
+        }
+
+        if (data.currentModel) {
+          setCurrentModel(data.currentModel);
         }
       }
       setHistoryTranscript(transcriptMessages);
@@ -436,19 +460,17 @@ export default function ChatTab({
     }).catch(() => {});
     fetchHistory();
 
-    // Fetch current provider status
-    const formatProviderLabel = (data: { current: string; bedrockEnv?: Record<string, string> }) => {
-      const source = data.current === 'bedrock' ? 'Bedrock' : 'Anthropic';
-      const raw = data.bedrockEnv?.ANTHROPIC_MODEL || '';
-      const match = raw.match(/claude-(\w+)-(\d+)-(\d+)/i);
-      const model = match
-        ? `Claude ${match[1][0].toUpperCase()}${match[1].slice(1)} ${match[2]}.${match[3]}`
-        : 'Claude';
-      return `${model} (${source})`;
+    // Fetch current provider status. Source (Anthropic/Bedrock) and the
+    // configured model (if any) are tracked separately so we can override
+    // the model portion with the per-session value once we know it.
+    const applyProviderStatus = (data: { current: string; bedrockEnv?: Record<string, string> }) => {
+      setProviderSource(data.current === 'bedrock' ? 'Bedrock' : 'Anthropic');
+      setProviderConfiguredModel(data.bedrockEnv?.ANTHROPIC_MODEL || null);
     };
-    fetch('/api/provider').then(res => res.json()).then(data => {
-      setProviderLabel(formatProviderLabel(data));
-    }).catch(() => setProviderLabel(''));
+    fetch('/api/provider').then(res => res.json()).then(applyProviderStatus).catch(() => {
+      setProviderSource(null);
+      setProviderConfiguredModel(null);
+    });
 
     const es = new EventSource('/api/events');
 
@@ -462,9 +484,7 @@ export default function ChatTab({
     });
 
     es.addEventListener('provider-switched', () => {
-      fetch('/api/provider').then(res => res.json()).then(status => {
-        setProviderLabel(formatProviderLabel(status));
-      }).catch(() => {});
+      fetch('/api/provider').then(res => res.json()).then(applyProviderStatus).catch(() => {});
     });
 
     es.onerror = () => {
@@ -476,9 +496,7 @@ export default function ChatTab({
           setLiveSessionIds(new Set(data.liveSessionIds || []));
         }).catch(() => {});
         fetchHistory();
-        fetch('/api/provider').then(res => res.json()).then(status => {
-          setProviderLabel(formatProviderLabel(status));
-        }).catch(() => {});
+        fetch('/api/provider').then(res => res.json()).then(applyProviderStatus).catch(() => {});
       }
     };
 
@@ -594,6 +612,15 @@ export default function ChatTab({
       } else if (data.error) {
         setStreamEvents(prev => [...prev, { type: 'error' as const, content: data.error, ts: Date.now() }]);
       }
+    });
+
+    // The CLI tells us which model it spun up in its `system.init` line —
+    // capture it so the status bar can show the real model name even when
+    // ANTHROPIC_MODEL isn't set (the direct-Anthropic case).
+    es.addEventListener('session-model', (e: MessageEvent) => {
+      if (!shouldProcess()) return;
+      const data = JSON.parse(e.data);
+      if (data.model) setCurrentModel(data.model);
     });
 
     // Handle session:health events (replaces health polling)
@@ -892,6 +919,7 @@ export default function ChatTab({
     setStreamEvents([]);
     setTranscriptLoading(false);
     setTranscriptPartial(false);
+    setCurrentModel(null);
 
     // Track this as a pending session so it persists in the sidebar
     setPendingNewSessions(prev => [...prev, { sessionId: newId, project: path, title: 'New Session', createdAt: Date.now() }]);
@@ -926,6 +954,7 @@ export default function ChatTab({
     setIsStuck(false);
     setStuckReason(undefined);
     setHistoryTranscriptLoading(false);
+    setCurrentModel(null);
 
     // Restore draft for this pending session
     const savedDraft = sessionDraftsRef.current.get(pending.sessionId) || '';

@@ -356,6 +356,13 @@ class SessionManager {
         // Stream the output - parse JSON stream from Claude CLI
         let buffer = '';
         let lastTextBlockIndex = -1; // Track text blocks to add separation
+        let lastEmittedModel: string | null = null;
+        const emitModelIfNew = (model: string | undefined) => {
+          if (!model || model === '<synthetic>') return;
+          if (model === lastEmittedModel) return;
+          lastEmittedModel = model;
+          eventBus.emitApp({ type: 'session:model', sessionId: session.sessionId, model });
+        };
         claude.stdout.on('data', (data) => {
           // Update activity timestamp whenever we receive data
           session.lastActivity = Date.now();
@@ -413,6 +420,13 @@ class SessionManager {
                   }
                 }
 
+                // Surface the model the CLI is running with. The init event
+                // gives us the answer before any assistant content arrives,
+                // which is the earliest point we can label the session.
+                if (json.type === 'system' && json.subtype === 'init') {
+                  emitModelIfNew(json.model);
+                }
+
                 // Handle stream_event type with nested event
                 if (json.type === 'stream_event' && json.event) {
                   const event = json.event;
@@ -447,6 +461,7 @@ class SessionManager {
                 // usage-limit notices) which skip the streaming path entirely.
                 else if (json.type === 'assistant' && json.message?.content) {
                   const isSynthetic = json.message.model === '<synthetic>';
+                  if (!isSynthetic) emitModelIfNew(json.message.model);
                   for (const block of json.message.content) {
                     if (block.type === 'text' && block.text && isSynthetic) {
                       bufferText(block.text);
