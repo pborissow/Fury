@@ -95,6 +95,15 @@ export default function ChatTab({
   const [ttsPlaying, setTtsPlaying] = useState<'loading' | 'playing' | 'paused' | 'idle'>('idle');
   const activeSessionRef = useRef<string | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const lastAssistantRef = useRef<HTMLDivElement>(null);
+  const prevAssistantCountRef = useRef(0);
+  const skipNextAssistantScrollRef = useRef(true);
+
+  // Tracks the latest prompt-submission timing for the stream panel's
+  // "Elapsed Time" indicator. submitEndTime stays null until the response
+  // (or error) completes; once set, the timer freezes at the final value.
+  const [submitStartTime, setSubmitStartTime] = useState<number | null>(null);
+  const [submitEndTime, setSubmitEndTime] = useState<number | null>(null);
   const chatEditorRef = useRef<RichTextEditorHandle>(null);
   const sessionDraftsRef = useRef<Map<string, string>>(new Map());
 
@@ -196,6 +205,39 @@ export default function ChatTab({
       scrollTranscriptToBottom();
     }
   }, [transcriptStreaming]);
+
+  // Freeze the elapsed-time counter when the first stream chunk arrives —
+  // this is the "time to first chunk" measurement. Fall back to freezing
+  // on completion in case the response ends without producing any chunks
+  // (e.g. an error before streaming starts).
+  useEffect(() => {
+    if (submitStartTime == null || submitEndTime != null) return;
+    if (streamEvents.length > 0 || !transcriptLoading) {
+      setSubmitEndTime(Date.now());
+    }
+  }, [streamEvents.length, transcriptLoading, submitStartTime, submitEndTime]);
+
+  // When a new assistant response lands (post-streaming), scroll so that the
+  // start of the response is at the top of the panel — letting the user see
+  // as much of the response as possible. Skip on initial transcript loads.
+  useEffect(() => {
+    if (historyTranscriptLoading) {
+      skipNextAssistantScrollRef.current = true;
+      prevAssistantCountRef.current = 0;
+      return;
+    }
+    const assistantCount = historyTranscript.reduce(
+      (n, m) => (m.role === 'assistant' ? n + 1 : n),
+      0,
+    );
+    if (assistantCount > prevAssistantCountRef.current && !skipNextAssistantScrollRef.current) {
+      requestAnimationFrame(() => {
+        lastAssistantRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+    prevAssistantCountRef.current = assistantCount;
+    skipNextAssistantScrollRef.current = false;
+  }, [historyTranscript, historyTranscriptLoading]);
 
   const HISTORY_PAGE_SIZE = 25;
 
@@ -949,6 +991,8 @@ export default function ChatTab({
     setTranscriptStreaming('');
     setStreamEvents([]);
     setSuggestedPrompt(null);
+    setSubmitStartTime(Date.now());
+    setSubmitEndTime(null);
     setTimeout(() => scrollTranscriptToBottom(), 50);
 
     try {
@@ -1285,6 +1329,7 @@ export default function ChatTab({
                             transcriptLoading={transcriptLoading}
                             onRewindConfirm={setRewindConfirm}
                             onIntermediaryView={setIntermediaryMessages}
+                            lastAssistantRef={lastAssistantRef}
                             ttsEnabled={ttsEnabled}
                             ttsPlaying={ttsPlaying}
                             onTtsToggle={() => {
@@ -1452,7 +1497,12 @@ export default function ChatTab({
             <FileTree projectPath={historyTranscriptProject} onFileDoubleClick={handleFileDoubleClick} />
           </div>
           {rightPanelView === 'stream' && (
-            <StreamEventsPanel streamEvents={streamEvents} transcriptLoading={transcriptLoading} />
+            <StreamEventsPanel
+              streamEvents={streamEvents}
+              transcriptLoading={transcriptLoading}
+              submitStartTime={submitStartTime}
+              submitEndTime={submitEndTime}
+            />
           )}
           {rightPanelView === 'notes' && (
             <div className="flex-1 overflow-hidden p-4">

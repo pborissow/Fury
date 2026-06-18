@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useEffect } from 'react';
+import { useRef, useEffect, useState } from 'react';
 
 export type StreamEvent =
   | { type: 'tool_start'; name: string; ts: number }
@@ -12,10 +12,47 @@ export type StreamEvent =
 interface StreamEventsPanelProps {
   streamEvents: StreamEvent[];
   transcriptLoading: boolean;
+  submitStartTime: number | null;
+  submitEndTime: number | null;
 }
 
-export default function StreamEventsPanel({ streamEvents, transcriptLoading }: StreamEventsPanelProps) {
+function formatElapsed(ms: number): string {
+  if (ms < 0) ms = 0;
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  const millis = Math.floor(ms % 1000);
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}.${String(millis).padStart(3, '0')}`;
+}
+
+export default function StreamEventsPanel({
+  streamEvents,
+  transcriptLoading,
+  submitStartTime,
+  submitEndTime,
+}: StreamEventsPanelProps) {
   const streamEndRef = useRef<HTMLDivElement>(null);
+
+  // Tick the elapsed-time display while a response is in flight. Once the
+  // end time is set we render a single frozen value with no more updates.
+  const [elapsedMs, setElapsedMs] = useState(0);
+  useEffect(() => {
+    if (submitStartTime == null) {
+      setElapsedMs(0);
+      return;
+    }
+    if (submitEndTime != null) {
+      setElapsedMs(submitEndTime - submitStartTime);
+      return;
+    }
+    let raf = 0;
+    const tick = () => {
+      setElapsedMs(Date.now() - submitStartTime);
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [submitStartTime, submitEndTime]);
 
   useEffect(() => {
     streamEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -23,6 +60,11 @@ export default function StreamEventsPanel({ streamEvents, transcriptLoading }: S
 
   return (
     <div className="flex-1 overflow-y-auto font-mono text-xs">
+      {submitStartTime != null && (
+        <div className="px-3 py-2 border-b border-border/50 text-xs text-muted-foreground flex items-center gap-1">
+          <span>Elapsed Time: {formatElapsed(elapsedMs)}</span>
+        </div>
+      )}
       {streamEvents.length === 0 && !transcriptLoading && (
         <div className="flex items-center justify-center h-full text-muted-foreground">
           No stream activity. Send a message to see real-time events.

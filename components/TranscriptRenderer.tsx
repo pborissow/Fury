@@ -8,6 +8,15 @@ import ChatBubble from '@/components/ChatBubble';
 import CopyableCodeBlock from '@/components/CopyableCodeBlock';
 import type { TranscriptMsg } from '@/lib/types';
 
+const ExternalLink = ({ node: _node, ...props }: any) => (
+  <a {...props} target="_blank" rel="noopener noreferrer" />
+);
+
+const assistantMarkdownComponents = {
+  pre: CopyableCodeBlock,
+  a: ExternalLink,
+};
+
 interface TranscriptRendererProps {
   historyTranscript: TranscriptMsg[];
   transcriptOverlayMessages: { role: 'user' | 'assistant'; content: string }[];
@@ -19,6 +28,7 @@ interface TranscriptRendererProps {
   ttsPlaying?: 'loading' | 'playing' | 'paused' | 'idle';
   onTtsToggle?: () => void;
   onTtsCancel?: () => void;
+  lastAssistantRef?: React.RefObject<HTMLDivElement | null>;
 }
 
 export default function TranscriptRenderer({
@@ -32,6 +42,7 @@ export default function TranscriptRenderer({
   ttsPlaying,
   onTtsToggle,
   onTtsCancel,
+  lastAssistantRef,
 }: TranscriptRendererProps) {
   // Merge overlay messages into transcript at the correct chronological position
   const overlayAsTranscript: TranscriptMsg[] = transcriptOverlayMessages.map(m => ({
@@ -110,7 +121,7 @@ export default function TranscriptRenderer({
             </div>
           )}
           {turn.assistant && (
-            <div className="flex justify-start">
+            <div className="flex justify-start" ref={i === lastAssistantTurnIndex ? lastAssistantRef : undefined}>
               <ChatBubble
                 label="Claude"
                 className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border transition-colors"
@@ -153,7 +164,7 @@ export default function TranscriptRenderer({
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     rehypePlugins={[[rehypeHighlight, { detect: true }]]}
-                    components={{ pre: CopyableCodeBlock }}
+                    components={assistantMarkdownComponents}
                   >
                     {turn.assistant.content}
                   </ReactMarkdown>
