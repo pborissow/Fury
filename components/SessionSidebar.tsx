@@ -1,9 +1,11 @@
 'use client';
 
+import { useEffect, useLayoutEffect, useRef } from 'react';
 import { AlertTriangle, ShieldAlert, Pencil, Trash2 } from 'lucide-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import HistoryTimestamp from '@/components/HistoryTimestamp';
 import type { HistoryEntry, PendingSession } from '@/lib/types';
+import SmartPath from '@/components/SmartPath';
 
 interface SessionSidebarProps {
   pendingNewSessions: PendingSession[];
@@ -12,6 +14,9 @@ interface SessionSidebarProps {
   viewingTranscriptId: string | null;
   transcriptLoading: boolean;
   isLoadingHistory: boolean;
+  historyHasMore: boolean;
+  isLoadingMoreHistory: boolean;
+  onLoadMoreHistory: () => void;
   onSelectSession: (sessionId: string, project: string, display: string) => void;
   onRestorePending: (pending: PendingSession) => void;
   onLabelEdit: (sessionId: string, currentLabel: string) => void;
@@ -26,14 +31,44 @@ export default function SessionSidebar({
   viewingTranscriptId,
   transcriptLoading,
   isLoadingHistory,
+  historyHasMore,
+  isLoadingMoreHistory,
+  onLoadMoreHistory,
   onSelectSession,
   onRestorePending,
   onLabelEdit,
   onDeleteConfirm,
   onContextMenu,
 }: SessionSidebarProps) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Auto-fetch the next page while the list doesn't fill the viewport.
+  // Runs after layout so we can measure scrollHeight vs clientHeight.
+  useLayoutEffect(() => {
+    if (!historyHasMore || isLoadingHistory || isLoadingMoreHistory) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    if (el.scrollHeight <= el.clientHeight + 16) {
+      onLoadMoreHistory();
+    }
+  }, [history.length, historyHasMore, isLoadingHistory, isLoadingMoreHistory, onLoadMoreHistory]);
+
+  // Infinite scroll: load more when user scrolls near the bottom.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      if (!historyHasMore || isLoadingMoreHistory) return;
+      if (el.scrollHeight - el.scrollTop - el.clientHeight < 200) {
+        onLoadMoreHistory();
+      }
+    };
+    el.addEventListener('scroll', onScroll);
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [historyHasMore, isLoadingMoreHistory, onLoadMoreHistory]);
+
   return (
-    <div className="flex-1 overflow-y-auto p-2">
+    <div ref={scrollRef} className="flex-1 overflow-y-auto p-2">
       <TooltipProvider>
       {/* Pending new sessions (not yet submitted) */}
       {pendingNewSessions.map((pending) => {
@@ -58,9 +93,10 @@ export default function SessionSidebar({
                 </div>
               )}
             </div>
-            <div className="mt-1 text-xs text-muted-foreground font-mono truncate" title={pending.project}>
-              {pending.project}
-            </div>
+            <SmartPath
+              path={pending.project}
+              className="mt-1 text-xs text-muted-foreground font-mono"
+            />
           </div>
         );
       })}
@@ -161,9 +197,10 @@ export default function SessionSidebar({
                   ) : null}
                 </div>
               )}
-              <div className="mt-1 text-xs text-muted-foreground font-mono truncate" title={entry.project}>
-                {entry.project}
-              </div>
+              <SmartPath
+                path={entry.project}
+                className="mt-1 text-xs text-muted-foreground font-mono"
+              />
             </div>
           );
         });
@@ -173,6 +210,17 @@ export default function SessionSidebar({
         <div className="text-center text-muted-foreground mt-8 text-sm">
           No sessions found
         </div>
+      )}
+
+      {historyHasMore && history.length > 0 && (
+        <button
+          type="button"
+          onClick={onLoadMoreHistory}
+          disabled={isLoadingMoreHistory}
+          className="w-full mt-2 py-2 text-xs text-muted-foreground hover:text-foreground border border-border rounded hover:border-ring transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+        >
+          {isLoadingMoreHistory ? 'Loading…' : 'Load more'}
+        </button>
       )}
       </TooltipProvider>
     </div>

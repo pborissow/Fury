@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Folder, Home, ChevronRight, ChevronUp, Loader2, HardDrive, Link2 } from 'lucide-react';
 import Dialog from '@/components/Dialog';
+import { shortenPath } from '@/lib/utils';
 
 interface Directory {
   name: string;
@@ -132,9 +133,7 @@ export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectorie
               <ScrollArea className="flex-1 min-h-0">
                 <div className="space-y-1">
                   {uniqueRecentDirs.map((dir, index) => {
-                    const sep = drives.length > 0 ? '\\' : '/';
-                    const segments = dir.replace(/\\/g, '/').replace(/\/$/, '').split('/');
-                    const shortLabel = segments.slice(-2).join(sep);
+                    const shortLabel = shortenPath(dir);
                     return (
                       <button
                         key={index}

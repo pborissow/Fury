@@ -17,6 +17,11 @@ interface HistoryEntry {
 export async function GET(req: NextRequest) {
   try {
     const historyPath = join(homedir(), '.claude', 'history.jsonl');
+    const url = new URL(req.url);
+    const limitParam = Number.parseInt(url.searchParams.get('limit') || '', 10);
+    const offsetParam = Number.parseInt(url.searchParams.get('offset') || '', 10);
+    const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 200) : 25;
+    const offset = Number.isFinite(offsetParam) && offsetParam > 0 ? offsetParam : 0;
 
     try {
       const content = await readFile(historyPath, 'utf-8');
@@ -59,21 +64,20 @@ export async function GET(req: NextRequest) {
         }
       }
 
-      // Sort by timestamp (most recent first), drop sessions with no meaningful messages, and limit
-      const entries = Array.from(sessionBestEntry.entries())
+      // Sort by timestamp (most recent first), drop sessions with no meaningful messages
+      const allEntriesFlat = Array.from(sessionBestEntry.entries())
         .filter(([, entry]) => !isSkippableDisplay(entry.display))
         .map(([key, entry]) => ({
           ...entry,
           messageCount: sessionMessageCount.get(key) || 0,
         }))
-        .sort((a, b) => b.timestamp - a.timestamp)
-        .slice(0, 50);
+        .sort((a, b) => b.timestamp - a.timestamp);
 
       // Merge archived sessions from SQLite (surfaces sessions that survived
       // in the DB after Claude deleted the JSONL + history entries)
       try {
         const archivedSessions = await loadArchivedSessions();
-        const existingIds = new Set(entries.map(e => e.sessionId).filter(Boolean));
+        const existingIds = new Set(allEntriesFlat.map(e => e.sessionId).filter(Boolean));
 
         // Build a metadata lookup from archived sessions
         const metadataMap = new Map<string, Record<string, unknown>>();
@@ -84,7 +88,7 @@ export async function GET(req: NextRequest) {
         }
 
         // Enrich existing entries with metadata from the DB
-        for (const entry of entries) {
+        for (const entry of allEntriesFlat) {
           if (entry.sessionId && metadataMap.has(entry.sessionId)) {
             (entry as any).metadata = metadataMap.get(entry.sessionId);
           }
@@ -93,7 +97,7 @@ export async function GET(req: NextRequest) {
         for (const archived of archivedSessions) {
           if (existingIds.has(archived.session_id)) continue;
           if (isSkippableDisplay(archived.display)) continue;
-          entries.push({
+          allEntriesFlat.push({
             display: archived.display,
             timestamp: archived.updated_at,
             project: archived.project,
@@ -103,21 +107,24 @@ export async function GET(req: NextRequest) {
           } as any);
         }
 
-        // Re-sort after merging and re-apply limit
-        entries.sort((a, b) => b.timestamp - a.timestamp);
-        entries.splice(50);
+        // Re-sort after merging
+        allEntriesFlat.sort((a, b) => b.timestamp - a.timestamp);
       } catch (archiveErr) {
         console.error('[History] Failed to load archived sessions:', archiveErr);
       }
 
-      return new Response(JSON.stringify({ entries }), {
+      const total = allEntriesFlat.length;
+      const entries = allEntriesFlat.slice(offset, offset + limit);
+      const hasMore = offset + entries.length < total;
+
+      return new Response(JSON.stringify({ entries, hasMore, total }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
     } catch (error) {
       // If file doesn't exist or can't be read, return empty array
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return new Response(JSON.stringify({ entries: [] }), {
+        return new Response(JSON.stringify({ entries: [], hasMore: false, total: 0 }), {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         });

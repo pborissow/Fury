@@ -59,6 +59,9 @@ export default function ChatTab({
 
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [isLoadingMoreHistory, setIsLoadingMoreHistory] = useState(false);
+  const historyLengthRef = useRef(0);
   const [liveSessionIds, setLiveSessionIds] = useState<Set<string>>(new Set());
 
   // New sessions that haven't been submitted yet — persisted in the sidebar so
@@ -194,26 +197,57 @@ export default function ChatTab({
     }
   }, [transcriptStreaming]);
 
+  const HISTORY_PAGE_SIZE = 25;
+
   // --- fetchHistory ---
-  const fetchHistory = async () => {
-    setIsLoadingHistory(true);
+  const fetchHistory = async (opts?: { append?: boolean }) => {
+    const append = opts?.append === true;
+    const offset = append ? historyLengthRef.current : 0;
+    if (append) setIsLoadingMoreHistory(true); else setIsLoadingHistory(true);
     try {
-      const res = await fetch('/api/history');
+      const res = await fetch(`/api/history?limit=${HISTORY_PAGE_SIZE}&offset=${offset}`);
       if (res.ok) {
         const data = await res.json();
-        setHistory(data.entries || []);
+        const incoming: HistoryEntry[] = data.entries || [];
+        if (append) {
+          setHistory(prev => {
+            const seen = new Set(prev.map(e => e.sessionId).filter(Boolean) as string[]);
+            const merged = [...prev];
+            for (const e of incoming) {
+              if (e.sessionId && seen.has(e.sessionId)) continue;
+              merged.push(e);
+            }
+            historyLengthRef.current = merged.length;
+            return merged;
+          });
+        } else {
+          setHistory(incoming);
+          historyLengthRef.current = incoming.length;
+        }
+        setHistoryHasMore(!!data.hasMore);
       }
     } catch (error) {
       console.error('Failed to fetch history:', error);
     } finally {
-      setIsLoadingHistory(false);
+      if (append) setIsLoadingMoreHistory(false); else setIsLoadingHistory(false);
     }
   };
+
+  const loadMoreHistory = useCallback(() => {
+    fetchHistory({ append: true });
+  }, []);
 
   // Fetch history on mount
   useEffect(() => {
     fetchHistory();
   }, []);
+
+  // Keep ref in sync with history length so loadMore uses an accurate offset
+  // even when entries are added/removed outside of fetchHistory (e.g. prepend
+  // on submit, delete-session).
+  useEffect(() => {
+    historyLengthRef.current = history.length;
+  }, [history.length]);
 
   // --- fetchTranscript ---
   const fetchTranscript = async (sessionId: string, project: string, displayTitle: string) => {
@@ -881,6 +915,9 @@ export default function ChatTab({
   const handleTranscriptSend = async (userMessage: string) => {
     if (!userMessage || transcriptLoading || !viewingTranscriptId) return;
 
+    // Stop any TTS playback so the user isn't talked over by the previous turn.
+    ttsCleanup();
+
     const mySessionId = viewingTranscriptId;
     const myProject = historyTranscriptProject;
 
@@ -1175,6 +1212,9 @@ export default function ChatTab({
             viewingTranscriptId={viewingTranscriptId}
             transcriptLoading={transcriptLoading}
             isLoadingHistory={isLoadingHistory}
+            historyHasMore={historyHasMore}
+            isLoadingMoreHistory={isLoadingMoreHistory}
+            onLoadMoreHistory={loadMoreHistory}
             onSelectSession={fetchTranscript}
             onRestorePending={restorePendingSession}
             onLabelEdit={(sessionId, currentLabel) => setLabelEdit({ sessionId, currentLabel })}

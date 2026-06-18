@@ -4,6 +4,7 @@ import { liveSessionScanner } from '@/lib/liveSessionScanner';
 import { fileWatchers } from '@/lib/fileWatchers';
 import { startArchiveListener } from '@/lib/transcriptArchiver';
 import { mcpCache } from '@/lib/mcpCache';
+import { sessionManager } from '@/lib/sessionManager';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -48,11 +49,34 @@ export async function GET(request: NextRequest) {
         send('ping', { ts: Date.now() });
       }, 30_000);
 
+      // Track the latest PID-scanner output and the last merged list we
+      // sent. We re-merge whenever either source changes, and only push if
+      // the resulting list differs from what we last sent (session:health
+      // fires every few seconds while processing — skip the noise).
+      let lastScannerIds: string[] = [];
+      let lastSentKey = '';
+      const emitLiveSessionsIfChanged = () => {
+        const merged = new Set<string>(lastScannerIds);
+        try {
+          for (const id of sessionManager.getActiveSessionIds()) merged.add(id);
+        } catch { /* manager unavailable (e.g. HMR race) — fall back to scanner-only */ }
+        const ids = [...merged].sort();
+        const key = ids.join(',');
+        if (key === lastSentKey) return;
+        lastSentKey = key;
+        send('live-sessions', { liveSessionIds: ids });
+      };
+
       // Subscribe to all events and forward relevant ones
       const handler = (payload: AppEvent) => {
         switch (payload.type) {
           case 'live-sessions':
-            send('live-sessions', { liveSessionIds: payload.liveSessionIds });
+            // Merge PID-scanner output with SessionManager-managed sessions
+            // before forwarding. Without this, Fury-spawned `--resume` runs
+            // on CLI v2.1.144+ never show a Live badge (their PID file
+            // carries a per-spawn sessionId, not the conversation id).
+            lastScannerIds = payload.liveSessionIds;
+            emitLiveSessionsIfChanged();
             break;
 
           case 'history-updated':
@@ -69,6 +93,10 @@ export async function GET(request: NextRequest) {
             if (watchSessionId && payload.sessionId === watchSessionId) {
               send('session-health', payload);
             }
+            // A Fury-managed session flipping isProcessing changes the live
+            // list even when the PID scanner output is stable. Re-emit so
+            // the badge appears/disappears in real time.
+            emitLiveSessionsIfChanged();
             break;
 
           case 'transcript:updated':

@@ -590,6 +590,25 @@ class SessionManager {
     });
   }
 
+  /**
+   * Return the conversation sessionIds of every Fury-managed CLI that is
+   * currently spawned and running. Used to populate the live-sessions list
+   * for the "Live" sidebar badge: as of Claude CLI v2.1.144 the per-process
+   * PID file under `~/.claude/sessions/<pid>.json` carries a fresh spawn-
+   * specific sessionId on every `--resume`, so the PID scanner alone misses
+   * any session Fury resumed. Fury knows the canonical conversation id for
+   * each process it spawned, so we surface that authoritatively here.
+   */
+  getActiveSessionIds(): string[] {
+    const ids: string[] = [];
+    for (const [sessionId, session] of this.sessions) {
+      if (session.isProcessing && session.currentProcess) {
+        ids.push(sessionId);
+      }
+    }
+    return ids;
+  }
+
   getSessionHealth(sessionId: string): SessionHealth {
     const session = this.sessions.get(sessionId);
 
