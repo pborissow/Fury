@@ -4,9 +4,9 @@
  */
 
 import { createHash } from 'crypto';
-import { open, readFile, readdir, stat } from 'fs/promises';
+import { mkdir, open, readFile, readdir, stat, writeFile } from 'fs/promises';
 import { homedir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { getDb } from './db';
 import { eventBus } from './eventBus';
 import { parseTranscriptJsonl, type TranscriptMessage } from './transcriptParser';
@@ -80,6 +80,35 @@ export async function archiveTranscript(
     : (messages.length > 0
       ? new Date(messages[0].timestamp).getTime() || now
       : now);
+
+  // Shrink guard: refuse to overwrite the archive when the incoming JSONL has
+  // fewer messages AND its first message is NEWER than what's archived. That
+  // pattern signals catastrophic shrink (e.g. Claude CLI cleaned up the JSONL
+  // and a subsequent --session-id recreated an empty file with the same UUID),
+  // not a user-initiated rewind (which preserves the first message). In a real
+  // rewind, the surviving messages are a prefix of the archive — the first
+  // timestamp matches.
+  const archivedSnapshot = await db.execute({
+    sql: 'SELECT COUNT(*) AS cnt, MIN(timestamp) AS first_ts FROM messages WHERE session_id = ?',
+    args: [sessionId],
+  });
+  const archivedCount = (archivedSnapshot.rows[0]?.cnt as number | undefined) ?? 0;
+  const archivedFirstTs = archivedSnapshot.rows[0]?.first_ts as string | undefined;
+  if (
+    archivedCount > 0 &&
+    messages.length < archivedCount &&
+    archivedFirstTs &&
+    messages.length > 0 &&
+    messages[0].timestamp > archivedFirstTs
+  ) {
+    console.warn(
+      `[archiveTranscript] REFUSING destructive overwrite for session ${sessionId}: ` +
+      `incoming ${messages.length} msgs starting ${messages[0].timestamp}, ` +
+      `archived ${archivedCount} msgs starting ${archivedFirstTs}. ` +
+      `Looks like catastrophic shrink (JSONL recreated). Keeping archive intact.`
+    );
+    return;
+  }
 
   // Build statements: UPSERT session (with NULL hash), clear old data, then insert new data.
   // The hash is set to NULL initially so that if a later batch fails, the incomplete
@@ -179,6 +208,43 @@ export async function loadTranscript(
   const rawLines = rawResult.rows.map(row => row.content as string);
 
   return { messages, rawLines };
+}
+
+/**
+ * Restore a session JSONL on disk from the SQLite archive. Used to make
+ * "resume" actually resume after Claude CLI's 30-day cleanup deletes the
+ * original JSONL. Returns the path on success, null if the archive has
+ * nothing for this session or if writing failed.
+ *
+ * Writes the slug directory derived from `projectPath`. The caller is
+ * responsible for not clobbering an already-existing JSONL — this function
+ * checks and refuses to overwrite.
+ */
+export async function restoreJsonlFromArchive(
+  sessionId: string,
+  projectPath: string,
+): Promise<string | null> {
+  const archived = await loadTranscript(sessionId);
+  if (!archived || archived.rawLines.length === 0) return null;
+
+  const slug = projectPathToSlug(projectPath);
+  const dir = join(homedir(), '.claude', 'projects', slug);
+  const jsonlPath = join(dir, `${sessionId}.jsonl`);
+
+  try {
+    // Don't clobber an existing JSONL — caller should have checked, but be safe.
+    await stat(jsonlPath).then(
+      () => { throw new Error('JSONL already exists; refusing to overwrite'); },
+      (err: any) => { if (err.code !== 'ENOENT') throw err; },
+    );
+    await mkdir(dir, { recursive: true });
+    await writeFile(jsonlPath, archived.rawLines.join('\n') + '\n', 'utf-8');
+    console.log(`[restoreJsonlFromArchive] Wrote ${archived.rawLines.length} lines to ${jsonlPath}`);
+    return jsonlPath;
+  } catch (err) {
+    console.error('[restoreJsonlFromArchive] Failed:', err);
+    return null;
+  }
 }
 
 /**

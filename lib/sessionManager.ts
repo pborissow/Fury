@@ -7,6 +7,7 @@ import { killProcessTree } from './killProcessTree';
 import { detectUsageLimit, handleUsageLimitDetected } from './providerSwitch';
 import { scrubSessionFile } from './imageScrubber';
 import { findSessionJsonlDir } from './sessionPaths';
+import { restoreJsonlFromArchive } from './transcriptArchiver';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -207,10 +208,21 @@ class SessionManager {
     }
   }
 
-  private executeClaudeCommand(
+  private async executeClaudeCommand(
     session: SessionInfo,
     prompt: string,
   ): Promise<void> {
+    // Preamble: if the JSONL is missing but we have the conversation archived,
+    // restore it before spawning Claude CLI so --resume gets a real history
+    // instead of silently degrading into a fresh session w/ recycled UUID.
+    const preCwd = session.projectPath || process.cwd();
+    if (!findSessionJsonlDir(session.sessionId, preCwd)) {
+      const restoredPath = await restoreJsonlFromArchive(session.sessionId, preCwd);
+      if (restoredPath) {
+        console.log(`[SessionManager] Restored JSONL from archive: ${restoredPath}`);
+      }
+    }
+
     return new Promise((resolve, reject) => {
       const buf = session.streamBuffer;
 
@@ -237,6 +249,9 @@ class SessionManager {
         // Determine whether to create a new session or resume an existing one.
         // --session-id creates a new session (fails if JSONL already exists).
         // --resume continues an existing session (fails if JSONL doesn't exist).
+        // The async preamble above this Promise has already restored a JSONL
+        // from the SQLite archive if one was missing — so by the time we reach
+        // here, findSessionJsonlDir reflects post-restore state.
         let cwd = session.projectPath || process.cwd();
         const jsonlLocation = findSessionJsonlDir(session.sessionId, cwd);
         const isExistingSession = jsonlLocation !== null;
