@@ -6,7 +6,7 @@
 import { createHash } from 'crypto';
 import { mkdir, open, readFile, readdir, stat, writeFile } from 'fs/promises';
 import { homedir } from 'os';
-import { dirname, join } from 'path';
+import { join } from 'path';
 import { getDb } from './db';
 import { eventBus } from './eventBus';
 import { parseTranscriptJsonl, type TranscriptMessage } from './transcriptParser';
@@ -82,12 +82,14 @@ export async function archiveTranscript(
       : now);
 
   // Shrink guard: refuse to overwrite the archive when the incoming JSONL has
-  // fewer messages AND its first message is NEWER than what's archived. That
-  // pattern signals catastrophic shrink (e.g. Claude CLI cleaned up the JSONL
-  // and a subsequent --session-id recreated an empty file with the same UUID),
-  // not a user-initiated rewind (which preserves the first message). In a real
-  // rewind, the surviving messages are a prefix of the archive — the first
-  // timestamp matches.
+  // fewer messages than what's archived AND the shrink looks catastrophic
+  // rather than a user-initiated rewind. Two destructive patterns:
+  //   - Empty incoming (0 messages) over a non-empty archive: Claude CLI
+  //     cleaned up the JSONL and a subsequent resume recreated an empty file.
+  //   - Smaller incoming whose first message is NEWER than what's archived:
+  //     the original head was lost (not a prefix).
+  // A real rewind preserves the first message, so the surviving messages are a
+  // prefix of the archive and the first timestamp matches — that is allowed.
   const archivedSnapshot = await db.execute({
     sql: 'SELECT COUNT(*) AS cnt, MIN(timestamp) AS first_ts FROM messages WHERE session_id = ?',
     args: [sessionId],
@@ -97,13 +99,15 @@ export async function archiveTranscript(
   if (
     archivedCount > 0 &&
     messages.length < archivedCount &&
-    archivedFirstTs &&
-    messages.length > 0 &&
-    messages[0].timestamp > archivedFirstTs
+    (
+      messages.length === 0 ||
+      (archivedFirstTs && messages[0].timestamp > archivedFirstTs)
+    )
   ) {
     console.warn(
       `[archiveTranscript] REFUSING destructive overwrite for session ${sessionId}: ` +
-      `incoming ${messages.length} msgs starting ${messages[0].timestamp}, ` +
+      `incoming ${messages.length} msgs` +
+      (messages.length > 0 ? ` starting ${messages[0].timestamp}` : ' (empty)') + `, ` +
       `archived ${archivedCount} msgs starting ${archivedFirstTs}. ` +
       `Looks like catastrophic shrink (JSONL recreated). Keeping archive intact.`
     );
