@@ -1,14 +1,13 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { Loader2, XIcon, GitCompareArrows } from 'lucide-react';
-import * as DialogPrimitive from '@radix-ui/react-dialog';
-import { Resizable } from 're-resizable';
+import { Loader2, GitCompareArrows } from 'lucide-react';
 import hljs from 'highlight.js';
 import { diffLines } from 'diff';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
+import Dialog from '@/components/Dialog';
 
 // File extensions that should open in the code viewer
 const CODE_EXTENSIONS = new Set([
@@ -276,14 +275,19 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
   const [showDiff, setShowDiff] = useState(false);
   const [mdView, setMdView] = useState<'preview' | 'raw'>('preview');
   const [loading, setLoading] = useState(false);
+  // Render the loading spinner only when the fetch is slow enough that the
+  // user would otherwise see a blank dialog body. Fast local reads finish
+  // before this flips to true, so the content just snaps in.
+  const [showSpinner, setShowSpinner] = useState(false);
+  const spinnerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [error, setError] = useState<string | null>(null);
   const codeRef = useRef<HTMLPreElement>(null);
 
-  // Persisted size & position
-  const [size, setSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
-  const [position, setPosition] = useState({ x: 0, y: 0 });
+  // Persisted size — loaded once, then passed as Dialog defaults. The
+  // dialog manages its own size/position state internally; we only get
+  // notified on resize/move-end to persist the new values.
+  const [persistedSize, setPersistedSize] = useState({ width: DEFAULT_WIDTH, height: DEFAULT_HEIGHT });
   const [prefsLoaded, setPrefsLoaded] = useState(false);
-  const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
   const savePrefTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fileName = filePath ? filePath.replace(/\\/g, '/').split('/').pop() || '' : '';
@@ -295,8 +299,7 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
         const res = await fetch('/api/ui-state');
         if (res.ok) {
           const { state } = await res.json();
-          if (state?.codeViewerSize) setSize(state.codeViewerSize);
-          if (state?.codeViewerPosition) setPosition(state.codeViewerPosition);
+          if (state?.codeViewerSize) setPersistedSize(state.codeViewerSize);
         }
       } catch { /* ignore */ }
       setPrefsLoaded(true);
@@ -342,6 +345,9 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
       setContent(null);
       setOriginalContent(null);
       setHasOriginal(false);
+      setShowSpinner(false);
+      if (spinnerTimerRef.current) clearTimeout(spinnerTimerRef.current);
+      spinnerTimerRef.current = setTimeout(() => setShowSpinner(true), 500);
 
       try {
         // Fetch current and original in parallel
@@ -371,10 +377,22 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
         setError(err instanceof Error ? err.message : 'Failed to load file');
       } finally {
         setLoading(false);
+        if (spinnerTimerRef.current) {
+          clearTimeout(spinnerTimerRef.current);
+          spinnerTimerRef.current = null;
+        }
+        setShowSpinner(false);
       }
     };
 
     fetchFile();
+
+    return () => {
+      if (spinnerTimerRef.current) {
+        clearTimeout(spinnerTimerRef.current);
+        spinnerTimerRef.current = null;
+      }
+    };
   }, [filePath]);
 
   // Highlight content using the programmatic API
@@ -389,230 +407,160 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
     return buildDiffRows(originalContent, content, fileName);
   }, [showDiff, originalContent, content, fileName]);
 
-  // Drag handlers
-  const handleDragStart = useCallback((e: React.PointerEvent) => {
-    if ((e.target as HTMLElement).closest('button')) return;
-
-    e.preventDefault();
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    dragRef.current = {
-      startX: e.clientX,
-      startY: e.clientY,
-      originX: position.x,
-      originY: position.y,
-    };
-  }, [position]);
-
-  const handleDragMove = useCallback((e: React.PointerEvent) => {
-    if (!dragRef.current) return;
-    e.preventDefault();
-    const dx = e.clientX - dragRef.current.startX;
-    const dy = e.clientY - dragRef.current.startY;
-    setPosition({
-      x: dragRef.current.originX + dx,
-      y: dragRef.current.originY + dy,
-    });
-  }, []);
-
-  const handleDragEnd = useCallback(() => {
-    if (dragRef.current) {
-      dragRef.current = null;
-      setPosition(pos => {
-        saveDialogPrefs({ codeViewerPosition: pos });
-        return pos;
-      });
-    }
+  const handleResizeEnd = useCallback((s: { width: number; height: number }) => {
+    setPersistedSize(s);
+    saveDialogPrefs({ codeViewerSize: s });
   }, [saveDialogPrefs]);
 
   const lines = content?.split('\n') || [];
 
+  const title = (
+    <span className="font-mono">
+      {fileName}
+      <span className="text-muted-foreground font-normal ml-3 text-xs">
+        {filePath}
+      </span>
+    </span>
+  );
+
+  const headerActions = hasOriginal ? (
+    <button
+      onClick={() => setShowDiff(!showDiff)}
+      disabled={isMd && mdView === 'preview' && !showDiff}
+      className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
+        showDiff
+          ? 'bg-primary text-primary-foreground'
+          : isMd && mdView === 'preview'
+            ? 'bg-muted text-muted-foreground/40 cursor-not-allowed'
+            : 'bg-muted text-muted-foreground hover:text-foreground'
+      }`}
+      title={isMd && mdView === 'preview' && !showDiff ? 'Switch to Source tab to use diff view' : 'Toggle diff view'}
+    >
+      <GitCompareArrows className="h-3.5 w-3.5" />
+      Diff
+    </button>
+  ) : undefined;
+
+  // Wait until persisted prefs are loaded so the Dialog mounts at the
+  // correct initial size instead of flashing the hard-coded default.
+  if (filePath === null || !prefsLoaded) return null;
+
   return (
-    <DialogPrimitive.Root open={filePath !== null} onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" />
-        <DialogPrimitive.Content
-          className="fixed z-50 focus:outline-none"
-          style={{
-            top: '50%',
-            left: '50%',
-            transform: `translate(calc(-50% + ${position.x}px), calc(-50% + ${position.y}px))`,
-          }}
-          onOpenAutoFocus={(e) => e.preventDefault()}
-        >
-          <Resizable
-            size={size}
-            onResizeStop={(_e, _dir, _ref, delta) => {
-              const newSize = { width: size.width + delta.width, height: size.height + delta.height };
-              setSize(newSize);
-              saveDialogPrefs({ codeViewerSize: newSize });
-            }}
-            minWidth={MIN_WIDTH}
-            minHeight={MIN_HEIGHT}
-            maxWidth="95vw"
-            maxHeight="95vh"
-            className="bg-card rounded-lg border flex flex-col overflow-hidden"
-            style={{ boxShadow: '0 8px 40px rgba(0, 0, 0, 0.8), 0 2px 12px rgba(0, 0, 0, 0.6)' }}
-            handleStyles={{
-              right: { cursor: 'ew-resize' },
-              bottom: { cursor: 'ns-resize' },
-              bottomRight: { cursor: 'nwse-resize' },
-            }}
-            enable={{
-              top: false,
-              topRight: false,
-              topLeft: false,
-              left: false,
-              right: true,
-              bottom: true,
-              bottomRight: true,
-              bottomLeft: false,
-            }}
+    <Dialog
+      open
+      onOpenChange={(o) => { if (!o) onClose(); }}
+      title={title}
+      headerActions={headerActions}
+      defaultWidth={persistedSize.width}
+      defaultHeight={persistedSize.height}
+      minWidth={MIN_WIDTH}
+      minHeight={MIN_HEIGHT}
+      resetOnOpen={false}
+      onResizeEnd={handleResizeEnd}
+      noPadding
+    >
+      {/* Markdown view tabs */}
+      {isMd && !showDiff && (
+        <div className="border-b border-border px-4 flex items-center gap-6 shrink-0" style={{ backgroundColor: '#1e1e1e' }}>
+          <button
+            onClick={() => setMdView('preview')}
+            className={`
+              relative py-2 text-sm font-medium transition-colors
+              ${mdView === 'preview'
+                ? 'text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+              }
+            `}
           >
-            {/* Draggable header */}
-            <div
-              className="flex items-center gap-2 px-4 py-3 border-b border-border shrink-0 cursor-grab active:cursor-grabbing select-none"
-              style={{ backgroundColor: '#313131' }}
-              onPointerDown={handleDragStart}
-              onPointerMove={handleDragMove}
-              onPointerUp={handleDragEnd}
-            >
-              <DialogPrimitive.Title className="font-mono text-sm font-semibold truncate flex-1">
-                {fileName}
-                <span className="text-muted-foreground font-normal ml-3 text-xs">
-                  {filePath}
-                </span>
-              </DialogPrimitive.Title>
-
-              {/* Diff toggle — hidden when no VCS changes, disabled during markdown preview */}
-              {hasOriginal && (
-                <button
-                  onClick={() => setShowDiff(!showDiff)}
-                  disabled={isMd && mdView === 'preview' && !showDiff}
-                  className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-colors ${
-                    showDiff
-                      ? 'bg-primary text-primary-foreground'
-                      : isMd && mdView === 'preview'
-                        ? 'bg-muted text-muted-foreground/40 cursor-not-allowed'
-                        : 'bg-muted text-muted-foreground hover:text-foreground'
-                  }`}
-                  title={isMd && mdView === 'preview' && !showDiff ? 'Switch to Source tab to use diff view' : 'Toggle diff view'}
-                >
-                  <GitCompareArrows className="h-3.5 w-3.5" />
-                  Diff
-                </button>
-              )}
-
-              <DialogPrimitive.Close className="ring-offset-background focus:ring-ring rounded-xs opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4">
-                <XIcon />
-                <span className="sr-only">Close</span>
-              </DialogPrimitive.Close>
-            </div>
-
-            {/* Markdown view tabs */}
-            {isMd && !showDiff && (
-              <div className="border-b border-border px-4 flex items-center gap-6 shrink-0" style={{ backgroundColor: '#1e1e1e' }}>
-                <button
-                  onClick={() => setMdView('preview')}
-                  className={`
-                    relative py-2 text-sm font-medium transition-colors
-                    ${mdView === 'preview'
-                      ? 'text-foreground'
-                      : 'text-muted-foreground hover:text-foreground'
-                    }
-                  `}
-                >
-                  Preview
-                  {mdView === 'preview' && (
-                    <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
-                  )}
-                </button>
-                <button
-                  onClick={() => setMdView('raw')}
-                  className={`
-                    relative py-2 text-sm font-medium transition-colors
-                    ${mdView === 'raw'
-                      ? 'text-foreground'
-                      : 'text-muted-foreground hover:text-foreground'
-                    }
-                  `}
-                >
-                  Source
-                  {mdView === 'raw' && (
-                    <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
-                  )}
-                </button>
-              </div>
+            Preview
+            {mdView === 'preview' && (
+              <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
             )}
+          </button>
+          <button
+            onClick={() => setMdView('raw')}
+            className={`
+              relative py-2 text-sm font-medium transition-colors
+              ${mdView === 'raw'
+                ? 'text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+              }
+            `}
+          >
+            Source
+            {mdView === 'raw' && (
+              <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
+            )}
+          </button>
+        </div>
+      )}
 
-            {/* Content area */}
-            <div className="flex-1 overflow-auto min-h-0">
-              {loading && (
-                <div className="flex items-center justify-center h-full gap-2 text-muted-foreground">
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                  <span>Loading file...</span>
-                </div>
-              )}
+      {/* Content area */}
+      <div className="flex-1 overflow-auto min-h-0">
+        {showSpinner && (
+          <div className="flex items-center justify-center h-full gap-2 text-muted-foreground">
+            <Loader2 className="h-5 w-5 animate-spin" />
+            <span>Loading file...</span>
+          </div>
+        )}
 
-              {error && (
-                <div className="flex items-center justify-center h-full text-destructive text-sm p-4">
-                  {error}
-                </div>
-              )}
+        {error && (
+          <div className="flex items-center justify-center h-full text-destructive text-sm p-4">
+            {error}
+          </div>
+        )}
 
-              {content !== null && !loading && !showDiff && isMd && mdView === 'preview' && (
-                <div className="p-6 prose-chat text-foreground max-w-none overflow-auto h-full" style={{ backgroundColor: '#1b1b1b' }}>
-                  <ReactMarkdown
-                    remarkPlugins={[remarkGfm]}
-                    rehypePlugins={[rehypeHighlight]}
-                    components={{
-                      code({ className, children, ...props }) {
-                        // rehype-highlight adds hljs + language-* classes to fenced blocks.
-                        // Ensure the hljs class is always present so the theme applies.
-                        const hasHljs = className?.includes('hljs');
-                        const cls = hasHljs ? className : `hljs ${className || ''}`.trim();
-                        return <code className={cls} {...props}>{children}</code>;
-                      },
-                    }}
-                  >
-                    {content}
-                  </ReactMarkdown>
-                </div>
-              )}
+        {content !== null && !loading && !showDiff && isMd && mdView === 'preview' && (
+          <div className="p-6 prose-chat text-foreground max-w-none overflow-auto h-full" style={{ backgroundColor: '#1b1b1b' }}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
+              rehypePlugins={[rehypeHighlight]}
+              components={{
+                code({ className, children, ...props }) {
+                  // rehype-highlight adds hljs + language-* classes to fenced blocks.
+                  // Ensure the hljs class is always present so the theme applies.
+                  const hasHljs = className?.includes('hljs');
+                  const cls = hasHljs ? className : `hljs ${className || ''}`.trim();
+                  return <code className={cls} {...props}>{children}</code>;
+                },
+              }}
+            >
+              {content}
+            </ReactMarkdown>
+          </div>
+        )}
 
-              {content !== null && !loading && !showDiff && (!isMd || mdView === 'raw') && (
-                <div className="flex text-sm font-mono">
-                  {/* Line numbers */}
-                  <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0" style={{ backgroundColor: '#0d1117' }}>
-                    {lines.map((_, i) => (
-                      <div key={i} className="leading-6">{i + 1}</div>
-                    ))}
-                  </div>
-
-                  {/* Code content */}
-                  <div className="flex-1 overflow-x-auto">
-                    <pre
-                      ref={codeRef}
-                      className="hljs p-4 m-0 bg-transparent leading-6"
-                      dangerouslySetInnerHTML={{ __html: highlightedHtml }}
-                    />
-                  </div>
-                </div>
-              )}
-
-              {content !== null && !loading && showDiff && diffResult && (
-                diffResult.tooLarge ? (
-                  <div className="flex items-center justify-center h-full text-muted-foreground text-sm p-4">
-                    Too many changes to display in diff view
-                  </div>
-                ) : (
-                  <DiffView rows={diffResult.rows} />
-                )
-              )}
+        {content !== null && !loading && !showDiff && (!isMd || mdView === 'raw') && (
+          <div className="flex text-sm font-mono">
+            {/* Line numbers */}
+            <div className="select-none shrink-0 py-4 pl-4 pr-3 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0" style={{ backgroundColor: '#0d1117' }}>
+              {lines.map((_, i) => (
+                <div key={i} className="leading-6">{i + 1}</div>
+              ))}
             </div>
-          </Resizable>
-        </DialogPrimitive.Content>
-      </DialogPrimitive.Portal>
-    </DialogPrimitive.Root>
+
+            {/* Code content */}
+            <div className="flex-1 overflow-x-auto">
+              <pre
+                ref={codeRef}
+                className="hljs p-4 m-0 bg-transparent leading-6"
+                dangerouslySetInnerHTML={{ __html: highlightedHtml }}
+              />
+            </div>
+          </div>
+        )}
+
+        {content !== null && !loading && showDiff && diffResult && (
+          diffResult.tooLarge ? (
+            <div className="flex items-center justify-center h-full text-muted-foreground text-sm p-4">
+              Too many changes to display in diff view
+            </div>
+          ) : (
+            <DiffView rows={diffResult.rows} />
+          )
+        )}
+      </div>
+    </Dialog>
   );
 });
 

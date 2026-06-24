@@ -421,10 +421,17 @@ export default function ChatTab({
             setTranscriptStreaming(bufData.accumulatedText || '');
             setStreamEvents(bufData.events || []);
             setTranscriptLoading(true);
+            // Restore the elapsed-time counter from the buffer so it survives
+            // navigating away and back. submitEndTime mirrors the live freeze
+            // semantics ("time to first chunk"): frozen at the first buffered
+            // event if one exists, still ticking (null) otherwise.
+            setSubmitStartTime(bufData.startedAt ?? null);
+            setSubmitEndTime(bufData.events?.[0]?.ts ?? null);
             detectedProcessing = true;
           } else if (bufData.isProcessing) {
             // Session is processing but buffer is inactive or missing.
             setTranscriptLoading(true);
+            if (bufData.startedAt) setSubmitStartTime(bufData.startedAt);
             detectedProcessing = true;
           }
         }

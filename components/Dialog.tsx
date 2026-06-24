@@ -37,6 +37,13 @@ interface DialogProps {
   resizable?: boolean;
   /** Remove default padding from content area (default false) */
   noPadding?: boolean;
+  /** Reset position & size to defaults each time the dialog opens (default true).
+   *  Set to false for dialogs that persist user-resized geometry. */
+  resetOnOpen?: boolean;
+  /** Fires after the user finishes resizing — use to persist the new size. */
+  onResizeEnd?: (size: { width: number; height: number }) => void;
+  /** Fires after the user finishes dragging — use to persist the new position. */
+  onMoveEnd?: (position: { x: number; y: number }) => void;
 }
 
 export default function Dialog({
@@ -52,19 +59,22 @@ export default function Dialog({
   minHeight = 200,
   resizable = true,
   noPadding = false,
+  resetOnOpen = true,
+  onResizeEnd,
+  onMoveEnd,
 }: DialogProps) {
   const [size, setSize] = useState({ width: defaultWidth, height: defaultHeight });
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
 
-  // Reset position when dialog opens
+  // Reset position when dialog opens, unless the consumer manages persistence.
   const handleOpenChange = useCallback((nextOpen: boolean) => {
-    if (nextOpen) {
+    if (nextOpen && resetOnOpen) {
       setPosition({ x: 0, y: 0 });
       setSize({ width: defaultWidth, height: defaultHeight });
     }
     onOpenChange(nextOpen);
-  }, [onOpenChange, defaultWidth, defaultHeight]);
+  }, [onOpenChange, defaultWidth, defaultHeight, resetOnOpen]);
 
   const handleDragStart = useCallback((e: React.PointerEvent) => {
     if ((e.target as HTMLElement).closest('button')) return;
@@ -88,8 +98,13 @@ export default function Dialog({
   }, []);
 
   const handleDragEnd = useCallback(() => {
-    dragRef.current = null;
-  }, []);
+    if (dragRef.current) {
+      dragRef.current = null;
+      if (onMoveEnd) {
+        setPosition(pos => { onMoveEnd(pos); return pos; });
+      }
+    }
+  }, [onMoveEnd]);
 
   // --- Resize ---
   const resizeRef = useRef<{
@@ -123,8 +138,14 @@ export default function Dialog({
     if (dir.includes('s')) newH = startH + dy;
     else if (dir.includes('n')) newH = startH - dy;
 
-    newW = Math.max(minWidth, newW);
-    newH = Math.max(minHeight, newH);
+    // Clamp both ends. The maximum mirrors the CSS max-w/h on the panel
+    // (95vw/95vh) so the underlying size state can't drift past what's
+    // actually rendered — otherwise dragging beyond the viewport
+    // accumulates "phantom" size that pops on the next resize.
+    const maxW = typeof window !== 'undefined' ? window.innerWidth * 0.95 : Infinity;
+    const maxH = typeof window !== 'undefined' ? window.innerHeight * 0.95 : Infinity;
+    newW = Math.min(maxW, Math.max(minWidth, newW));
+    newH = Math.min(maxH, Math.max(minHeight, newH));
 
     // Compensate for center-based positioning so the opposite edge stays fixed
     const dw = newW - startW;
@@ -140,8 +161,14 @@ export default function Dialog({
   }, [minWidth, minHeight]);
 
   const handleResizeEnd = useCallback(() => {
-    resizeRef.current = null;
-  }, []);
+    if (resizeRef.current) {
+      resizeRef.current = null;
+      if (onResizeEnd || onMoveEnd) {
+        setSize(s => { onResizeEnd?.(s); return s; });
+        setPosition(p => { onMoveEnd?.(p); return p; });
+      }
+    }
+  }, [onResizeEnd, onMoveEnd]);
 
   const HANDLE = 6;
   const resizeHandles: { dir: ResizeDir; cursor: string; style: React.CSSProperties }[] = resizable ? [
@@ -158,7 +185,7 @@ export default function Dialog({
   return (
     <DialogPrimitive.Root open={open} onOpenChange={handleOpenChange}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" onClick={(e) => e.stopPropagation()} />
+        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50" onClick={(e) => e.stopPropagation()} />
         <DialogPrimitive.Content
           className="fixed z-50 focus:outline-none"
           style={{
