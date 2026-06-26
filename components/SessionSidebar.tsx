@@ -6,11 +6,15 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import HistoryTimestamp from '@/components/HistoryTimestamp';
 import type { HistoryEntry, PendingSession } from '@/lib/types';
 import SmartPath from '@/components/SmartPath';
+import FreshnessLeaf from '@/components/FreshnessLeaf';
 
 interface SessionSidebarProps {
   pendingNewSessions: PendingSession[];
   history: HistoryEntry[];
   liveSessionIds: Set<string>;
+  /** Per-session epoch-ms of the last turn completion, used to anchor the
+   *  prompt-cache freshness leaf. Falls back to the entry timestamp. */
+  sessionActivity: Record<string, number>;
   viewingTranscriptId: string | null;
   transcriptLoading: boolean;
   isLoadingHistory: boolean;
@@ -28,6 +32,7 @@ export default function SessionSidebar({
   pendingNewSessions,
   history,
   liveSessionIds,
+  sessionActivity,
   viewingTranscriptId,
   transcriptLoading,
   isLoadingHistory,
@@ -154,7 +159,15 @@ export default function SessionSidebar({
                 </div>
               )}
               <div className="flex justify-between items-start mb-1">
-                <HistoryTimestamp timestamp={entry.timestamp} />
+                <div className="flex items-center gap-1.5">
+                  <HistoryTimestamp timestamp={entry.timestamp} />
+                  {entry.sessionId && (
+                    <FreshnessLeaf
+                      lastActiveAt={sessionActivity[entry.sessionId] ?? entry.timestamp}
+                      live={isLive}
+                    />
+                  )}
+                </div>
                 <div className="flex items-center gap-1.5">
                   {isViewing && transcriptLoading && (
                     <div className="flex items-center gap-0.5">

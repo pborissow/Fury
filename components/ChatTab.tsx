@@ -63,6 +63,10 @@ export default function ChatTab({
   const [isLoadingMoreHistory, setIsLoadingMoreHistory] = useState(false);
   const historyLengthRef = useRef(0);
   const [liveSessionIds, setLiveSessionIds] = useState<Set<string>>(new Set());
+  // Per-session epoch-ms of the last turn completion. Anchors the prompt-cache
+  // freshness leaf in the sidebar — stamped when a viewed session stops
+  // processing. Sessions without an entry fall back to their history timestamp.
+  const [sessionActivity, setSessionActivity] = useState<Record<string, number>>({});
 
   // New sessions that haven't been submitted yet — persisted in the sidebar so
   // the user can switch away and come back without losing them.
@@ -235,6 +239,18 @@ export default function ChatTab({
       setSubmitEndTime(Date.now());
     }
   }, [streamEvents.length, transcriptLoading, submitStartTime, submitEndTime]);
+
+  // Open the prompt-cache freshness window when the response starts streaming.
+  // submitEndTime freezes at the first chunk (and is restored from the stream
+  // buffer on navigation), which is the point the turn's prompt has been
+  // processed and cached — so that's when the 5-min TTL countdown should begin.
+  // Turn completion and stop re-anchor it later (see session-health handler and
+  // handleTranscriptStop).
+  useEffect(() => {
+    if (submitEndTime != null && viewingTranscriptId) {
+      setSessionActivity(prev => ({ ...prev, [viewingTranscriptId]: submitEndTime }));
+    }
+  }, [submitEndTime, viewingTranscriptId]);
 
   // When a new assistant response lands (post-streaming), scroll so that the
   // start of the response is at the top of the panel — letting the user see
@@ -656,6 +672,10 @@ export default function ChatTab({
       if (!data.isProcessing && transcriptLoadingRef.current) {
         setTranscriptLoading(false);
         setTranscriptStreaming('');
+        // Stamp the turn-completion time so the sidebar's freshness leaf
+        // counts the 5-min prompt-cache TTL from now (when the cache was
+        // last refreshed) rather than the turn's start.
+        setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
         fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
           .then(res => res.json())
           .then(refreshData => {
@@ -1182,6 +1202,11 @@ export default function ChatTab({
     } catch (error) {
       console.error('[App] Failed to stop session:', error);
     } finally {
+      // Stopping kills the CLI, but everything generated up to this point was
+      // cached — re-anchor the freshness window from now. (We clear
+      // transcriptLoading here optimistically, so the session-health "just
+      // ended" stamp won't fire; do it explicitly.)
+      setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
       if (activeSessionRef.current === mySessionId) {
         setTranscriptLoading(false);
         setTranscriptStreaming('');
@@ -1302,6 +1327,7 @@ export default function ChatTab({
             pendingNewSessions={pendingNewSessions}
             history={history}
             liveSessionIds={liveSessionIds}
+            sessionActivity={sessionActivity}
             viewingTranscriptId={viewingTranscriptId}
             transcriptLoading={transcriptLoading}
             isLoadingHistory={isLoadingHistory}
