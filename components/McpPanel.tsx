@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useCallback, useEffect, useMemo } from 'react';
-import { Plus, RotateCcw, Check, AlertTriangle, Terminal, Globe, ChevronRight, FileText, Pencil, Trash2, FolderOpen, Search, X, Eye } from 'lucide-react';
+import { Plus, RotateCcw, Check, AlertTriangle, Terminal, Globe, ChevronRight, FileText, Pencil, Trash2, FolderOpen, Search, X, Eye, Clock } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import Dialog, { ConfirmDialog } from '@/components/Dialog';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
@@ -519,13 +519,15 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
                 </div>
                 <div className="flex items-center gap-2">
                   {server.status === 'connected' ? (
-                    <Check className="h-4 w-4 text-green-500 flex-shrink-0" />
+                    <span title={server.statusDetail}><Check className="h-4 w-4 text-green-500 flex-shrink-0" /></span>
                   ) : server.status === 'needs_auth' ? (
-                    <AlertTriangle className="h-4 w-4 text-yellow-500 flex-shrink-0" />
+                    <span title={server.statusDetail}><AlertTriangle className="h-4 w-4 text-yellow-500 flex-shrink-0" /></span>
+                  ) : server.status === 'pending' ? (
+                    <span title={server.statusDetail}><Clock className="h-4 w-4 text-orange-400 flex-shrink-0" /></span>
                   ) : server.status === 'error' ? (
-                    <AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" />
+                    <span title={server.statusDetail}><AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" /></span>
                   ) : (
-                    <span className="h-4 w-4 flex items-center justify-center text-muted-foreground flex-shrink-0">?</span>
+                    <span className="h-4 w-4 flex items-center justify-center text-muted-foreground flex-shrink-0" title={server.statusDetail}>?</span>
                   )}
                   <span className="text-sm font-medium text-foreground truncate">{server.name}</span>
                 </div>

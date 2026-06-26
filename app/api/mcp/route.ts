@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { readFile } from 'fs/promises';
+import { readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { mcpCache, projectKeyCandidates } from '@/lib/mcpCache';
@@ -24,6 +24,35 @@ function parseEnvLines(raw: string | undefined): Record<string, string> {
 function stableEnvKey(env: Record<string, string> | undefined): string {
   const keys = Object.keys(env || {}).sort();
   return JSON.stringify(keys.map(k => [k, env![k]]));
+}
+
+async function autoApproveProjectServer(projectPath: string, serverName: string): Promise<void> {
+  const cfgPath = join(homedir(), '.claude.json');
+  try {
+    const raw = await readFile(cfgPath, 'utf-8');
+    const cfg = JSON.parse(raw);
+    const key = projectPath.replace(/\\/g, '/');
+    if (!cfg.projects) cfg.projects = {};
+    if (!cfg.projects[key]) {
+      cfg.projects[key] = {
+        allowedTools: [], mcpContextUris: [], mcpServers: {},
+        enabledMcpjsonServers: [], disabledMcpjsonServers: [],
+        hasTrustDialogAccepted: false, projectOnboardingSeenCount: 0,
+        hasClaudeMdExternalIncludesApproved: false,
+        hasClaudeMdExternalIncludesWarningShown: false,
+      };
+    }
+    const enabled: string[] = cfg.projects[key].enabledMcpjsonServers || [];
+    if (!enabled.includes(serverName)) {
+      enabled.push(serverName);
+      cfg.projects[key].enabledMcpjsonServers = enabled;
+    }
+    const disabled: string[] = cfg.projects[key].disabledMcpjsonServers || [];
+    cfg.projects[key].disabledMcpjsonServers = disabled.filter((n: string) => n !== serverName);
+    await writeFile(cfgPath, JSON.stringify(cfg, null, 2));
+  } catch {
+    console.error('[MCP API] Failed to auto-approve project server:', serverName);
+  }
 }
 
 export const dynamic = 'force-dynamic';
@@ -161,6 +190,9 @@ export async function POST(request: NextRequest) {
 
     const output = (stdout || '') + (stderr || '');
     const effectiveScope: 'user' | 'project' = scope === 'project' ? 'project' : 'user';
+    if (effectiveScope === 'project' && projectPath) {
+      await autoApproveProjectServer(projectPath, name);
+    }
     mcpCache.invalidate(projectPath || null, effectiveScope).catch(() => { /* background */ });
     return NextResponse.json({ success: true, output: output.trim() });
   } catch (error: unknown) {

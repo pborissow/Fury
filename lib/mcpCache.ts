@@ -23,7 +23,7 @@ export function projectKeyCandidates(projectPath: string): string[] {
 export interface McpServer {
   name: string;
   url: string;
-  status: 'connected' | 'needs_auth' | 'error' | 'unknown';
+  status: 'connected' | 'needs_auth' | 'pending' | 'error' | 'unknown';
   statusDetail: string;
   scope: 'project' | 'user' | 'unknown';
   transport: 'stdio' | 'http' | 'unknown';
@@ -174,19 +174,21 @@ class McpCache {
       const match = trimmed.match(/^(.+?):\s+(.+?)\s+-\s+(.+)$/);
       if (!match) continue;
 
-      const [, name, url, statusText] = match;
+      const [, name, rawUrl, statusText] = match;
+      const url = rawUrl.trim().replace(/\s+\([^)]+\)$/, '');
       let status: McpServer['status'] = 'unknown';
       if (/needs\s+auth/i.test(statusText)) status = 'needs_auth';
+      else if (/pending/i.test(statusText)) status = 'pending';
       else if (/connected|ok|running/i.test(statusText)) status = 'connected';
       else if (/error|fail/i.test(statusText)) status = 'error';
 
       servers.push({
         name: name.trim(),
-        url: url.trim(),
+        url,
         status,
         statusDetail: statusText.trim(),
         scope: 'unknown',
-        transport: (url.trim().startsWith('http://') || url.trim().startsWith('https://')) ? 'http' : 'stdio',
+        transport: (url.startsWith('http://') || url.startsWith('https://')) ? 'http' : 'stdio',
       });
     }
 
