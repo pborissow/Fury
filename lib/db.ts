@@ -219,7 +219,7 @@ async function scanAndArchiveAll(client: Client): Promise<void> {
           continue;
         }
 
-        const { messages, rawLines, numCompactions } = parseTranscriptJsonl(content);
+        const { messages, rawLines, numCompactions, totalOutputTokens } = parseTranscriptJsonl(content);
         if (messages.length === 0) {
           skipped++;
           continue;
@@ -235,7 +235,7 @@ async function scanAndArchiveAll(client: Client): Promise<void> {
         const project = info.project;
         const display = info.display || messages[0]?.content?.substring(0, 200) || sessionId;
 
-        await archiveTranscript(sessionId, project, display, content, messages, rawLines, true, { numCompactions });
+        await archiveTranscript(sessionId, project, display, content, messages, rawLines, true, { numCompactions, totalOutputTokens });
         archived++;
       } catch (err) {
         errors++;

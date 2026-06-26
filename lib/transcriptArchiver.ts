@@ -61,7 +61,7 @@ export async function archiveTranscript(
   messages: TranscriptMessage[],
   rawLines?: string[],
   skipHashCheck?: boolean,
-  opts?: { numCompactions?: number }
+  opts?: { numCompactions?: number; totalOutputTokens?: number }
 ): Promise<void> {
   const hash = computeHash(jsonlContent);
 
@@ -159,8 +159,10 @@ export async function archiveTranscript(
 
   // All batches succeeded — stamp the real hash and merge metadata atomically
   const nc = opts?.numCompactions ?? 0;
-  if (nc > 0) {
-    // Read existing metadata, set numCompactions, write back with hash
+  const tot = opts?.totalOutputTokens;
+  const hasMeta = nc > 0 || typeof tot === 'number';
+  if (hasMeta) {
+    // Read existing metadata, merge in derived fields, write back with hash
     const metaRow = await db.execute({
       sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
       args: [sessionId],
@@ -169,8 +171,11 @@ export async function archiveTranscript(
     if (metaRow.rows[0]?.metadata) {
       try { meta = JSON.parse(metaRow.rows[0].metadata as string); } catch {}
     }
-    meta.numCompactions = nc;
-    delete meta.hasCompaction; // clean up old key if present
+    if (nc > 0) {
+      meta.numCompactions = nc;
+      delete meta.hasCompaction; // clean up old key if present
+    }
+    if (typeof tot === 'number') meta.totalOutputTokens = tot;
     await db.execute({
       sql: 'UPDATE sessions SET jsonl_hash = ?, metadata = ? WHERE session_id = ?',
       args: [hash, JSON.stringify(meta), sessionId],
@@ -369,11 +374,11 @@ async function archiveSessionFromDisk(
   const hash = computeHash(content);
   if (await isCurrentlyArchived(sessionId, hash)) return;
 
-  const { messages, rawLines, numCompactions } = parseTranscriptJsonl(content);
+  const { messages, rawLines, numCompactions, totalOutputTokens } = parseTranscriptJsonl(content);
   if (messages.length === 0) return;
 
   const label = display || messages.find(m => m.role === 'user')?.content?.substring(0, 200) || sessionId;
-  await archiveTranscript(sessionId, project, label, content, messages, rawLines, true, { numCompactions });
+  await archiveTranscript(sessionId, project, label, content, messages, rawLines, true, { numCompactions, totalOutputTokens });
 }
 
 /**

@@ -64,6 +64,10 @@ export function parseTranscriptJsonl(content: string): {
   /** Model id (e.g. "claude-opus-4-7") from the most recent non-synthetic
    *  assistant message. Null if no real assistant message was emitted. */
   currentModel: string | null;
+  /** Cumulative output tokens generated across the session, summed once per
+   *  unique assistant message id (streaming repeats the same message's usage
+   *  on multiple JSONL lines, so we dedupe to avoid over-counting). */
+  totalOutputTokens: number;
 } {
   const messages: TranscriptMessage[] = [];
   const rawEntries: any[] = [];
@@ -74,6 +78,10 @@ export function parseTranscriptJsonl(content: string): {
   let planSlug: string | null = null;
   let planWriteTimestamp: string | null = null;
   let numCompactions = 0;
+  // Output tokens per unique assistant message id. Streaming writes the same
+  // API message's cumulative usage on multiple JSONL lines, so we key by id
+  // (last value wins = the final usage for that message) and sum at the end.
+  const outputTokensByMsgId = new Map<string, number>();
   let currentModel: string | null = null;
 
   // Accumulate tool_use across the current turn (between real user
@@ -167,6 +175,13 @@ export function parseTranscriptJsonl(content: string): {
           resetTurnTools();
         }
       } else if (entry.type === 'assistant') {
+        // Accumulate output tokens (deduped by message id) before any
+        // filtering, so internal-exchange and tool-only turns still count
+        // toward the session's billed output.
+        if (typeof msg?.usage?.output_tokens === 'number') {
+          const id = msg.id || entry.uuid;
+          if (id) outputTokensByMsgId.set(id, msg.usage.output_tokens);
+        }
         if (inInternalExchange) continue;
         if (!Array.isArray(msg.content)) continue;
 
@@ -250,5 +265,8 @@ export function parseTranscriptJsonl(content: string): {
     }
   }
 
-  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion, currentModel };
+  let totalOutputTokens = 0;
+  for (const v of outputTokensByMsgId.values()) totalOutputTokens += v;
+
+  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion, currentModel, totalOutputTokens };
 }

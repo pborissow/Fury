@@ -8,6 +8,13 @@ import type { HistoryEntry, PendingSession } from '@/lib/types';
 import SmartPath from '@/components/SmartPath';
 import FreshnessLeaf from '@/components/FreshnessLeaf';
 
+// Cumulative output tokens → compact label. <1000 shown raw ("57 tokens"),
+// ≥1000 rounded to whole thousands ("194k tokens").
+function formatTokens(n: number): string {
+  if (n >= 1000) return `${Math.round(n / 1000)}k tokens`;
+  return `${n} token${n === 1 ? '' : 's'}`;
+}
+
 interface SessionSidebarProps {
   pendingNewSessions: PendingSession[];
   history: HistoryEntry[];
@@ -111,6 +118,7 @@ export default function SessionSidebar({
         return history.map((entry, index) => {
           const isLive = !!entry.sessionId && liveSessionIds.has(entry.sessionId);
           const numCompactions = (entry.metadata?.numCompactions as number) || 0;
+          const totalOutputTokens = (entry.metadata?.totalOutputTokens as number) || 0;
           const isClickable = !!entry.sessionId && !!entry.project;
           const isViewing = viewingTranscriptId === entry.sessionId;
           return (
@@ -198,6 +206,7 @@ export default function SessionSidebar({
                 <div className="mt-1 text-xs text-muted-foreground flex items-center gap-1">
                   <span>
                     {entry.messageCount} message{entry.messageCount !== 1 ? 's' : ''}
+                    {totalOutputTokens > 0 && `, ${formatTokens(totalOutputTokens)}`}
                   </span>
                   {numCompactions > 0 ? (
                     <span title={`Context compacted ${numCompactions} time${numCompactions !== 1 ? 's' : ''} — consider starting a new session`}>
