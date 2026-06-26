@@ -106,6 +106,54 @@ async function initDb(client: Client): Promise<void> {
   } catch (err) {
     console.error('[DB] numCompactions backfill error:', err);
   }
+
+  // Migration: backfill totalOutputTokens metadata for existing archived
+  // sessions. Re-parses raw_jsonl per session and stores the cumulative
+  // output token count (deduped by message id inside parseTranscriptJsonl).
+  // Always writes the field — even 0 — so the migration doesn't re-run on
+  // sessions that genuinely had no billable assistant output.
+  try {
+    const targets = await client.execute(`
+      SELECT session_id FROM sessions
+      WHERE metadata IS NULL OR metadata NOT LIKE '%totalOutputTokens%'
+    `);
+    let updated = 0;
+    for (const row of targets.rows) {
+      const sid = row.session_id as string;
+      const rawRows = await client.execute({
+        sql: 'SELECT content FROM raw_jsonl WHERE session_id = ? ORDER BY line_number',
+        args: [sid],
+      });
+      if (rawRows.rows.length === 0) continue;
+      const content = rawRows.rows.map(r => r.content as string).join('\n');
+      let total = 0;
+      try {
+        total = parseTranscriptJsonl(content).totalOutputTokens;
+      } catch (e) {
+        console.warn(`[DB] totalOutputTokens parse failed for ${sid}:`, e);
+        continue;
+      }
+      const existing = await client.execute({
+        sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+        args: [sid],
+      });
+      let meta: Record<string, unknown> = {};
+      if (existing.rows[0]?.metadata) {
+        try { meta = JSON.parse(existing.rows[0].metadata as string); } catch {}
+      }
+      meta.totalOutputTokens = total;
+      await client.execute({
+        sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+        args: [JSON.stringify(meta), sid],
+      });
+      updated++;
+    }
+    if (updated > 0) {
+      console.log(`[DB] Backfilled totalOutputTokens for ${updated} sessions`);
+    }
+  } catch (err) {
+    console.error('[DB] totalOutputTokens backfill error:', err);
+  }
 }
 
 /**
