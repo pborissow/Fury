@@ -67,6 +67,17 @@ export default function ChatTab({
   // freshness leaf in the sidebar — stamped when a viewed session stops
   // processing. Sessions without an entry fall back to their history timestamp.
   const [sessionActivity, setSessionActivity] = useState<Record<string, number>>({});
+  // Per-session live cumulative output tokens (archived baseline + in-flight
+  // turn), driven by session:usage SSE. Overlays archived metadata so the
+  // sidebar count climbs as Claude streams; cleared once the archive catches up.
+  const [liveTokens, setLiveTokens] = useState<Record<string, number>>({});
+  // Pre-turn archived baseline, frozen at the first usage event of each run.
+  // The server re-archives the live JSONL mid-turn (transcript:updated →
+  // archiveSessionFromDisk), so the session's metadata.totalOutputTokens grows
+  // during the run. Reading it per-event and adding the SSE tally would
+  // double-count that growth (and the inflated overlay would never clear).
+  // Freezing the baseline at run start keeps the math `P + R` correct.
+  const baselineByRunRef = useRef<Record<string, number>>({});
 
   // New sessions that haven't been submitted yet — persisted in the sidebar so
   // the user can switch away and come back without losing them.
@@ -332,6 +343,32 @@ export default function ChatTab({
   useEffect(() => {
     historyLengthRef.current = history.length;
   }, [history.length]);
+
+  // Mirror history into a ref so the per-session SSE handler can read the
+  // current archived baseline without re-subscribing on every history change.
+  const historyRef = useRef<HistoryEntry[]>([]);
+  useEffect(() => {
+    historyRef.current = history;
+  }, [history]);
+
+  // Drop the live-token overlay for a session once its archived baseline has
+  // caught up (i.e. the finished turn's tokens are now in metadata). The
+  // server tally is a subset of the parser's, so baseline always reaches the
+  // overlay — until then max(baseline, overlay) shows the live value with no
+  // backward dip or double-count.
+  useEffect(() => {
+    setLiveTokens(prev => {
+      const ids = Object.keys(prev);
+      if (ids.length === 0) return prev;
+      let changed = false;
+      const next = { ...prev };
+      for (const id of ids) {
+        const baseline = (history.find(h => h.sessionId === id)?.metadata?.totalOutputTokens as number) || 0;
+        if (baseline >= prev[id]) { delete next[id]; changed = true; }
+      }
+      return changed ? next : prev;
+    });
+  }, [history]);
 
   // --- fetchTranscript ---
   const fetchTranscript = async (sessionId: string, project: string, displayTitle: string) => {
@@ -655,6 +692,24 @@ export default function ChatTab({
       if (data.model) setCurrentModel(data.model);
     });
 
+    // Live output-token tally for the in-flight turn. Add it to the session's
+    // archived baseline (pre-turn total) to get the live cumulative the sidebar
+    // counts toward. The cleanup effect drops the overlay once the archived
+    // metadata catches up at turn end.
+    es.addEventListener('session-usage', (e: MessageEvent) => {
+      if (!shouldProcess()) return;
+      const data = JSON.parse(e.data);
+      if (typeof data.turnOutputTokens !== 'number') return;
+      // Freeze the pre-turn baseline on the first event of this run; reuse it
+      // for the rest so mid-turn metadata growth can't be double-counted.
+      if (baselineByRunRef.current[mySessionId] === undefined) {
+        baselineByRunRef.current[mySessionId] =
+          (historyRef.current.find(h => h.sessionId === mySessionId)?.metadata?.totalOutputTokens as number) || 0;
+      }
+      const baseline = baselineByRunRef.current[mySessionId];
+      setLiveTokens(prev => ({ ...prev, [mySessionId]: baseline + data.turnOutputTokens }));
+    });
+
     // Handle session:health events (replaces health polling)
     es.addEventListener('session-health', (e: MessageEvent) => {
       if (!shouldProcess()) return;
@@ -676,6 +731,8 @@ export default function ChatTab({
         // counts the 5-min prompt-cache TTL from now (when the cache was
         // last refreshed) rather than the turn's start.
         setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
+        // Run ended — drop the frozen baseline so the next run re-captures it.
+        delete baselineByRunRef.current[mySessionId];
         fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
           .then(res => res.json())
           .then(refreshData => {
@@ -1207,6 +1264,7 @@ export default function ChatTab({
       // transcriptLoading here optimistically, so the session-health "just
       // ended" stamp won't fire; do it explicitly.)
       setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
+      delete baselineByRunRef.current[mySessionId];
       if (activeSessionRef.current === mySessionId) {
         setTranscriptLoading(false);
         setTranscriptStreaming('');
@@ -1328,6 +1386,7 @@ export default function ChatTab({
             history={history}
             liveSessionIds={liveSessionIds}
             sessionActivity={sessionActivity}
+            liveTokens={liveTokens}
             viewingTranscriptId={viewingTranscriptId}
             transcriptLoading={transcriptLoading}
             isLoadingHistory={isLoadingHistory}
@@ -1611,6 +1670,19 @@ export default function ChatTab({
       <AskUserQuestionDialog
         open={true}
         questions={askUserQuestion.input.questions}
+        context={
+          // The text Claude wrote leading up to the question — the same
+          // content rendered in the chat panel, surfaced here because the
+          // modal obstructs it and the panel can't scroll while it's open.
+          // The AskUserQuestion tool_use lands in its own (text-less)
+          // assistant message, so the preamble is the last assistant text:
+          // mid-turn it lives in the streaming buffer; once the turn ends
+          // (the CLI is killed when the tool fires) it's the last assistant
+          // bubble in the refreshed transcript.
+          transcriptStreaming.trim() ||
+          [...historyTranscript].reverse().find(m => m.role === 'assistant')?.content ||
+          ''
+        }
         onSubmit={handleAskUserQuestionResponse}
         onSkip={handleAskUserQuestionSkip}
       />

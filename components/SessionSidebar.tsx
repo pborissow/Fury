@@ -7,13 +7,7 @@ import HistoryTimestamp from '@/components/HistoryTimestamp';
 import type { HistoryEntry, PendingSession } from '@/lib/types';
 import SmartPath from '@/components/SmartPath';
 import FreshnessLeaf from '@/components/FreshnessLeaf';
-
-// Cumulative output tokens → compact label. <1000 shown raw ("57 tokens"),
-// ≥1000 rounded to whole thousands ("194k tokens").
-function formatTokens(n: number): string {
-  if (n >= 1000) return `${Math.round(n / 1000)}k tokens`;
-  return `${n} token${n === 1 ? '' : 's'}`;
-}
+import AnimatedTokenCount from '@/components/AnimatedTokenCount';
 
 interface SessionSidebarProps {
   pendingNewSessions: PendingSession[];
@@ -22,6 +16,10 @@ interface SessionSidebarProps {
   /** Per-session epoch-ms of the last turn completion, used to anchor the
    *  prompt-cache freshness leaf. Falls back to the entry timestamp. */
   sessionActivity: Record<string, number>;
+  /** Per-session live cumulative output tokens (archived baseline + in-flight
+   *  turn). Overlays the archived metadata so the count climbs as Claude
+   *  streams. Keyed by sessionId; absent when no turn is in flight. */
+  liveTokens: Record<string, number>;
   viewingTranscriptId: string | null;
   transcriptLoading: boolean;
   isLoadingHistory: boolean;
@@ -40,6 +38,7 @@ export default function SessionSidebar({
   history,
   liveSessionIds,
   sessionActivity,
+  liveTokens,
   viewingTranscriptId,
   transcriptLoading,
   isLoadingHistory,
@@ -118,7 +117,11 @@ export default function SessionSidebar({
         return history.map((entry, index) => {
           const isLive = !!entry.sessionId && liveSessionIds.has(entry.sessionId);
           const numCompactions = (entry.metadata?.numCompactions as number) || 0;
-          const totalOutputTokens = (entry.metadata?.totalOutputTokens as number) || 0;
+          const baselineTokens = (entry.metadata?.totalOutputTokens as number) || 0;
+          // Overlay the live in-flight tally; max() avoids both a backward
+          // dip and double-counting once the archived baseline catches up.
+          const liveTok = entry.sessionId ? liveTokens[entry.sessionId] : undefined;
+          const totalOutputTokens = Math.max(baselineTokens, liveTok ?? 0);
           const isClickable = !!entry.sessionId && !!entry.project;
           const isViewing = viewingTranscriptId === entry.sessionId;
           return (
@@ -206,7 +209,7 @@ export default function SessionSidebar({
                 <div className="mt-1 text-xs text-muted-foreground flex items-center gap-1">
                   <span>
                     {entry.messageCount} message{entry.messageCount !== 1 ? 's' : ''}
-                    {totalOutputTokens > 0 && `, ${formatTokens(totalOutputTokens)}`}
+                    {totalOutputTokens > 0 && <>, <AnimatedTokenCount value={totalOutputTokens} /></>}
                   </span>
                   {numCompactions > 0 ? (
                     <span title={`Context compacted ${numCompactions} time${numCompactions !== 1 ? 's' : ''} — consider starting a new session`}>

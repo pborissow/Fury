@@ -1,8 +1,20 @@
 'use client';
 
 import { useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import Dialog from '@/components/Dialog';
+import CopyableCodeBlock from '@/components/CopyableCodeBlock';
 import { Input } from '@/components/ui/input';
+
+const ExternalLink = ({ node: _node, ...props }: any) => (
+  <a {...props} target="_blank" rel="noopener noreferrer" />
+);
+
+const assistantMarkdownComponents = {
+  pre: CopyableCodeBlock,
+  a: ExternalLink,
+};
 
 interface QuestionOption {
   label: string;
@@ -19,6 +31,10 @@ interface Question {
 interface AskUserQuestionDialogProps {
   open: boolean;
   questions: Question[];
+  /** The last assistant message rendered in the chat panel. Shown at the top
+   *  of the dialog so the user can read the context Claude's question refers
+   *  to without the modal obstructing the (unscrollable) chat panel. */
+  context?: string;
   onSubmit: (formattedAnswer: string) => void;
   onSkip: () => void;
 }
@@ -26,6 +42,7 @@ interface AskUserQuestionDialogProps {
 export default function AskUserQuestionDialog({
   open,
   questions,
+  context,
   onSubmit,
   onSkip,
 }: AskUserQuestionDialogProps) {
@@ -130,7 +147,7 @@ export default function AskUserQuestionDialog({
       onOpenChange={(o) => { if (!o) onSkip(); }}
       title="Claude has a question"
       defaultWidth={560}
-      defaultHeight={480}
+      defaultHeight={560}
       minWidth={400}
       minHeight={300}
       buttons={[
@@ -141,6 +158,24 @@ export default function AskUserQuestionDialog({
       <div className="-mx-4 -mt-4 px-4 pt-2 pb-2 mb-4 text-sm text-muted-foreground border-b border-border">
         Please answer to continue the conversation
       </div>
+
+      {context?.trim() && (
+        <div className="mb-5">
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground mb-2">
+            Claude&apos;s message
+          </div>
+          <div className="max-h-52 overflow-y-auto rounded-md border border-border bg-muted/40 px-3 py-2">
+            <div className="prose-chat max-w-none text-sm">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={assistantMarkdownComponents}
+              >
+                {context}
+              </ReactMarkdown>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="space-y-6">
         {questions.map((q, qIndex) => (

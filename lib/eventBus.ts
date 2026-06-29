@@ -34,6 +34,14 @@ export interface SessionModelEvent {
   model: string;
 }
 
+export interface SessionUsageEvent {
+  type: 'session:usage';
+  sessionId: string;
+  /** Output tokens generated so far in the in-flight turn (summed per unique
+   *  assistant message id). The client adds this to the archived baseline. */
+  turnOutputTokens: number;
+}
+
 export interface TranscriptUpdatedEvent {
   type: 'transcript:updated';
   sessionId: string;
@@ -57,6 +65,7 @@ export type AppEvent =
   | SessionStreamEvent
   | SessionHealthEvent
   | SessionModelEvent
+  | SessionUsageEvent
   | TranscriptUpdatedEvent
   | ProviderSwitchedEvent
   | McpUpdatedEvent;

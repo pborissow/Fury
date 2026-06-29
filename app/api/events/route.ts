@@ -105,6 +105,12 @@ export async function GET(request: NextRequest) {
             }
             break;
 
+          case 'session:usage':
+            if (watchSessionId && payload.sessionId === watchSessionId) {
+              send('session-usage', payload);
+            }
+            break;
+
           case 'transcript:updated':
             if (watchSessionId && payload.sessionId === watchSessionId) {
               send('transcript-updated', payload);

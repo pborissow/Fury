@@ -378,6 +378,20 @@ class SessionManager {
           lastEmittedModel = model;
           eventBus.emitApp({ type: 'session:model', sessionId: session.sessionId, model });
         };
+
+        // Live output-token tally for this run, deduped by assistant message id
+        // (streaming repeats the same message's cumulative usage). Summed and
+        // emitted whenever it changes so the sidebar can count up in real time.
+        const turnOutputByMsgId = new Map<string, number>();
+        let currentStreamMsgId: string | null = null;
+        let lastEmittedTurnTokens = -1;
+        const emitUsageIfChanged = () => {
+          let total = 0;
+          for (const v of turnOutputByMsgId.values()) total += v;
+          if (total === lastEmittedTurnTokens) return;
+          lastEmittedTurnTokens = total;
+          eventBus.emitApp({ type: 'session:usage', sessionId: session.sessionId, turnOutputTokens: total });
+        };
         claude.stdout.on('data', (data) => {
           // Update activity timestamp whenever we receive data
           session.lastActivity = Date.now();
@@ -445,6 +459,19 @@ class SessionManager {
                 // Handle stream_event type with nested event
                 if (json.type === 'stream_event' && json.event) {
                   const event = json.event;
+                  // Track output tokens live as the message streams. message_start
+                  // gives the message id (+ initial usage); message_delta carries
+                  // the running output_tokens for that message. Keyed by id so an
+                  // agentic turn's messages sum correctly.
+                  if (event.type === 'message_start' && event.message?.id) {
+                    const mid: string = event.message.id;
+                    currentStreamMsgId = mid;
+                    const out = event.message.usage?.output_tokens;
+                    if (typeof out === 'number') { turnOutputByMsgId.set(mid, out); emitUsageIfChanged(); }
+                  } else if (event.type === 'message_delta' && currentStreamMsgId && typeof event.usage?.output_tokens === 'number') {
+                    turnOutputByMsgId.set(currentStreamMsgId, event.usage.output_tokens);
+                    emitUsageIfChanged();
+                  }
                   if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
                     const text = event.delta.text;
                     bufferText(text);
@@ -477,6 +504,12 @@ class SessionManager {
                 else if (json.type === 'assistant' && json.message?.content) {
                   const isSynthetic = json.message.model === '<synthetic>';
                   if (!isSynthetic) emitModelIfNew(json.message.model);
+                  // Update the live output-token tally as each assistant
+                  // message lands (one per agentic step).
+                  if (!isSynthetic && json.message.id && typeof json.message.usage?.output_tokens === 'number') {
+                    turnOutputByMsgId.set(json.message.id, json.message.usage.output_tokens);
+                    emitUsageIfChanged();
+                  }
                   for (const block of json.message.content) {
                     if (block.type === 'text' && block.text && isSynthetic) {
                       bufferText(block.text);
