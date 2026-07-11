@@ -150,6 +150,7 @@ export default function AskUserQuestionDialog({
       defaultHeight={560}
       minWidth={400}
       minHeight={300}
+      maximizable
       buttons={[
         { label: 'Skip', onClick: onSkip, variant: 'outline' },
         { label: 'Submit', onClick: handleSubmit, disabled: !isValid },

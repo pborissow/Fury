@@ -457,6 +457,7 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
       minHeight={MIN_HEIGHT}
       resetOnOpen={false}
       onResizeEnd={handleResizeEnd}
+      maximizable
       noPadding
     >
       {/* Markdown view tabs */}

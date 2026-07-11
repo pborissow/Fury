@@ -35,6 +35,8 @@ interface DialogProps {
   minHeight?: number;
   /** Enable resize handles (default true) */
   resizable?: boolean;
+  /** Allow maximizing/restoring the dialog by double-clicking the header (default false). */
+  maximizable?: boolean;
   /** Remove default padding from content area (default false) */
   noPadding?: boolean;
   /** Reset position & size to defaults each time the dialog opens (default true).
@@ -58,6 +60,7 @@ export default function Dialog({
   minWidth = 320,
   minHeight = 200,
   resizable = true,
+  maximizable = false,
   noPadding = false,
   resetOnOpen = true,
   onResizeEnd,
@@ -67,16 +70,51 @@ export default function Dialog({
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
 
+  // Maximize/restore state. When maximized we stash the pre-maximize geometry
+  // so a second double-click can put the window back exactly where it was.
+  const [maximized, setMaximized] = useState(false);
+  const restoreRef = useRef<{ size: { width: number; height: number }; position: { x: number; y: number } } | null>(null);
+
   // Reset position when dialog opens, unless the consumer manages persistence.
   const handleOpenChange = useCallback((nextOpen: boolean) => {
-    if (nextOpen && resetOnOpen) {
-      setPosition({ x: 0, y: 0 });
-      setSize({ width: defaultWidth, height: defaultHeight });
+    if (nextOpen) {
+      setMaximized(false);
+      if (resetOnOpen) {
+        setPosition({ x: 0, y: 0 });
+        setSize({ width: defaultWidth, height: defaultHeight });
+      }
     }
     onOpenChange(nextOpen);
   }, [onOpenChange, defaultWidth, defaultHeight, resetOnOpen]);
 
+  // Double-click the header to toggle maximize. Maximizing grows the window to
+  // the same 95vw/95vh cap the panel is clamped to and re-centers it; restoring
+  // returns to the exact geometry captured before maximizing. This is a
+  // transient view — we deliberately don't fire onResizeEnd/onMoveEnd, so any
+  // persisted size the consumer tracks stays at the user's real size.
+  const handleHeaderDoubleClick = useCallback((e: React.MouseEvent) => {
+    if (!maximizable) return;
+    if ((e.target as HTMLElement).closest('button')) return;
+    if (maximized) {
+      const prev = restoreRef.current;
+      if (prev) {
+        setSize(prev.size);
+        setPosition(prev.position);
+      }
+      setMaximized(false);
+    } else {
+      restoreRef.current = { size, position };
+      const maxW = typeof window !== 'undefined' ? window.innerWidth : size.width;
+      const maxH = typeof window !== 'undefined' ? window.innerHeight : size.height;
+      setSize({ width: maxW, height: maxH });
+      setPosition({ x: 0, y: 0 });
+      setMaximized(true);
+    }
+  }, [maximizable, maximized, size, position]);
+
   const handleDragStart = useCallback((e: React.PointerEvent) => {
+    // A maximized window fills the viewport and isn't draggable.
+    if (maximized) return;
     if ((e.target as HTMLElement).closest('button')) return;
     e.preventDefault();
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
@@ -86,7 +124,7 @@ export default function Dialog({
       originX: position.x,
       originY: position.y,
     };
-  }, [position]);
+  }, [position, maximized]);
 
   const handleDragMove = useCallback((e: React.PointerEvent) => {
     if (!dragRef.current) return;
@@ -117,6 +155,9 @@ export default function Dialog({
   const handleResizeStart = useCallback((dir: ResizeDir, e: React.PointerEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    // Resizing by hand exits the maximized state so the next double-click
+    // maximizes again rather than snapping back to stale restore geometry.
+    setMaximized(false);
     (e.target as HTMLElement).setPointerCapture(e.pointerId);
     resizeRef.current = {
       dir, startX: e.clientX, startY: e.clientY,
@@ -199,20 +240,22 @@ export default function Dialog({
           onEscapeKeyDown={(e) => e.preventDefault()}
         >
           <div
-            className="bg-card rounded-lg border flex flex-col overflow-hidden relative"
+            className={`bg-card border flex flex-col overflow-hidden relative${maximized ? '' : ' rounded-lg'}`}
             style={{
               width: size.width, height: size.height,
-              maxWidth: '95vw', maxHeight: '95vh',
+              maxWidth: maximized ? '100vw' : '95vw', maxHeight: maximized ? '100vh' : '95vh',
               boxShadow: '0 8px 40px rgba(0, 0, 0, 0.8), 0 2px 12px rgba(0, 0, 0, 0.6)',
             }}
           >
-            {/* Draggable header */}
+            {/* Draggable header (fixed while maximized) */}
             <div
-              className="flex items-center gap-2 px-4 py-3 border-b border-border shrink-0 cursor-grab active:cursor-grabbing select-none"
+              data-dialog-header
+              className={`flex items-center gap-2 px-4 py-3 border-b border-border shrink-0 select-none${maximized ? '' : ' cursor-grab active:cursor-grabbing'}`}
               style={{ backgroundColor: '#313131' }}
               onPointerDown={handleDragStart}
               onPointerMove={handleDragMove}
               onPointerUp={handleDragEnd}
+              onDoubleClick={handleHeaderDoubleClick}
             >
               <DialogPrimitive.Title className="text-sm font-semibold truncate flex-1">
                 {title}

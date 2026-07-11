@@ -22,6 +22,7 @@ export default function IntermediaryMessagesDialog({ messages, onClose }: Interm
       defaultHeight={500}
       minWidth={400}
       minHeight={300}
+      maximizable
     >
       <div className="-mx-4 -mt-4 px-4 pt-2 pb-1 mb-4 text-sm text-muted-foreground border-b border-border">
         {messages.length} intermediary response{messages.length !== 1 ? 's' : ''} before the final output
