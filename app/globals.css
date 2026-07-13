@@ -316,6 +316,17 @@
   background-color: var(--muted);
 }
 
+/* TipTap editor — inline code, matching the .prose-chat bubble style.
+   Scoped to inline code only so code blocks (pre > code) keep their own styling.
+   (styling for typed inline code in the composer) */
+.tiptap :not(pre) > code {
+  background-color: var(--muted);
+  color: var(--muted-foreground);
+  border-radius: 0.25rem;
+  padding: 0.125rem 0.25rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
 /* Bouncing dots animation for loading indicator */
 @layer utilities {
   @keyframes bounce-dot {

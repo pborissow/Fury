@@ -91,10 +91,16 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
       StarterKit.configure({
         codeBlock: false, // Disable default code block to use custom one
         link: false, // Disable auto-linking of URLs, file paths, and emails
+        // Turn off the browser's spellcheck squiggles on inline code.
+        code: {
+          HTMLAttributes: { spellcheck: 'false' },
+        },
       }),
       CodeBlock.configure({
         HTMLAttributes: {
           class: 'bg-muted p-3 rounded my-2 font-mono text-sm border border-border',
+          // Turn off the browser's spellcheck squiggles inside code blocks.
+          spellcheck: 'false',
         },
       }),
       Table.configure({ resizable: false }),
