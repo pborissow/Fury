@@ -117,11 +117,16 @@ export default function SessionSidebar({
         return history.map((entry, index) => {
           const isLive = !!entry.sessionId && liveSessionIds.has(entry.sessionId);
           const numCompactions = (entry.metadata?.numCompactions as number) || 0;
-          const baselineTokens = (entry.metadata?.totalOutputTokens as number) || 0;
-          // Overlay the live in-flight tally; max() avoids both a backward
-          // dip and double-counting once the archived baseline catches up.
+          // Total billed tokens (input+output+cache) — the cost-driving count,
+          // matching the Stats tab. Falls back to the legacy output-only field
+          // until the usage_events migration has populated totalTokens (which
+          // requires a full server restart, not just HMR), so the count never
+          // blanks out. Overlay the live in-flight tally; max() avoids both a
+          // backward dip and double-counting once the archived baseline catches up.
+          const baselineTokens = (entry.metadata?.totalTokens
+            ?? entry.metadata?.totalOutputTokens ?? 0) as number;
           const liveTok = entry.sessionId ? liveTokens[entry.sessionId] : undefined;
-          const totalOutputTokens = Math.max(baselineTokens, liveTok ?? 0);
+          const displayTokens = Math.max(baselineTokens, liveTok ?? 0);
           const isClickable = !!entry.sessionId && !!entry.project;
           const isViewing = viewingTranscriptId === entry.sessionId;
           return (
@@ -209,7 +214,7 @@ export default function SessionSidebar({
                 <div className="mt-1 text-xs text-muted-foreground flex items-center gap-1">
                   <span>
                     {entry.messageCount} message{entry.messageCount !== 1 ? 's' : ''}
-                    {totalOutputTokens > 0 && <>, <AnimatedTokenCount value={totalOutputTokens} /></>}
+                    {displayTokens > 0 && <>, <AnimatedTokenCount value={displayTokens} /></>}
                   </span>
                   {numCompactions > 0 ? (
                     <span title={`Context compacted ${numCompactions} time${numCompactions !== 1 ? 's' : ''} — consider starting a new session`}>

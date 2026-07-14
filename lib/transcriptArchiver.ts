@@ -9,7 +9,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { getDb } from './db';
 import { eventBus } from './eventBus';
-import { parseTranscriptJsonl, type TranscriptMessage } from './transcriptParser';
+import { parseTranscriptJsonl, type TranscriptMessage, type UsageEvent } from './transcriptParser';
 import { projectPathToSlug } from './utils';
 
 export interface SessionMetadata {
@@ -61,7 +61,7 @@ export async function archiveTranscript(
   messages: TranscriptMessage[],
   rawLines?: string[],
   skipHashCheck?: boolean,
-  opts?: { numCompactions?: number; totalOutputTokens?: number }
+  opts?: { numCompactions?: number; totalOutputTokens?: number; usageEvents?: UsageEvent[] }
 ): Promise<void> {
   const hash = computeHash(jsonlContent);
 
@@ -132,6 +132,11 @@ export async function archiveTranscript(
     { sql: 'DELETE FROM messages WHERE session_id = ?', args: [sessionId] },
     { sql: 'DELETE FROM raw_jsonl WHERE session_id = ?', args: [sessionId] },
   ];
+  // Only wipe usage_events when the caller is providing a fresh set — callers
+  // that omit usageEvents (if any) must not silently clear the analytics data.
+  if (opts?.usageEvents) {
+    preamble.push({ sql: 'DELETE FROM usage_events WHERE session_id = ?', args: [sessionId] });
+  }
 
   const inserts: { sql: string; args: any[] }[] = [];
   for (let i = 0; i < messages.length; i++) {
@@ -147,6 +152,15 @@ export async function archiveTranscript(
       args: [sessionId, i, lines[i]],
     });
   }
+  if (opts?.usageEvents) {
+    for (const u of opts.usageEvents) {
+      inserts.push({
+        sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_read)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [sessionId, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheRead],
+      });
+    }
+  }
 
   // Chunk inserts to avoid hitting batch size limits on very large sessions
   const CHUNK_SIZE = 500;
@@ -160,7 +174,8 @@ export async function archiveTranscript(
   // All batches succeeded — stamp the real hash and merge metadata atomically
   const nc = opts?.numCompactions ?? 0;
   const tot = opts?.totalOutputTokens;
-  const hasMeta = nc > 0 || typeof tot === 'number';
+  const wroteUsage = Array.isArray(opts?.usageEvents);
+  const hasMeta = nc > 0 || typeof tot === 'number' || wroteUsage;
   if (hasMeta) {
     // Read existing metadata, merge in derived fields, write back with hash
     const metaRow = await db.execute({
@@ -176,6 +191,15 @@ export async function archiveTranscript(
       delete meta.hasCompaction; // clean up old key if present
     }
     if (typeof tot === 'number') meta.totalOutputTokens = tot;
+    // Marks usage_events as populated (so the backfill skips it) and stores the
+    // cost-driving total billed token count — input + output + cache write +
+    // cache read — so the session list renders the same number the Stats tab
+    // aggregates, without re-summing. See lib/db.ts.
+    if (wroteUsage) {
+      meta.hasUsageEvents = true;
+      meta.totalTokens = opts!.usageEvents!.reduce(
+        (s, u) => s + u.input + u.output + u.cacheWrite + u.cacheRead, 0);
+    }
     await db.execute({
       sql: 'UPDATE sessions SET jsonl_hash = ?, metadata = ? WHERE session_id = ?',
       args: [hash, JSON.stringify(meta), sessionId],
@@ -374,11 +398,11 @@ async function archiveSessionFromDisk(
   const hash = computeHash(content);
   if (await isCurrentlyArchived(sessionId, hash)) return;
 
-  const { messages, rawLines, numCompactions, totalOutputTokens } = parseTranscriptJsonl(content);
+  const { messages, rawLines, numCompactions, totalOutputTokens, usageEvents } = parseTranscriptJsonl(content);
   if (messages.length === 0) return;
 
   const label = display || messages.find(m => m.role === 'user')?.content?.substring(0, 200) || sessionId;
-  await archiveTranscript(sessionId, project, label, content, messages, rawLines, true, { numCompactions, totalOutputTokens });
+  await archiveTranscript(sessionId, project, label, content, messages, rawLines, true, { numCompactions, totalOutputTokens, usageEvents });
 }
 
 /**

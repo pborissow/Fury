@@ -37,9 +37,10 @@ export interface SessionModelEvent {
 export interface SessionUsageEvent {
   type: 'session:usage';
   sessionId: string;
-  /** Output tokens generated so far in the in-flight turn (summed per unique
-   *  assistant message id). The client adds this to the archived baseline. */
-  turnOutputTokens: number;
+  /** Total billed tokens (input + output + cache write + cache read) accrued so
+   *  far in the in-flight turn, summed per unique assistant message id. The
+   *  client adds this to the archived baseline (metadata.totalTokens). */
+  turnTokens: number;
 }
 
 export interface TranscriptUpdatedEvent {

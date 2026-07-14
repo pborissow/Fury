@@ -25,6 +25,33 @@ export interface TranscriptMessage {
   turnMeta?: TurnMeta;
 }
 
+/**
+ * One billable usage record per unique assistant API message. Captures the
+ * full token breakdown (not just output) plus the model and timestamp, so the
+ * Stats tab can aggregate spend by day / project / model and compute cost.
+ *
+ * Streaming repeats the same message's cumulative usage across multiple JSONL
+ * lines, so records are deduped by messageId (last value wins). Synthetic
+ * CLI-injected messages (usage-limit notices, model `<synthetic>`) are excluded
+ * — they are not billed API calls.
+ */
+export interface UsageEvent {
+  /** Assistant API message id (msg.id), or the entry uuid as a fallback. */
+  messageId: string;
+  /** Model id from msg.model, e.g. "claude-opus-4-8". Null if absent. */
+  model: string | null;
+  /** ISO-8601 timestamp of the JSONL entry. Empty string if absent. */
+  timestamp: string;
+  /** Uncached input tokens (usage.input_tokens). */
+  input: number;
+  /** Generated output tokens (usage.output_tokens). */
+  output: number;
+  /** Cache-creation input tokens (usage.cache_creation_input_tokens). */
+  cacheWrite: number;
+  /** Cache-read input tokens (usage.cache_read_input_tokens). */
+  cacheRead: number;
+}
+
 const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
 export function isInternalContent(content: string): boolean {
@@ -68,6 +95,10 @@ export function parseTranscriptJsonl(content: string): {
    *  unique assistant message id (streaming repeats the same message's usage
    *  on multiple JSONL lines, so we dedupe to avoid over-counting). */
   totalOutputTokens: number;
+  /** Full per-message usage breakdown (input/output/cache) with model and
+   *  timestamp, deduped by message id. Feeds the Stats tab's cost analytics.
+   *  See {@link UsageEvent}. */
+  usageEvents: UsageEvent[];
 } {
   const messages: TranscriptMessage[] = [];
   const rawEntries: any[] = [];
@@ -82,6 +113,10 @@ export function parseTranscriptJsonl(content: string): {
   // API message's cumulative usage on multiple JSONL lines, so we key by id
   // (last value wins = the final usage for that message) and sum at the end.
   const outputTokensByMsgId = new Map<string, number>();
+  // Full usage breakdown per unique assistant message id (last value wins),
+  // for the Stats tab. Kept separate from outputTokensByMsgId so the existing
+  // token-counter behavior is unchanged.
+  const usageByMsgId = new Map<string, UsageEvent>();
   let currentModel: string | null = null;
 
   // Accumulate tool_use across the current turn (between real user
@@ -182,6 +217,29 @@ export function parseTranscriptJsonl(content: string): {
           const id = msg.id || entry.uuid;
           if (id) outputTokensByMsgId.set(id, msg.usage.output_tokens);
         }
+        // Capture the full usage breakdown for the Stats tab. Skip synthetic
+        // CLI-injected messages (not billed API calls). Keyed by the API message
+        // id so streaming's repeated cumulative usage collapses to one final
+        // record. Real assistant messages always carry msg.id; the entry.uuid
+        // fallback only applies when it's absent, and in that rare case a
+        // message split across multiple JSONL lines can't be deduped (each line
+        // gets a distinct uuid and sums). Matches the totalOutputTokens counter.
+        if (msg?.usage && typeof msg.usage === 'object' && msg.model !== '<synthetic>') {
+          const id = msg.id || entry.uuid;
+          if (id) {
+            const u = msg.usage;
+            const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
+            usageByMsgId.set(id, {
+              messageId: id,
+              model: typeof msg.model === 'string' ? msg.model : null,
+              timestamp: typeof entry.timestamp === 'string' ? entry.timestamp : '',
+              input: num(u.input_tokens),
+              output: num(u.output_tokens),
+              cacheWrite: num(u.cache_creation_input_tokens),
+              cacheRead: num(u.cache_read_input_tokens),
+            });
+          }
+        }
         if (inInternalExchange) continue;
         if (!Array.isArray(msg.content)) continue;
 
@@ -268,5 +326,7 @@ export function parseTranscriptJsonl(content: string): {
   let totalOutputTokens = 0;
   for (const v of outputTokensByMsgId.values()) totalOutputTokens += v;
 
-  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion, currentModel, totalOutputTokens };
+  const usageEvents = Array.from(usageByMsgId.values());
+
+  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion, currentModel, totalOutputTokens, usageEvents };
 }

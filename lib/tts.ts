@@ -439,6 +439,7 @@ export async function generateSpeech(text: string, signal?: AbortSignal, setting
     bedrockAwsProfile: '', bedrockAwsRegion: '', bedrockModel: '',
     bedrockSmallFastModel: '', bedrockAuthRefreshCmd: '',
     bedrockClaudeFailoverEnabled: false,
+    pricingPollEnabled: true, pricingPollIntervalDays: 7,
   };
   const s = settings || defaultSettings;
 

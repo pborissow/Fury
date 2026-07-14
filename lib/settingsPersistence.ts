@@ -22,6 +22,10 @@ export interface AppSettings {
   bedrockSmallFastModel: string;
   bedrockAuthRefreshCmd: string;
   bedrockClaudeFailoverEnabled: boolean;
+  /** Poll Anthropic's published pricing on a schedule (Stats tab cost accuracy). */
+  pricingPollEnabled: boolean;
+  /** Days between pricing checks. Calibrated from the last recorded check on boot. */
+  pricingPollIntervalDays: number;
 }
 
 const DEFAULTS: AppSettings = {
@@ -43,6 +47,8 @@ const DEFAULTS: AppSettings = {
   bedrockSmallFastModel: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
   bedrockAuthRefreshCmd: '',
   bedrockClaudeFailoverEnabled: false,
+  pricingPollEnabled: true,
+  pricingPollIntervalDays: 7,
 };
 
 class SettingsPersistence {

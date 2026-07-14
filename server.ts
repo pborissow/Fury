@@ -48,5 +48,14 @@ app.prepare().then(() => {
     } catch (err) {
       console.error('[server] Failed to rehydrate provider switch-back timer:', err);
     }
+
+    // Start the pricing poller, calibrated from the last recorded check so a
+    // restart continues the weekly cadence rather than resetting it.
+    try {
+      const { rehydratePricingPoller } = await import('./lib/pricingPoller');
+      await rehydratePricingPoller();
+    } catch (err) {
+      console.error('[server] Failed to start pricing poller:', err);
+    }
   });
 });

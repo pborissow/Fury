@@ -4,6 +4,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import ChatTab from '@/components/ChatTab';
 import CanvasTab from '@/components/CanvasTab';
+import StatsTab from '@/components/StatsTab';
 import { Sun, Moon, EllipsisVertical, CircleUserRound, LogOut } from 'lucide-react';
 import Dialog from '@/components/Dialog';
 import SettingsPanel, { type ServiceSettings } from '@/components/SettingsPanel';
@@ -145,7 +146,7 @@ export default function Home() {
   }, [localhostOnly, saveSettings]);
 
   // Tab control state
-  const [activeTab, setActiveTab] = useState<'chat' | 'canvas'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'canvas' | 'stats'>('chat');
 
   // Track which tabs have been mounted at least once (lazy mount + CSS hide)
   const [mountedTabs, setMountedTabs] = useState<Set<string>>(new Set(['chat']));
@@ -328,6 +329,17 @@ export default function Home() {
               <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
             )}
           </button>
+          <button
+            onClick={() => setActiveTab('stats')}
+            className={`relative py-3 text-sm font-medium transition-colors ${
+              activeTab === 'stats' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            Stats
+            {activeTab === 'stats' && (
+              <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
+            )}
+          </button>
         </div>
 
         {/* Tab Content — lazy mount, then CSS hide to preserve state */}
@@ -369,6 +381,15 @@ export default function Home() {
                 initialWorkflowId={activeWorkflowId}
                 onWorkflowIdChange={setActiveWorkflowId}
               />
+            </div>
+          )}
+
+          {layoutsLoaded && mountedTabs.has('stats') && (
+            <div
+              className="absolute inset-0"
+              style={activeTab !== 'stats' ? { visibility: 'hidden', pointerEvents: 'none' } : undefined}
+            >
+              <StatsTab isActive={activeTab === 'stats'} />
             </div>
           )}
         </div>

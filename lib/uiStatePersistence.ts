@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 
 interface UIState {
-  activeTab: 'chat' | 'canvas';
+  activeTab: 'chat' | 'canvas' | 'stats';
   activeWorkflowId: string | null;
   chatHorizontalLayout: number[] | null;
   chatVerticalLayout: number[] | null;

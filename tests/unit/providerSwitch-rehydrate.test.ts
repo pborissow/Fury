@@ -75,6 +75,8 @@ const BASE_SETTINGS: AppSettings = {
   bedrockSmallFastModel: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
   bedrockAuthRefreshCmd: 'aws sso login --profile test-profile',
   bedrockClaudeFailoverEnabled: true,
+  pricingPollEnabled: true,
+  pricingPollIntervalDays: 7,
 };
 
 function clearVirtualFs() {

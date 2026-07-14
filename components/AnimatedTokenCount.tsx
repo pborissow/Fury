@@ -2,9 +2,14 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-// Cumulative output tokens → compact label. <1000 shown raw ("57 tokens"),
-// ≥1000 rounded to whole thousands ("194k tokens").
+// Total billed tokens → compact label. <1000 shown raw ("57 tokens"),
+// thousands rounded ("194k tokens"), millions with one decimal below 10
+// ("3.4M tokens") or whole above ("31M tokens").
 export function formatTokens(n: number): string {
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return `${m >= 10 ? Math.round(m) : m.toFixed(1)}M tokens`;
+  }
   if (n >= 1000) return `${Math.round(n / 1000)}k tokens`;
   return `${n} token${n === 1 ? '' : 's'}`;
 }

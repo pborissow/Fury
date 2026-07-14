@@ -67,13 +67,13 @@ export default function ChatTab({
   // freshness leaf in the sidebar — stamped when a viewed session stops
   // processing. Sessions without an entry fall back to their history timestamp.
   const [sessionActivity, setSessionActivity] = useState<Record<string, number>>({});
-  // Per-session live cumulative output tokens (archived baseline + in-flight
+  // Per-session live cumulative billed tokens (archived baseline + in-flight
   // turn), driven by session:usage SSE. Overlays archived metadata so the
   // sidebar count climbs as Claude streams; cleared once the archive catches up.
   const [liveTokens, setLiveTokens] = useState<Record<string, number>>({});
   // Pre-turn archived baseline, frozen at the first usage event of each run.
   // The server re-archives the live JSONL mid-turn (transcript:updated →
-  // archiveSessionFromDisk), so the session's metadata.totalOutputTokens grows
+  // archiveSessionFromDisk), so the session's metadata.totalTokens grows
   // during the run. Reading it per-event and adding the SSE tally would
   // double-count that growth (and the inflated overlay would never clear).
   // Freezing the baseline at run start keeps the math `P + R` correct.
@@ -363,7 +363,8 @@ export default function ChatTab({
       let changed = false;
       const next = { ...prev };
       for (const id of ids) {
-        const baseline = (history.find(h => h.sessionId === id)?.metadata?.totalOutputTokens as number) || 0;
+        const meta = history.find(h => h.sessionId === id)?.metadata;
+        const baseline = (meta?.totalTokens ?? meta?.totalOutputTokens ?? 0) as number;
         if (baseline >= prev[id]) { delete next[id]; changed = true; }
       }
       return changed ? next : prev;
@@ -692,22 +693,23 @@ export default function ChatTab({
       if (data.model) setCurrentModel(data.model);
     });
 
-    // Live output-token tally for the in-flight turn. Add it to the session's
-    // archived baseline (pre-turn total) to get the live cumulative the sidebar
-    // counts toward. The cleanup effect drops the overlay once the archived
-    // metadata catches up at turn end.
+    // Live billed-token tally for the in-flight turn (input+output+cache). Add
+    // it to the session's archived baseline (pre-turn total) to get the live
+    // cumulative the sidebar counts toward. The cleanup effect drops the overlay
+    // once the archived metadata catches up at turn end.
     es.addEventListener('session-usage', (e: MessageEvent) => {
       if (!shouldProcess()) return;
       const data = JSON.parse(e.data);
-      if (typeof data.turnOutputTokens !== 'number') return;
+      if (typeof data.turnTokens !== 'number') return;
       // Freeze the pre-turn baseline on the first event of this run; reuse it
       // for the rest so mid-turn metadata growth can't be double-counted.
       if (baselineByRunRef.current[mySessionId] === undefined) {
+        const meta = historyRef.current.find(h => h.sessionId === mySessionId)?.metadata;
         baselineByRunRef.current[mySessionId] =
-          (historyRef.current.find(h => h.sessionId === mySessionId)?.metadata?.totalOutputTokens as number) || 0;
+          (meta?.totalTokens ?? meta?.totalOutputTokens ?? 0) as number;
       }
       const baseline = baselineByRunRef.current[mySessionId];
-      setLiveTokens(prev => ({ ...prev, [mySessionId]: baseline + data.turnOutputTokens }));
+      setLiveTokens(prev => ({ ...prev, [mySessionId]: baseline + data.turnTokens }));
     });
 
     // Handle session:health events (replaces health polling)

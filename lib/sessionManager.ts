@@ -379,18 +379,23 @@ class SessionManager {
           eventBus.emitApp({ type: 'session:model', sessionId: session.sessionId, model });
         };
 
-        // Live output-token tally for this run, deduped by assistant message id
-        // (streaming repeats the same message's cumulative usage). Summed and
-        // emitted whenever it changes so the sidebar can count up in real time.
-        const turnOutputByMsgId = new Map<string, number>();
+        // Live billed-token tally for this run, deduped by assistant message id
+        // (streaming repeats the same message's cumulative usage). Tracks the
+        // full breakdown — input/cache tokens arrive with message_start and are
+        // fixed; output grows via message_delta. Summed as total billed tokens
+        // (the cost-driving count) and emitted on change so the sidebar counts
+        // up in real time, consistent with the archived metadata.totalTokens.
+        const numTok = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
+        type TurnUsage = { input: number; output: number; cacheWrite: number; cacheRead: number };
+        const turnUsageByMsgId = new Map<string, TurnUsage>();
         let currentStreamMsgId: string | null = null;
         let lastEmittedTurnTokens = -1;
         const emitUsageIfChanged = () => {
           let total = 0;
-          for (const v of turnOutputByMsgId.values()) total += v;
+          for (const v of turnUsageByMsgId.values()) total += v.input + v.output + v.cacheWrite + v.cacheRead;
           if (total === lastEmittedTurnTokens) return;
           lastEmittedTurnTokens = total;
-          eventBus.emitApp({ type: 'session:usage', sessionId: session.sessionId, turnOutputTokens: total });
+          eventBus.emitApp({ type: 'session:usage', sessionId: session.sessionId, turnTokens: total });
         };
         claude.stdout.on('data', (data) => {
           // Update activity timestamp whenever we receive data
@@ -466,10 +471,18 @@ class SessionManager {
                   if (event.type === 'message_start' && event.message?.id) {
                     const mid: string = event.message.id;
                     currentStreamMsgId = mid;
-                    const out = event.message.usage?.output_tokens;
-                    if (typeof out === 'number') { turnOutputByMsgId.set(mid, out); emitUsageIfChanged(); }
+                    const u = event.message.usage;
+                    turnUsageByMsgId.set(mid, {
+                      input: numTok(u?.input_tokens),
+                      output: numTok(u?.output_tokens),
+                      cacheWrite: numTok(u?.cache_creation_input_tokens),
+                      cacheRead: numTok(u?.cache_read_input_tokens),
+                    });
+                    emitUsageIfChanged();
                   } else if (event.type === 'message_delta' && currentStreamMsgId && typeof event.usage?.output_tokens === 'number') {
-                    turnOutputByMsgId.set(currentStreamMsgId, event.usage.output_tokens);
+                    const rec = turnUsageByMsgId.get(currentStreamMsgId) ?? { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+                    rec.output = event.usage.output_tokens;
+                    turnUsageByMsgId.set(currentStreamMsgId, rec);
                     emitUsageIfChanged();
                   }
                   if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
@@ -504,10 +517,17 @@ class SessionManager {
                 else if (json.type === 'assistant' && json.message?.content) {
                   const isSynthetic = json.message.model === '<synthetic>';
                   if (!isSynthetic) emitModelIfNew(json.message.model);
-                  // Update the live output-token tally as each assistant
-                  // message lands (one per agentic step).
-                  if (!isSynthetic && json.message.id && typeof json.message.usage?.output_tokens === 'number') {
-                    turnOutputByMsgId.set(json.message.id, json.message.usage.output_tokens);
+                  // Update the live billed-token tally as each assistant message
+                  // lands (one per agentic step) — the complete envelope carries
+                  // the authoritative final usage for the message.
+                  if (!isSynthetic && json.message.id && json.message.usage) {
+                    const u = json.message.usage;
+                    turnUsageByMsgId.set(json.message.id, {
+                      input: numTok(u.input_tokens),
+                      output: numTok(u.output_tokens),
+                      cacheWrite: numTok(u.cache_creation_input_tokens),
+                      cacheRead: numTok(u.cache_read_input_tokens),
+                    });
                     emitUsageIfChanged();
                   }
                   for (const block of json.message.content) {
