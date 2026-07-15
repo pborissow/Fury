@@ -155,9 +155,9 @@ export async function archiveTranscript(
   if (opts?.usageEvents) {
     for (const u of opts.usageEvents) {
       inserts.push({
-        sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_read)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        args: [sessionId, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheRead],
+        sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [sessionId, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead],
       });
     }
   }

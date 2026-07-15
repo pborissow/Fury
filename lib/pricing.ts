@@ -166,7 +166,11 @@ export function latestRate(model: string | null | undefined): ModelRates | null 
 export interface TokenUsage {
   input: number;
   output: number;
-  cacheWrite: number;
+  /** Cache-creation tokens with 5-minute TTL (bill at 1.25x input). */
+  cacheWrite5m: number;
+  /** Cache-creation tokens with 1-hour TTL (bill at 2x input). Claude Code's
+   *  default cache TTL, so this is where most cache-write spend lands. */
+  cacheWrite1h: number;
   cacheRead: number;
 }
 
@@ -181,9 +185,11 @@ export interface CostBreakdown {
  * Estimate the USD cost of a usage record. When `atDate` (ET "YYYY-MM-DD") is
  * given, the event is priced at the rate in effect that day — so historical
  * cost is stable across price changes. Omit `atDate` to use the current rate.
- * Cache writes bill at the 5-minute rate (Claude Code's default cache TTL).
- * Unknown models yield `{ cost: 0, priced: false }` so callers can flag
- * unpriced spend rather than baking in a wrong number.
+ * Cache writes are billed by their actual TTL: 5-minute at 1.25x input, 1-hour
+ * at 2x. (Pricing all cache writes at the 5m rate underestimated ~36% on cache-
+ * heavy sessions, since Claude Code writes 1h cache — verified against the SDK's
+ * total_cost_usd.) Unknown models yield `{ cost: 0, priced: false }` so callers
+ * can flag unpriced spend rather than baking in a wrong number.
  */
 export function costForUsage(
   model: string | null | undefined,
@@ -195,7 +201,8 @@ export function costForUsage(
   const cost =
     (usage.input * r.input +
       usage.output * r.output +
-      usage.cacheWrite * r.cacheWrite5m +
+      usage.cacheWrite5m * r.cacheWrite5m +
+      usage.cacheWrite1h * r.cacheWrite1h +
       usage.cacheRead * r.cacheRead) /
     1_000_000;
   return { cost, priced: true };

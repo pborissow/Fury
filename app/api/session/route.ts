@@ -3,6 +3,7 @@ import { unlink, readFile, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { sessionManager } from '@/lib/sessionManager';
+import { sdkSessionManager } from '@/lib/sdkSessionManager';
 import { projectPathToSlug } from '@/lib/utils';
 import { deleteArchivedSession, invalidateArchive, updateSessionMetadata } from '@/lib/transcriptArchiver';
 import { isInternalContent } from '@/lib/transcriptParser';
@@ -42,6 +43,17 @@ export async function DELETE(request: NextRequest) {
     results.push('Killed active process');
   } catch {
     // Not managed by Fury — that's fine
+  }
+
+  // Also tear down a persistent SDK session if this id is one. Unlike the
+  // shipping manager (fresh process per turn), an SDK session holds a warm
+  // process that would otherwise leak after the JSONL/history are deleted.
+  // Safe no-op for ids the SDK manager doesn't own.
+  try {
+    await sdkSessionManager.killSession(sessionId);
+    results.push('Killed SDK session process');
+  } catch {
+    // Not an SDK-managed session — fine
   }
 
   // 2. Remove from SQLite archive FIRST — before deleting the JSONL file,

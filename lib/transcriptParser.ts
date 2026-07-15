@@ -46,8 +46,15 @@ export interface UsageEvent {
   input: number;
   /** Generated output tokens (usage.output_tokens). */
   output: number;
-  /** Cache-creation input tokens (usage.cache_creation_input_tokens). */
+  /** Total cache-creation input tokens (5m + 1h). Kept for token counts. */
   cacheWrite: number;
+  /** 5-minute-TTL cache-creation tokens (cache_creation.ephemeral_5m_input_tokens). */
+  cacheWrite5m: number;
+  /** 1-hour-TTL cache-creation tokens (cache_creation.ephemeral_1h_input_tokens).
+   *  When the split object is absent (older transcripts) the flat
+   *  cache_creation_input_tokens total is attributed here — Claude Code writes
+   *  1h cache by default (verified against the SDK's total_cost_usd). */
+  cacheWrite1h: number;
   /** Cache-read input tokens (usage.cache_read_input_tokens). */
   cacheRead: number;
 }
@@ -229,13 +236,25 @@ export function parseTranscriptJsonl(content: string): {
           if (id) {
             const u = msg.usage;
             const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
+            // Split cache writes by TTL for accurate pricing (5m = 1.25x input,
+            // 1h = 2x). The CLI emits the breakdown in cache_creation; older
+            // transcripts have only the flat cache_creation_input_tokens, which
+            // we attribute to 1h (Claude Code's default TTL).
+            const cc = u.cache_creation;
+            const hasSplit = cc && (typeof cc.ephemeral_5m_input_tokens === 'number' ||
+              typeof cc.ephemeral_1h_input_tokens === 'number');
+            const cwFlat = num(u.cache_creation_input_tokens);
+            const cw5m = hasSplit ? num(cc.ephemeral_5m_input_tokens) : 0;
+            const cw1h = hasSplit ? num(cc.ephemeral_1h_input_tokens) : cwFlat;
             usageByMsgId.set(id, {
               messageId: id,
               model: typeof msg.model === 'string' ? msg.model : null,
               timestamp: typeof entry.timestamp === 'string' ? entry.timestamp : '',
               input: num(u.input_tokens),
               output: num(u.output_tokens),
-              cacheWrite: num(u.cache_creation_input_tokens),
+              cacheWrite: hasSplit ? cw5m + cw1h : cwFlat,
+              cacheWrite5m: cw5m,
+              cacheWrite1h: cw1h,
               cacheRead: num(u.cache_read_input_tokens),
             });
           }

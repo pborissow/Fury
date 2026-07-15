@@ -74,7 +74,9 @@ async function initDb(client: Client): Promise<void> {
       ts           TEXT,
       input        INTEGER NOT NULL DEFAULT 0,
       output       INTEGER NOT NULL DEFAULT 0,
-      cache_write  INTEGER NOT NULL DEFAULT 0,
+      cache_write    INTEGER NOT NULL DEFAULT 0,
+      cache_write_5m INTEGER NOT NULL DEFAULT 0,
+      cache_write_1h INTEGER NOT NULL DEFAULT 0,
       cache_read   INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (session_id, message_id)
     );
@@ -144,6 +146,18 @@ async function initDb(client: Client): Promise<void> {
     await client.execute('ALTER TABLE pricing_log ADD COLUMN effective_from TEXT');
   } catch {
     // Column already exists — expected after first migration
+  }
+
+  // Migration: split cache_write into 5m/1h TTL buckets for accurate pricing.
+  // Existing rows keep cache_write (the total); the split columns default to 0
+  // and the stats route attributes a legacy total to 1h until a session is
+  // re-archived (which repopulates them from the JSONL's cache_creation split).
+  for (const col of ['cache_write_5m', 'cache_write_1h']) {
+    try {
+      await client.execute(`ALTER TABLE usage_events ADD COLUMN ${col} INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
   }
 
   // Migration: backfill numCompactions metadata for existing archived sessions.
@@ -267,9 +281,9 @@ async function initDb(client: Client): Promise<void> {
       ];
       for (const u of events) {
         stmts.push({
-          sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_read)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-          args: [sid, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheRead],
+          sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: [sid, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead],
         });
       }
       // Chunk to stay under batch size limits on very large sessions.

@@ -65,7 +65,8 @@ export async function GET(req: Request) {
     const localDay = dayFormatter(tz);
     const db = await getDb();
     const res = await db.execute(`
-      SELECT u.session_id, u.model, u.ts, u.input, u.output, u.cache_write, u.cache_read,
+      SELECT u.session_id, u.model, u.ts, u.input, u.output,
+             u.cache_write, u.cache_write_5m, u.cache_write_1h, u.cache_read,
              s.project, s.display, s.metadata, s.message_count, s.created_at
       FROM usage_events u
       JOIN sessions s ON s.session_id = u.session_id`);
@@ -90,13 +91,20 @@ export async function GET(req: Request) {
       const cacheRead = Number(r.cache_read) || 0;
       const tokens = input + output + cacheWrite + cacheRead;
 
+      // Cache writes are priced by TTL (5m = 1.25x, 1h = 2x input). Rows written
+      // before the split migration have cache_write (total) but 0 in both split
+      // columns — attribute that legacy total to 1h (Claude Code's default TTL).
+      let cw5m = Number(r.cache_write_5m) || 0;
+      let cw1h = Number(r.cache_write_1h) || 0;
+      if (cw5m === 0 && cw1h === 0 && cacheWrite > 0) cw1h = cacheWrite;
+
       const tsMs = r.ts ? Date.parse(r.ts as string) : NaN;
       const ms = Number.isFinite(tsMs) ? tsMs : Number(r.created_at) || 0;
       const day = localDay(ms);
 
       // Price by the rate in effect on the event's day, so past sessions keep
       // their original cost when rates change going forward.
-      const { cost, priced } = costForUsage(rawModel, { input, output, cacheWrite, cacheRead }, day);
+      const { cost, priced } = costForUsage(rawModel, { input, output, cacheWrite5m: cw5m, cacheWrite1h: cw1h, cacheRead }, day);
       if (!priced) { unpricedEvents++; unpricedTokens += tokens; }
 
       const dk = day + '|' + model;

@@ -5,6 +5,8 @@ import { fileWatchers } from '@/lib/fileWatchers';
 import { startArchiveListener } from '@/lib/transcriptArchiver';
 import { mcpCache } from '@/lib/mcpCache';
 import { sessionManager } from '@/lib/sessionManager';
+import { sdkSessionManager } from '@/lib/sdkSessionManager';
+import { computeLiveSessionIds } from '@/lib/liveSessions';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -55,12 +57,22 @@ export async function GET(request: NextRequest) {
       // fires every few seconds while processing — skip the noise).
       let lastScannerIds: string[] = [];
       let lastSentKey = '';
+      // Read a manager id list defensively — an HMR race can leave a manager
+      // singleton momentarily unavailable; fall back to empty rather than throw.
+      const safeIds = (fn: () => string[]): string[] => {
+        try { return fn(); } catch { return []; }
+      };
       const emitLiveSessionsIfChanged = () => {
-        const merged = new Set<string>(lastScannerIds);
-        try {
-          for (const id of sessionManager.getActiveSessionIds()) merged.add(id);
-        } catch { /* manager unavailable (e.g. HMR race) — fall back to scanner-only */ }
-        const ids = [...merged].sort();
+        // "Live" = actively processing, not "has a warm process". For persistent
+        // SDK sessions the PID scanner reports the warm process even at rest, so
+        // computeLiveSessionIds subtracts Fury-managed SDK sessions and adds back
+        // only the ones actually processing (isProcessing).
+        const ids = computeLiveSessionIds({
+          scannerIds: lastScannerIds,
+          shippingActiveIds: safeIds(() => sessionManager.getActiveSessionIds()),
+          sdkManagedIds: safeIds(() => sdkSessionManager.getManagedSessionIds()),
+          sdkActiveIds: safeIds(() => sdkSessionManager.getActiveSessionIds()),
+        });
         const key = ids.join(',');
         if (key === lastSentKey) return;
         lastSentKey = key;
