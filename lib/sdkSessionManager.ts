@@ -503,7 +503,7 @@ class SdkSessionManager {
 // SINGLETON_VERSION when this class's behavior changes so the dev server
 // recreates the instance on the next import and picks up the new code. In
 // production the module loads once, so this never re-runs.
-const SINGLETON_VERSION = 4;
+const SINGLETON_VERSION = 5;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

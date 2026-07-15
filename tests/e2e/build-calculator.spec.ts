@@ -15,20 +15,34 @@
  * rewindFiles() is a real checkpoint revert (proven in scripts/verify-rewind.ts).
  *
  * COST/TIME: runs real Claude turns and writes real files under
- * ~/Documents/JavaScript/calculator (wiped + recreated each run). Budget
- * several minutes.
+ * <repo>/../fury-e2e-calc (wiped + recreated each run). Budget several minutes.
  */
 import { test, expect } from '@playwright/test';
 import { createHash, randomUUID } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { findSessionJsonlDir } from '../../lib/sessionPaths';
 
-const PROJECT = '/Users/peterborrisow/Documents/JavaScript/calculator';
+// Resolved relative to the repo, so the test is machine-independent (no
+// absolute home paths — works on macOS + Windows).
+//
+// Deliberately a SIBLING of the repo, not a directory inside it: when the cwd
+// sits inside a git repo, Claude Code resolves relative writes against the REPO
+// ROOT rather than the cwd. An in-repo path (e.g. test-results/calc) therefore
+// writes calculator.js into Fury itself — the project dir stays empty, the test
+// fails, and the repo gets polluted. Verified empirically; keep this outside.
+const PROJECT = join(__dirname, '..', '..', '..', 'fury-e2e-calc');
 const CALC = join(PROJECT, 'calculator.js');
-// Fury/Claude project slug: each path separator (/ \ :) becomes a dash.
-const SLUG = PROJECT.replace(/[\\/:]/g, '-');
-const JSONL = (sessionId: string) => join(homedir(), '.claude', 'projects', SLUG, `${sessionId}.jsonl`);
+
+// Resolve the transcript through Fury's own lookup instead of hand-deriving the
+// project slug: the CLI's slugification has edge cases (it also collapses
+// underscores, e.g. `_probe` -> `-probe`) and canonicalizes cwd (symlinks,
+// Windows subst drives). Returns null once the JSONL is gone.
+const jsonlPath = (sessionId: string): string | null => {
+  const loc = findSessionJsonlDir(sessionId, PROJECT);
+  return loc ? join(loc.dir, `${sessionId}.jsonl`) : null;
+};
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -127,8 +141,8 @@ let createdSessionId: string | null = null;
 test.afterAll(() => {
   if (!createdSessionId) return;
   try {
-    const jsonl = JSONL(createdSessionId);
-    if (existsSync(jsonl)) rmSync(jsonl);
+    const jsonl = jsonlPath(createdSessionId);
+    if (jsonl) rmSync(jsonl);
   } catch { /* best effort */ }
   try {
     const histPath = join(homedir(), '.claude', 'history.jsonl');
@@ -155,9 +169,9 @@ test('Fury builds a calculator, then stop + rewind reverts the refinement', asyn
   };
 
   // ---- clean slate ----
-  // A prior failed run can leave an orphaned CLI process holding cwd=calculator.
+  // A prior failed run can leave an orphaned CLI process holding cwd=calc.
   // Reap any first, then remove the dir with a short retry.
-  reapPidFiles((e) => String(e.cwd || '').replace(/\\/g, '/').includes('/JavaScript/calculator'));
+  reapPidFiles((e) => String(e.cwd || '').replace(/\\/g, '/').includes('/fury-e2e-calc'));
   for (let i = 0; i < 6; i++) {
     try { rmSync(PROJECT, { recursive: true, force: true }); break; }
     catch { await sleep(500); }
@@ -319,5 +333,5 @@ test('Fury builds a calculator, then stop + rewind reverts the refinement', asyn
   const dead = await poll(() => liveProcsForSession(sessionId).length === 0, 20_000, 300);
   console.log(`[E2E] After UI delete: live process(es) = [${liveProcsForSession(sessionId).join(', ')}]`);
   expect(dead, 'deleting the session should kill its warm CLI process(es)').toBe(true);
-  expect(existsSync(JSONL(sessionId)), 'session JSONL should be deleted').toBe(false);
+  expect(jsonlPath(sessionId), 'session JSONL should be deleted').toBeNull();
 });
