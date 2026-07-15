@@ -277,6 +277,18 @@ class SdkSessionManager {
     return [...this.sessions.keys()];
   }
 
+  /**
+   * Whether this session has an in-flight turn right now. Consulted by
+   * /api/health and /api/stream-buffer, which otherwise only see the CLI
+   * sessionManager — without this they report isProcessing:false for a live SDK
+   * session, and ChatTab's poll clears transcriptLoading (killing the bouncing
+   * dots AND dropping every session-stream event).
+   */
+  isSessionProcessing(sessionId: string): boolean {
+    const s = this.sessions.get(sessionId);
+    return !!(s && s.isProcessing);
+  }
+
   // ---- internals ----------------------------------------------------------
 
   /**

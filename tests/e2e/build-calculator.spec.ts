@@ -15,7 +15,8 @@
  * rewindFiles() is a real checkpoint revert (proven in scripts/verify-rewind.ts).
  *
  * COST/TIME: runs real Claude turns and writes real files under
- * C:\Users\petya\Documents\Javascript\calculator. Budget several minutes.
+ * ~/Documents/JavaScript/calculator (wiped + recreated each run). Budget
+ * several minutes.
  */
 import { test, expect } from '@playwright/test';
 import { createHash, randomUUID } from 'crypto';
@@ -23,9 +24,10 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { homedir } from 'os';
 import { join } from 'path';
 
-const PROJECT = 'C:\\Users\\petya\\Documents\\Javascript\\calculator';
+const PROJECT = '/Users/peterborrisow/Documents/JavaScript/calculator';
 const CALC = join(PROJECT, 'calculator.js');
-const SLUG = 'C--Users-petya-Documents-Javascript-calculator';
+// Fury/Claude project slug: each path separator (/ \ :) becomes a dash.
+const SLUG = PROJECT.replace(/[\\/:]/g, '-');
 const JSONL = (sessionId: string) => join(homedir(), '.claude', 'projects', SLUG, `${sessionId}.jsonl`);
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -118,20 +120,6 @@ function liveProcsForSession(sessionId: string): number[] {
   return alive;
 }
 
-/** UUIDs of real (string-content) user turns, in order, from the transcript. */
-function userTurnUuids(sessionId: string): string[] {
-  const path = JSONL(sessionId);
-  if (!existsSync(path)) return [];
-  return readFileSync(path, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((l) => {
-      try { return JSON.parse(l); } catch { return null; }
-    })
-    .filter((e) => e && e.type === 'user' && typeof e.message?.content === 'string' && !e.isMeta)
-    .map((e) => e.uuid as string);
-}
-
 // Session created by the test, cleaned up afterward so re-runs don't accumulate
 // rows in ~/.claude. The built calculator app is intentionally left on disk.
 let createdSessionId: string | null = null;
@@ -167,10 +155,9 @@ test('Fury builds a calculator, then stop + rewind reverts the refinement', asyn
   };
 
   // ---- clean slate ----
-  // A prior failed run can leave an orphaned CLI process holding cwd=calculator;
-  // Windows refuses to delete a process's working directory. Reap any first,
-  // then remove the dir with a short retry.
-  reapPidFiles((e) => String(e.cwd || '').replace(/\\/g, '/').includes('/Javascript/calculator'));
+  // A prior failed run can leave an orphaned CLI process holding cwd=calculator.
+  // Reap any first, then remove the dir with a short retry.
+  reapPidFiles((e) => String(e.cwd || '').replace(/\\/g, '/').includes('/JavaScript/calculator'));
   for (let i = 0; i < 6; i++) {
     try { rmSync(PROJECT, { recursive: true, force: true }); break; }
     catch { await sleep(500); }
@@ -204,44 +191,84 @@ test('Fury builds a calculator, then stop + rewind reverts the refinement', asyn
   expect(t1Calc).toMatch(/add/);
   expect(t1Calc).toMatch(/divide/);
 
-  // ---- Turn 2: refinement, then STOP mid-flight ----
-  console.log('[E2E] Turn 2: add power + modulo (will stop mid-flight)');
+  // ---- Open the session in the UI so the real stop/rewind controls render ----
+  // Sends stay on the API for determinism, but STOP and REWIND are driven
+  // through the actual UI (data-testid controls) to exercise the wired SDK
+  // handlers end-to-end: handleTranscriptStop → /api/claude-sdk/interrupt and
+  // handleRewind('both') → /api/claude-sdk/rewind.
+  await page.reload();
+  await page.waitForLoadState('domcontentloaded');
+  const openRow = page.locator('.group\\/session').filter({ hasText: 'Create a Node.js calculator' }).first();
+  await expect(openRow, 'session should appear in the sidebar').toBeVisible({ timeout: 30_000 });
+  await openRow.click();
+  await expect(page.getByTestId('send-button'), 'viewing the session shows the composer').toBeVisible({ timeout: 20_000 });
+
+  // ---- Turn 2: refinement, then STOP via UI (best-effort mid-flight) ----
+  // Catching a real LLM turn mid-flight is inherently racy (the SDK often
+  // finishes the edit in ~10s), so the Stop click is best-effort: if the turn
+  // already completed, the button is gone and the rewind below still reverts
+  // the change deterministically (that's the load-bearing assertion). When the
+  // window is caught, this exercises handleTranscriptStop → interrupt.
+  console.log('[E2E] Turn 2: add power + modulo + docs');
   await post('/api/claude-sdk', {
     prompt:
       'Modify calculator.js: add two more exported functions, power(base, exp) and ' +
-      'modulo(a, b), keeping the existing four. Edit only calculator.js. No explanation.',
+      'modulo(a, b), keeping the existing four. Also add a detailed JSDoc block above ' +
+      'every one of the six functions and add input validation (throw a TypeError on ' +
+      'non-number arguments) to each. Edit only calculator.js. No explanation.',
     sessionId,
     projectPath: PROJECT,
   });
 
-  // Interrupt as soon as turn 2 touches disk (best-effort mid-flight; if it
-  // already finished, interrupt is a harmless no-op and rewind still reverts).
-  const changed = await poll(() => !snapshotsEqual(snapshotDir(PROJECT), t1), 180_000, 300);
-  expect(changed, 'turn 2 should modify files').toBe(true);
-  console.log('[E2E] Detected turn-2 change → interrupting');
-  await post('/api/claude-sdk/interrupt', { sessionId });
+  // ---- Regression guard: processing indicator + live stream must render ----
+  // Both are gated on transcriptLoading. On the SDK branch they vanished because
+  // /api/stream-buffer (and /api/health) queried only the CLI sessionManager, so
+  // they reported isProcessing:false for SDK sessions; ChatTab's stream-buffer
+  // poll then cleared transcriptLoading — removing the bouncing dots AND dropping
+  // every session-stream event. Verify both render AND that the indicator
+  // PERSISTS across poll intervals (the bug cleared it within ~1-2s).
+  const dots = page.getByTestId('processing-dots');
+  await expect(dots, 'bouncing dots should appear during an SDK turn').toBeVisible({ timeout: 25_000 });
+  await expect(page.getByTestId('stream-event').first(), 'Stream tab should show live tool events').toBeVisible({ timeout: 45_000 });
+  await page.waitForTimeout(4000); // let the stream-buffer poll fire several times
+  await expect(dots, 'indicator must persist (not be cleared by the stream-buffer poll)').toBeVisible();
+  const streamCount = await page.getByTestId('stream-event').count();
+  console.log(`[E2E] processing dots persisted + ${streamCount} stream event(s) rendered`);
 
-  const mid = snapshotDir(PROJECT);
-  expect(snapshotsEqual(mid, t1), 'refinement should have landed a change vs turn 1').toBe(false);
-  console.log(`[E2E] Mid-flight calculator.js has power? ${/power/.test(readFileSync(CALC, 'utf8'))}`);
+  // Click the real Stop button the moment it's visible (as early as possible to
+  // win the race), as long as a change has already landed to revert.
+  const stopBtn = page.getByTestId('stop-button');
+  let clickedStop = false;
+  const t0 = Date.now();
+  while (Date.now() - t0 < 180_000) {
+    const changed = !snapshotsEqual(snapshotDir(PROJECT), t1);
+    if (changed && await stopBtn.isVisible().catch(() => false)) {
+      await stopBtn.click().catch(() => {});
+      clickedStop = true;
+      break;
+    }
+    // Turn finished (composer back) with a change already on disk → done racing.
+    if (changed && await page.getByTestId('send-button').isVisible().catch(() => false)) break;
+    await sleep(250);
+  }
+  expect(!snapshotsEqual(snapshotDir(PROJECT), t1), 'turn 2 should modify files').toBe(true);
+  console.log(`[E2E] Stop via UI clicked mid-flight? ${clickedStop}  (power now? ${/power/.test(readFileSync(CALC, 'utf8'))})`);
 
-  // ---- Rewind: revert turn-2's file changes via the SDK checkpoint ----
-  const uuids = await poll(() => {
-    const u = userTurnUuids(sessionId);
-    return u.length >= 2 ? u : false;
-  }, 15_000);
-  expect(uuids, 'should find 2 user-turn uuids in transcript').not.toBeNull();
-  const turn2Uuid = uuids![1];
-  console.log(`[E2E] Rewinding files to turn-2 user message ${turn2Uuid}`);
+  // Processing ends → composer returns and the UI refreshes the transcript from
+  // JSONL (turn-2 user message + its uuid, which the SDK rewind targets).
+  await expect(page.getByTestId('send-button'), 'composer returns').toBeVisible({ timeout: 30_000 });
 
-  const rewindRes = await post('/api/claude-sdk/rewind', { sessionId, messageUuid: turn2Uuid });
-  const rewindBody = await rewindRes.json();
-  console.log('[E2E] rewind result:', JSON.stringify(rewindBody.result));
-  expect(rewindBody.ok).toBe(true);
-  expect(rewindBody.result?.canRewind).toBe(true);
+  // ---- REWIND via UI: turn-2 rewind button → "Conversation + Code" ----
+  console.log('[E2E] Rewind via UI: rewind-turn-1 → "Conversation + Code"');
+  const rewindBtn = page.getByTestId('rewind-turn-1');
+  await rewindBtn.waitFor({ state: 'attached', timeout: 20_000 });
+  await rewindBtn.click({ force: true }); // opacity-0 until hover
+  const rewindDialog = page.getByRole('dialog');
+  await expect(rewindDialog).toBeVisible();
+  await rewindDialog.getByRole('button', { name: 'Conversation + Code' }).click();
 
   // ---- Verify: code reverted to the turn-1 state ----
-  await waitForStable(PROJECT, 1500, 20_000);
+  await waitForStable(PROJECT, 1500, 30_000);
   const finalCalc = existsSync(CALC) ? readFileSync(CALC, 'utf8') : '(missing)';
   console.log(`[E2E] After rewind: calculator.js has power? ${/power/.test(finalCalc)}`);
 

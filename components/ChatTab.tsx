@@ -38,6 +38,9 @@ interface ChatTabProps {
   isActive: boolean; // pause SSE processing when tab is hidden
   promptSuggestionsEnabled: boolean;
   ttsEnabled: boolean;
+  /** When on, stop/rewind route to the persistent SDK session endpoints
+   *  (/api/claude-sdk/interrupt, /rewind) instead of the CLI kill + LLM-undo. */
+  sdkSessionsEnabled: boolean;
 }
 
 export default function ChatTab({
@@ -48,6 +51,7 @@ export default function ChatTab({
   isActive,
   promptSuggestionsEnabled,
   ttsEnabled,
+  sdkSessionsEnabled,
 }: ChatTabProps) {
   // --- State moved from page.tsx ---
 
@@ -159,7 +163,7 @@ export default function ChatTab({
     sessionId: string; currentLabel: string;
   } | null>(null);
   const [rewindConfirm, setRewindConfirm] = useState<{
-    turnIndex: number; userMessage: string; fullMessage: string; timestamp: string;
+    turnIndex: number; userMessage: string; fullMessage: string; timestamp: string; uuid?: string;
   } | null>(null);
   const [intermediaryMessages, setIntermediaryMessages] = useState<TranscriptMsg[]>([]);
   const [showKillConfirm, setShowKillConfirm] = useState(false);
@@ -1065,11 +1069,17 @@ export default function ChatTab({
     if (!mySessionId) return;
 
     try {
-      const res = await fetch('/api/health', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: mySessionId, action: 'stop' }),
-      });
+      const res = sdkSessionsEnabled
+        ? await fetch('/api/claude-sdk/interrupt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: mySessionId }),
+          })
+        : await fetch('/api/health', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: mySessionId, action: 'stop' }),
+          });
 
       if (res.ok && activeSessionRef.current === mySessionId) {
         setIsStuck(false);
@@ -1177,37 +1187,55 @@ export default function ChatTab({
     setStreamEvents([]);
 
     try {
-      // Step 1: If "both", prompt Claude to undo code changes BEFORE truncating
-      // (so it still has context of what it did)
+      // Step 1: If "both", revert the code changes BEFORE truncating history.
       if (mode === 'both') {
-        const undoRes = await fetch('/api/claude', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prompt: `Undo all file changes you made starting from the message shown below. Restore every modified file to its state before that point. Do not explain, just revert the files.\n\nMessage to rewind to (${rewindInfo.timestamp ? new Date(rewindInfo.timestamp).toISOString() : 'unknown time'}):\n> ${rewindInfo.userMessage}`,
-            sessionId: mySessionId,
-            projectPath: myProject,
-          }),
-        });
+        if (sdkSessionsEnabled) {
+          // SDK path: native file-checkpoint revert. Deterministic (real
+          // git-style rollback), no extra LLM turn. Targets the user message's
+          // uuid — rewindFiles restores the working tree to that checkpoint.
+          if (!rewindInfo.uuid) throw new Error('Rewind requires the message uuid (SDK path)');
+          const rewindRes = await fetch('/api/claude-sdk/rewind', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              sessionId: mySessionId,
+              messageUuid: rewindInfo.uuid,
+              projectPath: myProject,
+            }),
+          });
+          if (!rewindRes.ok) throw new Error(`SDK rewind failed: ${rewindRes.status}`);
+        } else {
+          // CLI path: prompt Claude to undo code changes BEFORE truncating
+          // (so it still has context of what it did).
+          const undoRes = await fetch('/api/claude', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              prompt: `Undo all file changes you made starting from the message shown below. Restore every modified file to its state before that point. Do not explain, just revert the files.\n\nMessage to rewind to (${rewindInfo.timestamp ? new Date(rewindInfo.timestamp).toISOString() : 'unknown time'}):\n> ${rewindInfo.userMessage}`,
+              sessionId: mySessionId,
+              projectPath: myProject,
+            }),
+          });
 
-        if (!undoRes.ok) throw new Error(`Undo request failed: ${undoRes.status}`);
+          if (!undoRes.ok) throw new Error(`Undo request failed: ${undoRes.status}`);
 
-        // Poll health until the undo processing finishes.
-        // SSE delivers stream progress to the user during this time.
-        await new Promise<void>((resolve) => {
-          const poll = setInterval(async () => {
-            try {
-              const healthRes = await fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`);
-              if (healthRes.ok) {
-                const healthData = await healthRes.json();
-                if (!healthData.isProcessing) {
-                  clearInterval(poll);
-                  resolve();
+          // Poll health until the undo processing finishes.
+          // SSE delivers stream progress to the user during this time.
+          await new Promise<void>((resolve) => {
+            const poll = setInterval(async () => {
+              try {
+                const healthRes = await fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`);
+                if (healthRes.ok) {
+                  const healthData = await healthRes.json();
+                  if (!healthData.isProcessing) {
+                    clearInterval(poll);
+                    resolve();
+                  }
                 }
-              }
-            } catch { /* retry next interval */ }
-          }, 2000);
-        });
+              } catch { /* retry next interval */ }
+            }, 2000);
+          });
+        }
       }
 
       // Step 2: Truncate the JSONL (removes original turns + the undo prompt)
@@ -1253,11 +1281,21 @@ export default function ChatTab({
     const mySessionId = viewingTranscriptId;
     if (!mySessionId) return;
     try {
-      await fetch('/api/health', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: mySessionId, action: 'stop' }),
-      });
+      if (sdkSessionsEnabled) {
+        // SDK path: interrupt the in-flight turn without tearing down the
+        // persistent session (keeps the warm process + checkpoints alive).
+        await fetch('/api/claude-sdk/interrupt', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: mySessionId }),
+        });
+      } else {
+        await fetch('/api/health', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: mySessionId, action: 'stop' }),
+        });
+      }
     } catch (error) {
       console.error('[App] Failed to stop session:', error);
     } finally {
@@ -1541,7 +1579,7 @@ export default function ChatTab({
                                 title="View live stream"
                               >
                                 <div className="text-xs opacity-70 mb-1">Claude</div>
-                                <div className="flex items-center gap-1 py-2">
+                                <div data-testid="processing-dots" className="flex items-center gap-1 py-2">
                                   <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
                                   <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
                                   <div className="dot w-2 h-2 bg-foreground rounded-full"></div>

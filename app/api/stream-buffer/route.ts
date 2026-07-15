@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { sessionManager } from '@/lib/sessionManager';
+import { sdkSessionManager } from '@/lib/sdkSessionManager';
 
 export const runtime = 'nodejs';
 
@@ -22,17 +23,21 @@ export async function GET(req: NextRequest) {
 
   const health = sessionManager.getSessionHealth(sessionId);
   const buffer = sessionManager.getStreamBuffer(sessionId);
+  // A turn served by the persistent SDK manager isn't tracked by the CLI
+  // sessionManager, so OR in its processing state — otherwise ChatTab's poll
+  // sees isProcessing:false and clears transcriptLoading (no dots, no stream).
+  const isProcessing = health.isProcessing || sdkSessionManager.isSessionProcessing(sessionId);
 
   if (!buffer) {
     return Response.json({
       hasBuffer: false,
-      isProcessing: health.isProcessing,
+      isProcessing,
     });
   }
 
   return Response.json({
     hasBuffer: true,
-    isProcessing: health.isProcessing,
+    isProcessing,
     userPrompt: buffer.userPrompt,
     accumulatedText: buffer.accumulatedText,
     events: buffer.events,

@@ -30,7 +30,7 @@ const ALLOWED_KEYS = [
   'ttsProvider', 'ttsRemoteHost', 'ttsRemotePort',
   'bedrockAwsProfile', 'bedrockAwsRegion', 'bedrockModel',
   'bedrockSmallFastModel', 'bedrockAuthRefreshCmd',
-  'bedrockClaudeFailoverEnabled',
+  'bedrockClaudeFailoverEnabled', 'sdkSessionsEnabled',
 ] as const;
 
 export async function POST(request: Request) {

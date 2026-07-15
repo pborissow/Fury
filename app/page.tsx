@@ -75,6 +75,7 @@ export default function Home() {
   // App settings (persisted to server)
   const [promptSuggestionsEnabled, setPromptSuggestionsEnabled] = useState(true);
   const [ttsEnabled, setTtsEnabled] = useState(false);
+  const [sdkSessionsEnabled, setSdkSessionsEnabled] = useState(true);
   const [localhostOnly, setLocalhostOnly] = useState(true);
   const [hasCredentials, setHasCredentials] = useState(false);
   const [authUsername, setAuthUsername] = useState('');
@@ -100,6 +101,7 @@ export default function Home() {
     fetch('/api/settings').then(r => r.json()).then(s => {
       if (s.promptSuggestionsEnabled !== undefined) setPromptSuggestionsEnabled(s.promptSuggestionsEnabled);
       if (s.ttsEnabled !== undefined) setTtsEnabled(s.ttsEnabled);
+      if (s.sdkSessionsEnabled !== undefined) setSdkSessionsEnabled(s.sdkSessionsEnabled);
       if (s.localhostOnly !== undefined) setLocalhostOnly(s.localhostOnly);
       if (s.hasCredentials !== undefined) setHasCredentials(s.hasCredentials);
       if (s.authUsername) setAuthUsername(s.authUsername);
@@ -363,6 +365,7 @@ export default function Home() {
                 isActive={activeTab === 'chat'}
                 promptSuggestionsEnabled={promptSuggestionsEnabled}
                 ttsEnabled={ttsEnabled}
+                sdkSessionsEnabled={sdkSessionsEnabled}
               />
             </div>
           )}

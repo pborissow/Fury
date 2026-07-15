@@ -55,6 +55,7 @@ const BASE_SETTINGS: AppSettings = {
   bedrockClaudeFailoverEnabled: true,
   pricingPollEnabled: true,
   pricingPollIntervalDays: 7,
+  sdkSessionsEnabled: true,
 };
 
 beforeEach(() => {

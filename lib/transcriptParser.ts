@@ -23,6 +23,9 @@ export interface TranscriptMessage {
   content: string;
   timestamp: string;
   turnMeta?: TurnMeta;
+  /** JSONL entry uuid — surfaced for user messages so the UI can target a
+   *  turn for the SDK's native rewindFiles(messageUuid). */
+  uuid?: string;
 }
 
 /**
@@ -211,6 +214,7 @@ export function parseTranscriptJsonl(content: string): {
             role: 'user',
             content: msg.content,
             timestamp: entry.timestamp,
+            uuid: entry.uuid,
           });
           // New turn starting — drop any tool counts accumulated during
           // the previous turn.

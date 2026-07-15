@@ -26,6 +26,12 @@ export interface AppSettings {
   pricingPollEnabled: boolean;
   /** Days between pricing checks. Calibrated from the last recorded check on boot. */
   pricingPollIntervalDays: number;
+  /** Route chat turns through the persistent @anthropic-ai/claude-agent-sdk
+   *  session manager (lib/sdkSessionManager.ts) instead of the one-shot
+   *  `claude --print` manager. Keeps the CLI process alive across turns, so
+   *  background tasks and scheduled wakeups survive instead of being orphaned.
+   *  Default ON in the sdk-session-prototype branch. */
+  sdkSessionsEnabled: boolean;
 }
 
 const DEFAULTS: AppSettings = {
@@ -49,6 +55,7 @@ const DEFAULTS: AppSettings = {
   bedrockClaudeFailoverEnabled: false,
   pricingPollEnabled: true,
   pricingPollIntervalDays: 7,
+  sdkSessionsEnabled: true,
 };
 
 class SettingsPersistence {

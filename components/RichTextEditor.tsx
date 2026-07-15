@@ -549,6 +549,7 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
 
           {/* Send/Stop Button */}
           <Button
+            data-testid={isProcessing ? 'stop-button' : 'send-button'}
             onClick={isProcessing ? onStop : handleSubmit}
             disabled={!isProcessing && (disabled || editor.isEmpty)}
             className={`h-10 w-10 rounded-full text-white p-0 ${

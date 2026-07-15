@@ -7,6 +7,8 @@ export interface TranscriptMsg {
   role: 'user' | 'assistant';
   content: string;
   timestamp: string;
+  /** JSONL entry uuid (user messages) — target for SDK rewindFiles. */
+  uuid?: string;
 }
 
 export interface SessionMetadata {
