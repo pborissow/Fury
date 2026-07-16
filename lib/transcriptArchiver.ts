@@ -61,7 +61,19 @@ export async function archiveTranscript(
   messages: TranscriptMessage[],
   rawLines?: string[],
   skipHashCheck?: boolean,
-  opts?: { numCompactions?: number; totalOutputTokens?: number; usageEvents?: UsageEvent[] }
+  opts?: {
+    numCompactions?: number;
+    totalOutputTokens?: number;
+    usageEvents?: UsageEvent[];
+    /** Current context occupancy in tokens (parseTranscriptJsonl().contextTokens). */
+    contextTokens?: number;
+    /** The model's context window. NOT derivable from the JSONL — the transcript
+     *  records "claude-opus-4-8" whether or not the [1m] beta was active, and
+     *  carries no window field. Supplied by the session manager from the SDK's
+     *  `result.modelUsage[model].contextWindow`. When omitted we fall back to
+     *  whatever a previous run already stored, so re-archiving never loses it. */
+    contextWindow?: number;
+  }
 ): Promise<void> {
   const hash = computeHash(jsonlContent);
 
@@ -114,6 +126,24 @@ export async function archiveTranscript(
     return;
   }
 
+  // Resolve the context window before writing usage_events. The window can't be
+  // recovered from the transcript, so a caller that doesn't know it (e.g. the
+  // file-watch archive path, which runs without a live session) must inherit the
+  // value a previous run persisted rather than stamping 0 over it.
+  let contextWindow = opts?.contextWindow ?? 0;
+  if (!contextWindow) {
+    const prior = await db.execute({
+      sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+      args: [sessionId],
+    });
+    if (prior.rows[0]?.metadata) {
+      try {
+        const w = JSON.parse(prior.rows[0].metadata as string).contextWindow;
+        if (typeof w === 'number' && isFinite(w) && w > 0) contextWindow = w;
+      } catch {}
+    }
+  }
+
   // Build statements: UPSERT session (with NULL hash), clear old data, then insert new data.
   // The hash is set to NULL initially so that if a later batch fails, the incomplete
   // archive will be retried on the next call (NULL hash never matches).
@@ -155,9 +185,9 @@ export async function archiveTranscript(
   if (opts?.usageEvents) {
     for (const u of opts.usageEvents) {
       inserts.push({
-        sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        args: [sessionId, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead],
+        sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read, context_window, is_sidechain)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [sessionId, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead, contextWindow, u.isSidechain ? 1 : 0],
       });
     }
   }
@@ -175,7 +205,9 @@ export async function archiveTranscript(
   const nc = opts?.numCompactions ?? 0;
   const tot = opts?.totalOutputTokens;
   const wroteUsage = Array.isArray(opts?.usageEvents);
-  const hasMeta = nc > 0 || typeof tot === 'number' || wroteUsage;
+  const ctxTok = opts?.contextTokens;
+  const hasMeta =
+    nc > 0 || typeof tot === 'number' || wroteUsage || typeof ctxTok === 'number' || contextWindow > 0;
   if (hasMeta) {
     // Read existing metadata, merge in derived fields, write back with hash
     const metaRow = await db.execute({
@@ -200,6 +232,12 @@ export async function archiveTranscript(
       meta.totalTokens = opts!.usageEvents!.reduce(
         (s, u) => s + u.input + u.output + u.cacheWrite + u.cacheRead, 0);
     }
+    // Current context occupancy + the window it's measured against. The session
+    // list renders these directly (size, fill %, breakpoint icons) without
+    // touching usage_events. contextWindow stays absent when unknown — the UI
+    // then shows the size but no fill, rather than guessing a denominator.
+    if (typeof ctxTok === 'number') meta.contextTokens = ctxTok;
+    if (contextWindow > 0) meta.contextWindow = contextWindow;
     await db.execute({
       sql: 'UPDATE sessions SET jsonl_hash = ?, metadata = ? WHERE session_id = ?',
       args: [hash, JSON.stringify(meta), sessionId],
@@ -209,6 +247,47 @@ export async function archiveTranscript(
       sql: 'UPDATE sessions SET jsonl_hash = ? WHERE session_id = ?',
       args: [hash, sessionId],
     });
+  }
+}
+
+/**
+ * Persist a session's context window onto its metadata.
+ *
+ * The window is only ever reported by the running CLI/SDK (on the `result`
+ * envelope's modelUsage) and is unrecoverable from the transcript afterwards —
+ * the JSONL logs "claude-opus-4-8" whether or not the [1m] beta was active and
+ * carries no window field. Capturing it here is what lets an archived session
+ * render a fill %; without it the list shows context size only.
+ *
+ * Best-effort: a failure costs a fill bar, never a turn. Safe to call on every
+ * result — it no-ops when the value is unchanged.
+ */
+export async function persistSessionContextWindow(
+  sessionId: string,
+  contextWindow: number
+): Promise<void> {
+  if (!(contextWindow > 0)) return;
+  try {
+    const db = await getDb();
+    const row = await db.execute({
+      sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+      args: [sessionId],
+    });
+    // The row may not exist yet on a session's first turn; the archiver creates
+    // it and the next result persists the window.
+    if (row.rows.length === 0) return;
+    let meta: Record<string, unknown> = {};
+    if (row.rows[0]?.metadata) {
+      try { meta = JSON.parse(row.rows[0].metadata as string); } catch {}
+    }
+    if (meta.contextWindow === contextWindow) return;
+    meta.contextWindow = contextWindow;
+    await db.execute({
+      sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+      args: [JSON.stringify(meta), sessionId],
+    });
+  } catch (err) {
+    console.warn(`[persistSessionContextWindow] failed for ${sessionId}:`, err);
   }
 }
 
@@ -398,11 +477,11 @@ async function archiveSessionFromDisk(
   const hash = computeHash(content);
   if (await isCurrentlyArchived(sessionId, hash)) return;
 
-  const { messages, rawLines, numCompactions, totalOutputTokens, usageEvents } = parseTranscriptJsonl(content);
+  const { messages, rawLines, numCompactions, totalOutputTokens, usageEvents, contextTokens } = parseTranscriptJsonl(content);
   if (messages.length === 0) return;
 
   const label = display || messages.find(m => m.role === 'user')?.content?.substring(0, 200) || sessionId;
-  await archiveTranscript(sessionId, project, label, content, messages, rawLines, true, { numCompactions, totalOutputTokens, usageEvents });
+  await archiveTranscript(sessionId, project, label, content, messages, rawLines, true, { numCompactions, totalOutputTokens, usageEvents, contextTokens });
 }
 
 /**

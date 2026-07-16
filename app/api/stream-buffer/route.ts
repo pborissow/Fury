@@ -22,10 +22,15 @@ export async function GET(req: NextRequest) {
   }
 
   const health = sessionManager.getSessionHealth(sessionId);
-  const buffer = sessionManager.getStreamBuffer(sessionId);
   // A turn served by the persistent SDK manager isn't tracked by the CLI
-  // sessionManager, so OR in its processing state — otherwise ChatTab's poll
-  // sees isProcessing:false and clears transcriptLoading (no dots, no stream).
+  // sessionManager, so fall back to its buffer. Without this the response is
+  // `hasBuffer:false` for every SDK session, and ChatTab skips the branch that
+  // strips the in-flight turn's partial assistant messages from the JSONL —
+  // rendering intermediary bubbles above the bouncing dots — and loses stream
+  // restore (text/events/timer) on switch-back.
+  const buffer = sessionManager.getStreamBuffer(sessionId) ?? sdkSessionManager.getStreamBuffer(sessionId);
+  // Likewise OR in its processing state — otherwise ChatTab's poll sees
+  // isProcessing:false and clears transcriptLoading (no dots, no stream).
   const isProcessing = health.isProcessing || sdkSessionManager.isSessionProcessing(sessionId);
 
   if (!buffer) {

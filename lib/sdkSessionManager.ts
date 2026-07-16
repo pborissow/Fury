@@ -3,8 +3,13 @@ import { appendFile } from 'fs/promises';
 import { readdirSync, readFileSync, rmSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { persistSessionContextWindow } from './transcriptArchiver';
 import { eventBus } from './eventBus';
 import { findSessionJsonlDir } from './sessionPaths';
+// Type-only (erased at compile time) — no runtime coupling to the CLI manager.
+// Reusing its shapes keeps /api/stream-buffer and ChatTab identical for both
+// backends.
+import type { StreamBuffer, StreamBufferEvent } from './sessionManager';
 
 /**
  * PROTOTYPE — persistent-session manager built on @anthropic-ai/claude-agent-sdk.
@@ -82,19 +87,42 @@ interface SdkSession {
   // shipping manager's session:usage accounting).
   usageByMsg: Map<string, number>;
   lastEmittedTokens: number;
-  // Whether we've written this session's history.jsonl entry yet (once per
-  // in-memory session is enough — buildHistoryMap dedupes to the earliest).
-  historyWritten: boolean;
+  lastEmittedContext: number;
+  lastEmittedWindow: number;
+  // Current context occupancy: the prompt size of the most recent API call
+  // (input + cache write + cache read; output isn't part of the next prompt).
+  // An absolute level, not a running total — the last call wins.
+  contextTokens: number;
+  // The model's context window, from result.modelUsage[model].contextWindow.
+  // 0 until the first result of the session. Not recoverable from the JSONL
+  // (see archiveTranscript's contextWindow doc), so capturing it here is the
+  // only way archived sessions ever learn their denominator.
+  contextWindow: number;
   // Aborts the query() and terminates the underlying CLI subprocess. This is
   // the SDK's documented hard-stop (Options.abortController) — used by stop()
   // and killSession() so deleting a session actually kills its warm process.
   abortController?: AbortController;
+  // Server-side buffer of the current turn's stream, mirroring the CLI manager.
+  // Load-bearing for the UI: ChatTab keys its "strip the in-flight turn's
+  // partial assistant messages" logic on this (otherwise the JSONL's partials
+  // render as intermediary bubbles above the bouncing dots), and restores
+  // streamed text / tool events / the elapsed timer from it when the user opens
+  // or switches back to a session mid-turn.
+  streamBuffer?: StreamBuffer;
 }
 
 const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
 
+/** When this Node process started. Any CLI process older than this cannot have
+ *  been spawned by us, which is how reapOrphanedProcesses tells a leftover from
+ *  a previous server life apart from a live, unrelated SDK app. */
+const PROCESS_STARTED_AT = Date.now() - Math.floor(process.uptime() * 1000);
+
 class SdkSessionManager {
   private sessions = new Map<string, SdkSession>();
+  /** Keep completed stream buffers this long so a user switching back right
+   *  after a turn still sees its final state (matches the CLI manager). */
+  private readonly BUFFER_TTL = 60 * 1000;
 
   private getOrCreate(sessionId: string): SdkSession {
     let s = this.sessions.get(sessionId);
@@ -107,8 +135,11 @@ class SdkSessionManager {
         lastActivity: Date.now(),
         ttftEmitted: false,
         usageByMsg: new Map(),
+        contextTokens: 0,
+        contextWindow: 0,
         lastEmittedTokens: -1,
-        historyWritten: false,
+        lastEmittedContext: -1,
+        lastEmittedWindow: -1,
       };
       this.sessions.set(sessionId, s);
     }
@@ -130,8 +161,27 @@ class SdkSessionManager {
     // archiver. scanAndArchiveAll (lib/db.ts) SKIPS any session that has no
     // history.jsonl entry — it needs the real project path, not the slug. The
     // interactive CLI writes history.jsonl itself, but the SDK's streaming
-    // session does NOT, so we write it here (parity with sessionManager.ts).
-    this.ensureHistoryEntry(s, prompt);
+    // session does NOT, so we write it here (parity with sessionManager.ts,
+    // which appends one entry per turn).
+    this.appendHistoryEntry(s, prompt);
+
+    // Open this turn's stream buffer BEFORE the first event can arrive.
+    // `userPrompt` must be the exact prompt text: ChatTab matches it against the
+    // JSONL user message to find where to cut the in-flight turn's partials.
+    s.streamBuffer = {
+      userPrompt: prompt,
+      accumulatedText: '',
+      events: [],
+      isActive: true,
+      startedAt: Date.now(),
+    };
+
+    // Reset the per-turn tally. eventBus's SessionUsageEvent documents
+    // turnTokens as "accrued so far in the in-flight turn", but this map lives
+    // on the session, which (unlike the CLI manager's per-spawn map) outlives
+    // the turn — so without this it silently became session-cumulative.
+    s.usageByMsg.clear();
+    s.lastEmittedTokens = -1;
 
     s.isProcessing = true;
     s.startedAt = Date.now();
@@ -180,6 +230,7 @@ class SdkSessionManager {
     }
     if (s) {
       s.isProcessing = false;
+      this.closeBuffer(s);
       this.emitHealth(s, false);
     }
   }
@@ -201,6 +252,7 @@ class SdkSessionManager {
     s.input = null;
     s.abortController = undefined;
     s.isProcessing = false;
+    this.closeBuffer(s);
     this.emitHealth(s, false);
   }
 
@@ -228,6 +280,100 @@ class SdkSessionManager {
     this.killProcessesForSession(sessionId);
     this.sessions.delete(sessionId);
     if (s) this.emitHealth(s, false);
+  }
+
+  /**
+   * Tear down every session this manager owns. Call on server shutdown: the SDK
+   * spawns the CLI as a child of this process, but a dying parent does NOT take
+   * its children with it — they get reparented and keep running. Without this,
+   * every restart (Ctrl+C, deploy, nodemon) leaks a warm process that still
+   * burns tokens, still writes the session JSONL, and still shows up in the PID
+   * scanner as Live while the fresh manager has no handle to stream or stop it.
+   */
+  /**
+   * Take over the live session records from the previous instance when this
+   * module hot-reloads (see the SINGLETON_VERSION block at the bottom).
+   *
+   * The records are carried BY REFERENCE on purpose: the previous instance's
+   * still-running consume() loops keep mutating the very same objects (
+   * isProcessing, streamBuffer, usage) that this instance serves to
+   * /api/stream-buffer and /api/health. So an in-flight turn survives the reload
+   * — dots keep bouncing, partials keep getting stripped — instead of being
+   * orphaned into a zombie the UI can neither see nor stop. Defensive about the
+   * previous instance's shape, since it was built from a different module
+   * version whose fields may not match.
+   */
+  adoptSessionsFrom(previous: SdkSessionManager): void {
+    const prior = (previous as unknown as { sessions?: Map<string, SdkSession> }).sessions;
+    if (!(prior instanceof Map)) return;
+    for (const [id, session] of prior) {
+      if (!this.sessions.has(id)) this.sessions.set(id, session);
+    }
+  }
+
+  async killAll(): Promise<number> {
+    const ids = [...this.sessions.keys()];
+    for (const id of ids) await this.killSession(id);
+    return ids.length;
+  }
+
+  /**
+   * Kill CLI processes left over from a PREVIOUS server life. Fury's SDK
+   * sessions are pure in-memory state, so after a restart the manager owns
+   * nothing while the old processes are still alive — a zombie the UI reports
+   * as Live (PID scanner) but with no dots/stream/buffer (manager knows
+   * nothing), and which the SDK gives us no way to re-attach to. Reaping makes
+   * the state honest and consistent.
+   *
+   * Scoping (deliberately conservative — this kills processes):
+   *  - `entrypoint: 'sdk-ts'` alone is NOT enough: that marks ANY app using the
+   *    TS Agent SDK, including our own scripts/probe-*.ts and compare-cost.ts.
+   *  - So we also require the process to have started BEFORE this server did.
+   *    Anything older cannot belong to us and is therefore left over from a
+   *    previous life; anything newer (a probe, another app started since) is
+   *    spared.
+   *  - Sessions this manager owns are always skipped, so it's safe to call at
+   *    any time; at boot the map is empty, which is the intended sweep.
+   *
+   * Residual risk: a second Fury instance whose processes predate this one would
+   * still match. Tests MUST pass `onlySessionId` rather than rely on that.
+   *
+   * `onlySessionId` narrows the sweep to a single session. Tests MUST pass it:
+   * a probe run outside the server has an empty map, so an unscoped call would
+   * treat every live SDK process on the machine — including sessions the user is
+   * actively using — as an orphan and kill them.
+   */
+  reapOrphanedProcesses(opts?: { onlySessionId?: string }): number {
+    let dir: string;
+    let files: string[];
+    try {
+      dir = join(homedir(), '.claude', 'sessions');
+      files = readdirSync(dir);
+    } catch {
+      return 0;
+    }
+    let reaped = 0;
+    for (const f of files) {
+      if (!f.endsWith('.json')) continue;
+      const full = join(dir, f);
+      try {
+        const e = JSON.parse(readFileSync(full, 'utf8'));
+        if (e.entrypoint !== 'sdk-ts' || typeof e.pid !== 'number') continue;
+        if (opts?.onlySessionId && e.sessionId !== opts.onlySessionId) continue;
+        if (this.sessions.has(e.sessionId)) continue; // we own it — leave it alone
+        // Predates this process => can't be ours => left over from a previous
+        // life. Spares concurrently-running SDK apps (incl. our own probes).
+        // Skipped when explicitly scoped to one session (tests).
+        if (!opts?.onlySessionId && !(typeof e.startedAt === 'number' && e.startedAt < PROCESS_STARTED_AT)) continue;
+        let alive = false;
+        try { process.kill(e.pid, 0); alive = true; } catch { /* already dead */ }
+        if (alive) {
+          try { process.kill(e.pid, 'SIGKILL'); reaped++; } catch { /* raced */ }
+        }
+        try { rmSync(full); } catch { /* leave stale */ }
+      } catch { /* unreadable/foreign pid file — skip */ }
+    }
+    return reaped;
   }
 
   /** SIGKILL every CLI process whose ~/.claude/sessions PID file names this id. */
@@ -289,16 +435,41 @@ class SdkSessionManager {
     return !!(s && s.isProcessing);
   }
 
+  /**
+   * The current turn's stream buffer, served by /api/stream-buffer. Without it
+   * ChatTab sees `hasBuffer:false` for SDK sessions and skips the branch that
+   * strips the in-flight turn's partial assistant messages — so opening a
+   * working session renders intermediary bubbles above the bouncing dots. It
+   * also restores streamed text / tool events / the elapsed timer on
+   * switch-back. Completed buffers expire after BUFFER_TTL.
+   */
+  getStreamBuffer(sessionId: string): StreamBuffer | null {
+    const s = this.sessions.get(sessionId);
+    if (!s?.streamBuffer) return null;
+    const buf = s.streamBuffer;
+    if (!buf.isActive && buf.completedAt && Date.now() - buf.completedAt > this.BUFFER_TTL) {
+      s.streamBuffer = undefined;
+      return null;
+    }
+    return buf;
+  }
+
   // ---- internals ----------------------------------------------------------
 
   /**
-   * Append this session's entry to ~/.claude/history.jsonl (once per session).
-   * Mirrors sessionManager.ts — without it, SDK sessions never appear in the
-   * history sidebar and the DB startup scan skips them (no project path).
+   * Append an entry to ~/.claude/history.jsonl for THIS TURN. Mirrors
+   * sessionManager.ts — without it, SDK sessions never appear in the history
+   * sidebar and the DB startup scan skips them (no project path).
+   *
+   * Once per TURN, not once per session. history.jsonl is a prompt log, and
+   * /api/history derives the sidebar's "N messages" by counting a session's
+   * entries — so writing once per session collapsed every SDK session to
+   * "1 message" (it only ever grew when a server restart reset the in-memory
+   * map). buildHistoryMap (lib/db.ts) dedupes to the earliest entry per session
+   * for display, and /api/history picks a best display of its own, so the
+   * repeated entries are expected by both readers.
    */
-  private ensureHistoryEntry(s: SdkSession, prompt: string): void {
-    if (s.historyWritten) return;
-    s.historyWritten = true;
+  private appendHistoryEntry(s: SdkSession, prompt: string): void {
     try {
       const entry = JSON.stringify({
         display: prompt.length > 200 ? prompt.slice(0, 200) + '...' : prompt,
@@ -313,6 +484,31 @@ class SdkSessionManager {
       );
     } catch (err) {
       console.error('[SdkSessionManager] Failed to build history entry:', err);
+    }
+  }
+
+  /** Append streamed text to the buffer, coalescing consecutive text events. */
+  private bufferText(s: SdkSession, text: string): void {
+    const buf = s.streamBuffer;
+    if (!buf) return;
+    buf.accumulatedText += text;
+    const last = buf.events[buf.events.length - 1];
+    if (last && last.type === 'text') {
+      last.content = (last.content || '') + text;
+    } else {
+      buf.events.push({ type: 'text', content: text, ts: Date.now() });
+    }
+  }
+
+  private bufferEvent(s: SdkSession, evt: StreamBufferEvent): void {
+    s.streamBuffer?.events.push(evt);
+  }
+
+  /** Close the current buffer (turn ended / interrupted) but keep its content. */
+  private closeBuffer(s: SdkSession): void {
+    if (s.streamBuffer?.isActive) {
+      s.streamBuffer.isActive = false;
+      s.streamBuffer.completedAt = Date.now();
     }
   }
 
@@ -334,6 +530,18 @@ class SdkSessionManager {
   };
 
   private startQuery(s: SdkSession): void {
+    // Reclaim any CLI process still running for this session before spawning a
+    // replacement. consume() nulls s.q when the message stream ends (e.g. after
+    // an interrupt) WITHOUT terminating the process, so the next sendMessage
+    // would spawn a second process for the same session: both alive, both
+    // writing the same JSONL, only the newest one tracked/abortable.
+    // startQuery only runs when s.q is null, so anything still alive here is a
+    // leak by definition.
+    if (s.abortController && !s.abortController.signal.aborted) {
+      try { s.abortController.abort(); } catch { /* best effort */ }
+    }
+    this.killProcessesForSession(s.sessionId);
+
     const cwd = s.projectPath || process.cwd();
     const existing = findSessionJsonlDir(s.sessionId, cwd) !== null;
     const input = createInputStream();
@@ -375,12 +583,14 @@ class SdkSessionManager {
       // surfaces here as an AbortError — don't report it as a session error.
       if (!s.abortController?.signal.aborted) {
         const message = err instanceof Error ? err.message : String(err);
+        this.bufferEvent(s, { type: 'error', content: message, ts: Date.now() });
         eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, error: message });
       }
     } finally {
       s.isProcessing = false;
       s.q = null;
       s.input = null;
+      this.closeBuffer(s);
       this.emitHealth(s, false);
     }
   }
@@ -405,8 +615,10 @@ class SdkSessionManager {
             const ttft = Date.now() - (s.turnStartedAt ?? Date.now());
             console.log(`[SdkSessionManager] ${s.sessionId} TTFT=${ttft}ms (sdk ttft_ms=${anyMsg.ttft_ms ?? '?'})`);
           }
+          this.bufferText(s, ev.delta.text);
           eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, text: ev.delta.text });
         } else if (ev.type === 'content_block_start' && ev.content_block?.type === 'tool_use') {
+          this.bufferEvent(s, { type: 'tool_start', name: ev.content_block.name, ts: Date.now() });
           eventBus.emitApp({
             type: 'session:stream',
             sessionId: s.sessionId,
@@ -418,6 +630,23 @@ class SdkSessionManager {
             ev.message.id,
             num(u?.input_tokens) + num(u?.output_tokens) + num(u?.cache_creation_input_tokens) + num(u?.cache_read_input_tokens),
           );
+          // Context occupancy is fixed at message_start (the prompt is already
+          // assembled) and excludes output, which isn't in this call's prompt.
+          // Each call within a turn re-reports the whole prompt, so the latest
+          // message_start is the live context — assign, never accumulate.
+          //
+          // Subagents (sidechains) run their own conversation with a fresh, much
+          // smaller context, and the SDK forwards their tool_use blocks by
+          // default (forwardSubagentText only gates *text*) carrying real usage.
+          // Assigning from one collapses the reading mid-turn — verified: a
+          // subagent drove this from ~23.5k to 2950. Their tokens are still
+          // billed, so they stay in the tally above; only the main thread's
+          // occupancy may set contextTokens. Mirrors transcriptParser's
+          // `!entry.isSidechain` guard.
+          if (anyMsg.parent_tool_use_id == null) {
+            s.contextTokens =
+              num(u?.input_tokens) + num(u?.cache_creation_input_tokens) + num(u?.cache_read_input_tokens);
+          }
           this.emitUsage(s);
         }
         break;
@@ -428,6 +657,7 @@ class SdkSessionManager {
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block.type === 'tool_use') {
+              this.bufferEvent(s, { type: 'tool_complete', name: block.name, input: block.input, ts: Date.now() });
               eventBus.emitApp({
                 type: 'session:stream',
                 sessionId: s.sessionId,
@@ -442,6 +672,11 @@ class SdkSessionManager {
             anyMsg.message.id,
             num(u.input_tokens) + num(u.output_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens),
           );
+          // Sidechain guard — see the message_start case above.
+          if (anyMsg.parent_tool_use_id == null) {
+            s.contextTokens =
+              num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens);
+          }
           this.emitUsage(s);
         }
         break;
@@ -456,6 +691,7 @@ class SdkSessionManager {
                 typeof block.content === 'string'
                   ? block.content.slice(0, 100)
                   : JSON.stringify(block.content).slice(0, 100);
+              this.bufferEvent(s, { type: 'tool_result', preview, ts: Date.now() });
               eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, toolResult: { preview } });
             }
           }
@@ -465,6 +701,30 @@ class SdkSessionManager {
 
       case 'result': {
         s.isProcessing = false;
+        this.closeBuffer(s);
+        // The SDK reports the context window per model it used this turn. Take
+        // the largest: on a model switch mid-turn the surviving conversation is
+        // bounded by the roomiest window it ran under, and picking the smallest
+        // would show a fill % over 100.
+        const mu = anyMsg.modelUsage as Record<string, { contextWindow?: number }> | undefined;
+        if (mu) {
+          let win = 0;
+          for (const v of Object.values(mu)) {
+            const w = num(v?.contextWindow);
+            if (w > win) win = w;
+          }
+          if (win > 0) {
+            s.contextWindow = win;
+            // Persist on EVERY result, not only when the value changes: at the
+            // first result the sessions row usually doesn't exist yet (the
+            // archiver creates it), so that write is a no-op — and since the
+            // window never changes afterwards, a change-gated retry would never
+            // fire and the window would be lost for good. The helper itself
+            // no-ops when the stored value already matches.
+            void persistSessionContextWindow(s.sessionId, win);
+          }
+        }
+        this.emitUsage(s);
         this.emitHealth(s, false);
         if (anyMsg.subtype === 'success') {
           console.log(
@@ -490,10 +750,26 @@ class SdkSessionManager {
   private emitUsage(s: SdkSession): void {
     let total = 0;
     for (const v of s.usageByMsg.values()) total += v;
-    if (total === s.lastEmittedTokens) return;
+    // Emit when the billed tally, the context level, OR the window moved. The
+    // window lands on `result` after the tally has stopped moving, so gating
+    // purely on `total` would drop the one event carrying the denominator.
+    if (
+      total === s.lastEmittedTokens &&
+      s.contextTokens === s.lastEmittedContext &&
+      s.contextWindow === s.lastEmittedWindow
+    ) return;
     s.lastEmittedTokens = total;
-    eventBus.emitApp({ type: 'session:usage', sessionId: s.sessionId, turnTokens: total });
+    s.lastEmittedContext = s.contextTokens;
+    s.lastEmittedWindow = s.contextWindow;
+    eventBus.emitApp({
+      type: 'session:usage',
+      sessionId: s.sessionId,
+      turnTokens: total,
+      contextTokens: s.contextTokens,
+      contextWindow: s.contextWindow,
+    });
   }
+
 }
 
 // Singleton across Next.js HMR. The instance is intentionally persisted so we
@@ -503,13 +779,25 @@ class SdkSessionManager {
 // SINGLETON_VERSION when this class's behavior changes so the dev server
 // recreates the instance on the next import and picks up the new code. In
 // production the module loads once, so this never re-runs.
-const SINGLETON_VERSION = 5;
+//
+// CRITICAL: the recreate MUST carry the live sessions across. Constructing an
+// empty manager silently orphans every in-flight session — the CLI process keeps
+// running and writing the JSONL, but the new manager has no record, so
+// /api/stream-buffer answers hasBuffer:false / isProcessing:false. The bouncing
+// dots vanish, the in-flight turn's partial assistant messages stop being
+// stripped (they render as intermediary bubbles above the composer), and the
+// next send spawns a SECOND process for the same session. Editing this file
+// while a session is working used to reproduce exactly that, every time.
+const SINGLETON_VERSION = 8;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;
 };
 if (!globalForSdk.__sdkSessionManager || globalForSdk.__sdkSessionManagerV !== SINGLETON_VERSION) {
-  globalForSdk.__sdkSessionManager = new SdkSessionManager();
+  const previous = globalForSdk.__sdkSessionManager;
+  const replacement = new SdkSessionManager();
+  if (previous) replacement.adoptSessionsFrom(previous);
+  globalForSdk.__sdkSessionManager = replacement;
   globalForSdk.__sdkSessionManagerV = SINGLETON_VERSION;
 }
 export const sdkSessionManager = globalForSdk.__sdkSessionManager;

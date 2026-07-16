@@ -71,17 +71,16 @@ export default function ChatTab({
   // freshness leaf in the sidebar — stamped when a viewed session stops
   // processing. Sessions without an entry fall back to their history timestamp.
   const [sessionActivity, setSessionActivity] = useState<Record<string, number>>({});
-  // Per-session live cumulative billed tokens (archived baseline + in-flight
-  // turn), driven by session:usage SSE. Overlays archived metadata so the
-  // sidebar count climbs as Claude streams; cleared once the archive catches up.
-  const [liveTokens, setLiveTokens] = useState<Record<string, number>>({});
-  // Pre-turn archived baseline, frozen at the first usage event of each run.
-  // The server re-archives the live JSONL mid-turn (transcript:updated →
-  // archiveSessionFromDisk), so the session's metadata.totalTokens grows
-  // during the run. Reading it per-event and adding the SSE tally would
-  // double-count that growth (and the inflated overlay would never clear).
-  // Freezing the baseline at run start keeps the math `P + R` correct.
-  const baselineByRunRef = useRef<Record<string, number>>({});
+  // Per-session live context occupancy + window, driven by session:usage SSE.
+  // Overlays archived metadata so the sidebar tracks context as Claude streams.
+  //
+  // Unlike the cumulative token count this replaced, context is an ABSOLUTE
+  // level, not an increment — the server reports the latest call's prompt size
+  // outright. So there's no baseline to freeze, no addition, and no risk of
+  // double-counting the archive's mid-turn growth: last value wins.
+  const [liveContext, setLiveContext] = useState<
+    Record<string, { tokens: number; window: number }>
+  >({});
 
   // New sessions that haven't been submitted yet — persisted in the sidebar so
   // the user can switch away and come back without losing them.
@@ -355,25 +354,10 @@ export default function ChatTab({
     historyRef.current = history;
   }, [history]);
 
-  // Drop the live-token overlay for a session once its archived baseline has
-  // caught up (i.e. the finished turn's tokens are now in metadata). The
-  // server tally is a subset of the parser's, so baseline always reaches the
-  // overlay — until then max(baseline, overlay) shows the live value with no
-  // backward dip or double-count.
-  useEffect(() => {
-    setLiveTokens(prev => {
-      const ids = Object.keys(prev);
-      if (ids.length === 0) return prev;
-      let changed = false;
-      const next = { ...prev };
-      for (const id of ids) {
-        const meta = history.find(h => h.sessionId === id)?.metadata;
-        const baseline = (meta?.totalTokens ?? meta?.totalOutputTokens ?? 0) as number;
-        if (baseline >= prev[id]) { delete next[id]; changed = true; }
-      }
-      return changed ? next : prev;
-    });
-  }, [history]);
+  // NOTE: the live-token overlay used to need a reconciliation effect here to
+  // drop it once the archived baseline caught up. The context overlay needs no
+  // such thing — it's an absolute level that the archive converges to on its
+  // own, so a stale overlay can only ever be superseded, never double-counted.
 
   // --- fetchTranscript ---
   const fetchTranscript = async (sessionId: string, project: string, displayTitle: string) => {
@@ -697,23 +681,21 @@ export default function ChatTab({
       if (data.model) setCurrentModel(data.model);
     });
 
-    // Live billed-token tally for the in-flight turn (input+output+cache). Add
-    // it to the session's archived baseline (pre-turn total) to get the live
-    // cumulative the sidebar counts toward. The cleanup effect drops the overlay
-    // once the archived metadata catches up at turn end.
+    // Live context occupancy for the in-flight turn. An absolute level, so it
+    // replaces rather than accumulates — no baseline, no arithmetic.
     es.addEventListener('session-usage', (e: MessageEvent) => {
       if (!shouldProcess()) return;
       const data = JSON.parse(e.data);
-      if (typeof data.turnTokens !== 'number') return;
-      // Freeze the pre-turn baseline on the first event of this run; reuse it
-      // for the rest so mid-turn metadata growth can't be double-counted.
-      if (baselineByRunRef.current[mySessionId] === undefined) {
-        const meta = historyRef.current.find(h => h.sessionId === mySessionId)?.metadata;
-        baselineByRunRef.current[mySessionId] =
-          (meta?.totalTokens ?? meta?.totalOutputTokens ?? 0) as number;
-      }
-      const baseline = baselineByRunRef.current[mySessionId];
-      setLiveTokens(prev => ({ ...prev, [mySessionId]: baseline + data.turnTokens }));
+      if (typeof data.contextTokens !== 'number') return;
+      setLiveContext(prev => {
+        const prior = prev[mySessionId];
+        // The window only arrives once the turn's `result` lands, and later
+        // events in the same turn report 0 until then. Keep the last known
+        // non-zero value so the fill bar doesn't blink out mid-turn.
+        const window = data.contextWindow > 0 ? data.contextWindow : (prior?.window ?? 0);
+        if (prior?.tokens === data.contextTokens && prior?.window === window) return prev;
+        return { ...prev, [mySessionId]: { tokens: data.contextTokens, window } };
+      });
     });
 
     // Handle session:health events (replaces health polling)
@@ -737,8 +719,19 @@ export default function ChatTab({
         // counts the 5-min prompt-cache TTL from now (when the cache was
         // last refreshed) rather than the turn's start.
         setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
-        // Run ended — drop the frozen baseline so the next run re-captures it.
-        delete baselineByRunRef.current[mySessionId];
+        // Drop the live overlay: the turn is done, so the archive (re-read just
+        // below) becomes the source of truth again. SessionSidebar reads
+        // `live?.tokens ?? metadata.contextTokens`, so an entry left here
+        // outranks the archive for the life of the page — it can never be
+        // superseded downward. That strands a stale-high reading after a rewind
+        // (archived contextTokens drops; the overlay wouldn't), which is exactly
+        // the feature this branch exists for.
+        setLiveContext(prev => {
+          if (!(mySessionId in prev)) return prev;
+          const next = { ...prev };
+          delete next[mySessionId];
+          return next;
+        });
         fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
           .then(res => res.json())
           .then(refreshData => {
@@ -820,17 +813,19 @@ export default function ChatTab({
             }
           })
           .catch(() => {});
-        // Also refresh transcript to pick up any missed messages
+        // Also refresh transcript to pick up any missed messages — but never
+        // while a turn is in flight: the JSONL holds that turn's partial
+        // assistant messages, which would render as intermediary bubbles above
+        // the bouncing dots. Same guard as the transcript-updated handler below.
+        // (Re-checked inside .then(), since loading can flip while in flight.)
         fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
           .then(res => res.json())
           .then(data => {
-            if (data.messages && shouldProcess()) {
-              setHistoryTranscript(data.messages);
-              if (!transcriptLoadingRef.current) {
-                setTranscriptOverlayMessages([]);
-                setOverlayInsertPoint(null);
-              }
-            }
+            if (!data.messages || !shouldProcess()) return;
+            if (transcriptLoadingRef.current) return;
+            setHistoryTranscript(data.messages);
+            setTranscriptOverlayMessages([]);
+            setOverlayInsertPoint(null);
           })
           .catch(() => {});
       }
@@ -1304,7 +1299,18 @@ export default function ChatTab({
       // transcriptLoading here optimistically, so the session-health "just
       // ended" stamp won't fire; do it explicitly.)
       setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
-      delete baselineByRunRef.current[mySessionId];
+      // Same reason: the health handler's turn-end branch is gated on
+      // `transcriptLoadingRef.current`, which we're about to clear below, so it
+      // will NOT drop the live context overlay for a stopped turn. Left behind,
+      // the overlay outranks the archive via `??` for the life of the page (it
+      // can never be superseded downward) — stranding a stale-high reading and
+      // defeating rewind. Drop it here too.
+      setLiveContext(prev => {
+        if (!(mySessionId in prev)) return prev;
+        const next = { ...prev };
+        delete next[mySessionId];
+        return next;
+      });
       if (activeSessionRef.current === mySessionId) {
         setTranscriptLoading(false);
         setTranscriptStreaming('');
@@ -1426,7 +1432,7 @@ export default function ChatTab({
             history={history}
             liveSessionIds={liveSessionIds}
             sessionActivity={sessionActivity}
-            liveTokens={liveTokens}
+            liveContext={liveContext}
             viewingTranscriptId={viewingTranscriptId}
             transcriptLoading={transcriptLoading}
             isLoadingHistory={isLoadingHistory}

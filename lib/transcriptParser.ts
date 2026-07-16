@@ -60,6 +60,11 @@ export interface UsageEvent {
   cacheWrite1h: number;
   /** Cache-read input tokens (usage.cache_read_input_tokens). */
   cacheRead: number;
+  /** True when this call belongs to a subagent (JSONL `isSidechain`). Its tokens
+   *  are still billed — cost aggregation must keep them — but it runs its own
+   *  context with its own (possibly different) model, so anything reasoning
+   *  about the MAIN thread's context or window must exclude it. */
+  isSidechain: boolean;
 }
 
 const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
@@ -109,6 +114,17 @@ export function parseTranscriptJsonl(content: string): {
    *  timestamp, deduped by message id. Feeds the Stats tab's cost analytics.
    *  See {@link UsageEvent}. */
   usageEvents: UsageEvent[];
+  /** Size of the conversation's CURRENT context window occupancy, in tokens:
+   *  the prompt size of the most recent main-thread assistant call
+   *  (input + cache write + cache read; output is not part of the next prompt).
+   *
+   *  This is deliberately NOT cumulative. Summing usage across a session counts
+   *  the same carried context once per API call — a 600k-context session over
+   *  200 calls totals ~90M, which is real for billing but ~150x what a user
+   *  means by "how big is this conversation". Sidechain (subagent) calls are
+   *  excluded: they run in their own throwaway context and never occupy the
+   *  main thread's window. 0 when no real assistant call was made. */
+  contextTokens: number;
 } {
   const messages: TranscriptMessage[] = [];
   const rawEntries: any[] = [];
@@ -119,6 +135,9 @@ export function parseTranscriptJsonl(content: string): {
   let planSlug: string | null = null;
   let planWriteTimestamp: string | null = null;
   let numCompactions = 0;
+  // Prompt size of the most recent main-thread assistant call. See the
+  // contextTokens field doc on the return type.
+  let contextTokens = 0;
   // Output tokens per unique assistant message id. Streaming writes the same
   // API message's cumulative usage on multiple JSONL lines, so we key by id
   // (last value wins = the final usage for that message) and sum at the end.
@@ -260,7 +279,17 @@ export function parseTranscriptJsonl(content: string): {
               cacheWrite5m: cw5m,
               cacheWrite1h: cw1h,
               cacheRead: num(u.cache_read_input_tokens),
+              isSidechain: !!entry.isSidechain,
             });
+            // Current context occupancy = this call's prompt size. Last main-
+            // thread call wins, so after the loop this holds the live context.
+            // Sidechains (subagents) get their own context and are skipped.
+            if (!entry.isSidechain) {
+              contextTokens =
+                num(u.input_tokens) +
+                (hasSplit ? cw5m + cw1h : cwFlat) +
+                num(u.cache_read_input_tokens);
+            }
           }
         }
         if (inInternalExchange) continue;
@@ -351,5 +380,5 @@ export function parseTranscriptJsonl(content: string): {
 
   const usageEvents = Array.from(usageByMsgId.values());
 
-  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion, currentModel, totalOutputTokens, usageEvents };
+  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion, currentModel, totalOutputTokens, usageEvents, contextTokens };
 }

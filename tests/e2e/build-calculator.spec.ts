@@ -224,15 +224,26 @@ test('Fury builds a calculator, then stop + rewind reverts the refinement', asyn
   // the change deterministically (that's the load-bearing assertion). When the
   // window is caught, this exercises handleTranscriptStop → interrupt.
   console.log('[E2E] Turn 2: add power + modulo + docs');
-  await post('/api/claude-sdk', {
-    prompt:
-      'Modify calculator.js: add two more exported functions, power(base, exp) and ' +
-      'modulo(a, b), keeping the existing four. Also add a detailed JSDoc block above ' +
-      'every one of the six functions and add input validation (throw a TypeError on ' +
-      'non-number arguments) to each. Edit only calculator.js. No explanation.',
-    sessionId,
-    projectPath: PROJECT,
-  });
+  const turn2Prompt =
+    'Modify calculator.js: add two more exported functions, power(base, exp) and ' +
+    'modulo(a, b), keeping the existing four. Also add a detailed JSDoc block above ' +
+    'every one of the six functions and add input validation (throw a TypeError on ' +
+    'non-number arguments) to each. Edit only calculator.js. No explanation.';
+  await post('/api/claude-sdk', { prompt: turn2Prompt, sessionId, projectPath: PROJECT });
+
+  // ---- Regression guard: the SDK session must expose a stream buffer ----
+  // sendMessage opens the buffer synchronously, so it exists as soon as the POST
+  // returns. Without it /api/stream-buffer reports hasBuffer:false, ChatTab skips
+  // the branch that strips the in-flight turn's partial assistant messages from
+  // the JSONL, and opening/reloading the session mid-turn renders intermediary
+  // assistant bubbles between the user prompt and the bouncing dots (it also
+  // loses stream restore: text, tool events, elapsed timer).
+  const buf = await (await page.request.get(`/api/stream-buffer?sessionId=${sessionId}`)).json();
+  console.log(`[E2E] stream-buffer mid-turn: hasBuffer=${buf.hasBuffer} isActive=${buf.isActive} isProcessing=${buf.isProcessing}`);
+  expect(buf.hasBuffer, 'SDK session must expose a stream buffer').toBe(true);
+  expect(buf.isActive, 'buffer must be active mid-turn (gates the strip)').toBe(true);
+  expect(buf.isProcessing, 'buffer must report processing').toBe(true);
+  expect(buf.userPrompt, 'userPrompt must match exactly — the strip anchors on it').toBe(turn2Prompt);
 
   // ---- Regression guard: processing indicator + live stream must render ----
   // Both are gated on transcriptLoading. On the SDK branch they vanished because

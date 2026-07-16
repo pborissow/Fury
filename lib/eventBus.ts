@@ -41,6 +41,15 @@ export interface SessionUsageEvent {
    *  far in the in-flight turn, summed per unique assistant message id. The
    *  client adds this to the archived baseline (metadata.totalTokens). */
   turnTokens: number;
+  /** Current context occupancy in tokens — the prompt size of the latest API
+   *  call (input + cache write + cache read). Unlike turnTokens this is an
+   *  absolute level, not an increment: the client renders it directly and must
+   *  NOT add it to a baseline. */
+  contextTokens: number;
+  /** The model's context window, from the SDK's result.modelUsage. 0 until the
+   *  first result message of the session arrives (the window isn't known before
+   *  then), in which case the client shows size without a fill %. */
+  contextWindow: number;
 }
 
 export interface TranscriptUpdatedEvent {

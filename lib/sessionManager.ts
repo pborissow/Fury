@@ -7,7 +7,7 @@ import { killProcessTree } from './killProcessTree';
 import { detectUsageLimit, handleUsageLimitDetected } from './providerSwitch';
 import { scrubSessionFile } from './imageScrubber';
 import { findSessionJsonlDir } from './sessionPaths';
-import { restoreJsonlFromArchive } from './transcriptArchiver';
+import { persistSessionContextWindow, restoreJsonlFromArchive } from './transcriptArchiver';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -386,16 +386,53 @@ class SessionManager {
         // (the cost-driving count) and emitted on change so the sidebar counts
         // up in real time, consistent with the archived metadata.totalTokens.
         const numTok = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
-        type TurnUsage = { input: number; output: number; cacheWrite: number; cacheRead: number };
+        // `sidechain` = this call belongs to a subagent (parent_tool_use_id set).
+        // Its tokens are still billed (they count toward the tally), but it runs
+        // its own small context, so it must never define the main thread's
+        // contextTokens — see emitUsageIfChanged below.
+        type TurnUsage = { input: number; output: number; cacheWrite: number; cacheRead: number; sidechain: boolean };
         const turnUsageByMsgId = new Map<string, TurnUsage>();
         let currentStreamMsgId: string | null = null;
         let lastEmittedTurnTokens = -1;
+        let lastEmittedContext = -1;
+        let lastEmittedWindow = -1;
+        // Context window, from the result envelope's modelUsage. 0 until the
+        // turn ends, so the first turn of a session renders size without a fill
+        // % — the CLI doesn't advertise the window any earlier.
+        let turnContextWindow = 0;
         const emitUsageIfChanged = () => {
           let total = 0;
-          for (const v of turnUsageByMsgId.values()) total += v.input + v.output + v.cacheWrite + v.cacheRead;
-          if (total === lastEmittedTurnTokens) return;
+          // Current context = the most recent message's prompt size. Map keeps
+          // insertion order and message_delta re-sets an existing key without
+          // reordering, so the last value is the newest message_start.
+          let last: TurnUsage | null = null;
+          for (const v of turnUsageByMsgId.values()) {
+            // Subagent tokens are billed, so they count toward the tally...
+            total += v.input + v.output + v.cacheWrite + v.cacheRead;
+            // ...but they run their own fresh (much smaller) context, so they
+            // must not define the main thread's occupancy. Without this a
+            // Task-using turn collapses the reading mid-turn.
+            if (!v.sidechain) last = v;
+          }
+          const contextTokens = last ? last.input + last.cacheWrite + last.cacheRead : 0;
+          // Also gate on the window: it lands on `result` after the tally has
+          // stopped moving, so keying only on tokens would drop the one event
+          // that gives the client its denominator.
+          if (
+            total === lastEmittedTurnTokens &&
+            contextTokens === lastEmittedContext &&
+            turnContextWindow === lastEmittedWindow
+          ) return;
           lastEmittedTurnTokens = total;
-          eventBus.emitApp({ type: 'session:usage', sessionId: session.sessionId, turnTokens: total });
+          lastEmittedContext = contextTokens;
+          lastEmittedWindow = turnContextWindow;
+          eventBus.emitApp({
+            type: 'session:usage',
+            sessionId: session.sessionId,
+            turnTokens: total,
+            contextTokens,
+            contextWindow: turnContextWindow,
+          });
         };
         claude.stdout.on('data', (data) => {
           // Update activity timestamp whenever we receive data
@@ -461,6 +498,30 @@ class SessionManager {
                   emitModelIfNew(json.model);
                 }
 
+                // The result envelope carries the context window per model used
+                // this turn — the only place the CLI reports it, and the only way
+                // an archived session learns its denominator (the JSONL records
+                // the model id without the [1m] marker and no window field).
+                // Take the largest on a mid-turn model switch, so fill can't
+                // exceed 100%.
+                if (json.type === 'result' && json.modelUsage) {
+                  let win = 0;
+                  for (const v of Object.values(json.modelUsage as Record<string, any>)) {
+                    const w = numTok(v?.contextWindow);
+                    if (w > win) win = w;
+                  }
+                  if (win > 0) {
+                    turnContextWindow = win;
+                    emitUsageIfChanged();
+                    // Persist on every result, not only on change — at the first
+                    // result the sessions row may not exist yet (the archiver
+                    // creates it), and the window never changes afterwards, so a
+                    // change-gated retry would never fire. The helper no-ops when
+                    // the stored value already matches.
+                    void persistSessionContextWindow(session.sessionId, win);
+                  }
+                }
+
                 // Handle stream_event type with nested event
                 if (json.type === 'stream_event' && json.event) {
                   const event = json.event;
@@ -477,10 +538,11 @@ class SessionManager {
                       output: numTok(u?.output_tokens),
                       cacheWrite: numTok(u?.cache_creation_input_tokens),
                       cacheRead: numTok(u?.cache_read_input_tokens),
+                      sidechain: json.parent_tool_use_id != null,
                     });
                     emitUsageIfChanged();
                   } else if (event.type === 'message_delta' && currentStreamMsgId && typeof event.usage?.output_tokens === 'number') {
-                    const rec = turnUsageByMsgId.get(currentStreamMsgId) ?? { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+                    const rec = turnUsageByMsgId.get(currentStreamMsgId) ?? { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, sidechain: json.parent_tool_use_id != null };
                     rec.output = event.usage.output_tokens;
                     turnUsageByMsgId.set(currentStreamMsgId, rec);
                     emitUsageIfChanged();
@@ -527,6 +589,7 @@ class SessionManager {
                       output: numTok(u.output_tokens),
                       cacheWrite: numTok(u.cache_creation_input_tokens),
                       cacheRead: numTok(u.cache_read_input_tokens),
+                      sidechain: json.parent_tool_use_id != null,
                     });
                     emitUsageIfChanged();
                   }

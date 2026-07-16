@@ -78,6 +78,12 @@ async function initDb(client: Client): Promise<void> {
       cache_write_5m INTEGER NOT NULL DEFAULT 0,
       cache_write_1h INTEGER NOT NULL DEFAULT 0,
       cache_read   INTEGER NOT NULL DEFAULT 0,
+      context_window INTEGER NOT NULL DEFAULT 0,
+      -- Subagent call. Its tokens are billed (cost aggregation keeps them), but
+      -- it runs its own small context with its own model, so anything reading
+      -- context/window per event MUST exclude it or a subagent's ~3k call reads
+      -- as the main thread's context.
+      is_sidechain INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (session_id, message_id)
     );
     CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_events(session_id);
@@ -158,6 +164,30 @@ async function initDb(client: Client): Promise<void> {
     } catch {
       // Column already exists — expected after first migration
     }
+  }
+
+  // Migration: flag subagent (sidechain) calls. Their tokens are billed, so cost
+  // still counts them, but they run their own small context under a possibly
+  // different model — /api/stats excludes them from peak/final context and the
+  // window, otherwise a subagent's ~3k call dents the curve and can be reported
+  // as the session's ending context. Rows written before this default to 0
+  // (treated as main thread) until the session is re-archived.
+  try {
+    await client.execute('ALTER TABLE usage_events ADD COLUMN is_sidechain INTEGER NOT NULL DEFAULT 0');
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
+  // Migration: record the model's context window per usage event. Can't be
+  // derived from the transcript — the JSONL logs "claude-opus-4-8" whether or
+  // not the [1m] beta was active and has no window field — so it's captured at
+  // runtime from the SDK's result.modelUsage. 0 means "unknown", and the UI
+  // renders context size without a fill % rather than guessing a denominator.
+  // Per-event rather than per-session because the model can change mid-session.
+  try {
+    await client.execute('ALTER TABLE usage_events ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0');
+  } catch {
+    // Column already exists — expected after first migration
   }
 
   // Migration: backfill numCompactions metadata for existing archived sessions.
@@ -281,9 +311,9 @@ async function initDb(client: Client): Promise<void> {
       ];
       for (const u of events) {
         stmts.push({
-          sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          args: [sid, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead],
+          sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read, is_sidechain)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: [sid, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead, u.isSidechain ? 1 : 0],
         });
       }
       // Chunk to stay under batch size limits on very large sessions.
@@ -314,6 +344,161 @@ async function initDb(client: Client): Promise<void> {
     }
   } catch (err) {
     console.error('[DB] usage_events backfill error:', err);
+  }
+
+  // Migration: backfill metadata.contextTokens (current context occupancy) for
+  // existing archived sessions, replacing the cumulative token count the session
+  // list used to render. Re-parses raw_jsonl per session, same as the migrations
+  // above. Always writes the field — even 0 — so it doesn't re-run on sessions
+  // with no assistant calls.
+  //
+  // Also recovers context_window where it is *logically certain*: a single API
+  // call cannot exceed the model's window, so any session whose largest call
+  // exceeded 200k was necessarily running a 1M-window model. Sessions that
+  // stayed under 200k are genuinely ambiguous (200k and 1M both explain the
+  // data), so they're left at 0 = unknown and the UI omits the fill % for them.
+  // Going forward the exact value comes from the SDK at runtime; this only
+  // rescues history.
+  try {
+    const targets = await client.execute(`
+      SELECT session_id FROM sessions
+      WHERE metadata IS NULL OR metadata NOT LIKE '%contextTokens%'
+    `);
+    let updated = 0;
+    let windowsRecovered = 0;
+    for (const row of targets.rows) {
+      const sid = row.session_id as string;
+      const rawRows = await client.execute({
+        sql: 'SELECT content FROM raw_jsonl WHERE session_id = ? ORDER BY line_number',
+        args: [sid],
+      });
+      // A session with no raw_jsonl, or one we can't parse, still has to get the
+      // field written — the guard above selects on `metadata NOT LIKE
+      // '%contextTokens%'`, so skipping the write (the old `continue`) made the
+      // backfill re-select and re-query it on EVERY boot, forever. Record 0
+      // (= unknown/nothing to measure) and move on.
+      let parsed: ReturnType<typeof parseTranscriptJsonl> | null = null;
+      if (rawRows.rows.length > 0) {
+        const content = rawRows.rows.map(r => r.content as string).join('\n');
+        try {
+          parsed = parseTranscriptJsonl(content);
+        } catch (e) {
+          console.warn(`[DB] contextTokens parse failed for ${sid} — recording 0 so it doesn't re-run:`, e);
+        }
+      }
+
+      // Sidechain calls are excluded: this infers the MAIN thread's window, and
+      // a subagent can run a different model with a different window, so
+      // including them makes the ">200k proves 1M" inference unsound.
+      const maxCall = (parsed?.usageEvents ?? []).reduce(
+        (m, u) => (u.isSidechain ? m : Math.max(m, u.input + u.cacheWrite + u.cacheRead)), 0);
+      const inferredWindow = maxCall > 200_000 ? 1_000_000 : 0;
+
+      const existing = await client.execute({
+        sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+        args: [sid],
+      });
+      let meta: Record<string, unknown> = {};
+      if (existing.rows[0]?.metadata) {
+        try { meta = JSON.parse(existing.rows[0].metadata as string); } catch {}
+      }
+      meta.contextTokens = parsed?.contextTokens ?? 0;
+      // Never downgrade a window the runtime already captured exactly.
+      const known = typeof meta.contextWindow === 'number' ? meta.contextWindow as number : 0;
+      if (!known && inferredWindow > 0) {
+        meta.contextWindow = inferredWindow;
+        windowsRecovered++;
+        await client.execute({
+          sql: 'UPDATE usage_events SET context_window = ? WHERE session_id = ? AND context_window = 0',
+          args: [inferredWindow, sid],
+        });
+      }
+      await client.execute({
+        sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+        args: [JSON.stringify(meta), sid],
+      });
+      updated++;
+    }
+    if (updated > 0) {
+      console.log(
+        `[DB] Backfilled contextTokens for ${updated} sessions ` +
+        `(${windowsRecovered} with a recoverable context window)`);
+    }
+  } catch (err) {
+    console.error('[DB] contextTokens backfill error:', err);
+  }
+
+  // Migration: populate is_sidechain on existing usage_events rows.
+  //
+  // The ALTER above defaults every pre-existing row to 0 (= main thread), and
+  // NOTHING else would ever correct them: the usage_events and contextTokens
+  // backfills are gated on metadata.totalTokens / metadata.contextTokens, which
+  // are already set for every archived session, and scanAndArchiveAll skips on a
+  // hash match — so a finished session is never re-archived. Hence a FRESH
+  // metadata key; the obvious two are burned.
+  //
+  // Sessions that never ran a subagent are unaffected (their rows are correctly
+  // 0), but any session with Task/Agent history would otherwise report subagent
+  // calls as main-thread context forever.
+  try {
+    const targets = await client.execute(`
+      SELECT session_id FROM sessions
+      WHERE metadata IS NULL OR metadata NOT LIKE '%hasSidechainFlag%'
+    `);
+    let updated = 0;
+    let flagged = 0;
+    for (const row of targets.rows) {
+      const sid = row.session_id as string;
+      const rawRows = await client.execute({
+        sql: 'SELECT content FROM raw_jsonl WHERE session_id = ? ORDER BY line_number',
+        args: [sid],
+      });
+
+      let sidechainIds: string[] = [];
+      if (rawRows.rows.length > 0) {
+        try {
+          const content = rawRows.rows.map(r => r.content as string).join('\n');
+          sidechainIds = parseTranscriptJsonl(content).usageEvents
+            .filter(u => u.isSidechain)
+            .map(u => u.messageId);
+        } catch (e) {
+          console.warn(`[DB] is_sidechain parse failed for ${sid} — flagging anyway so it doesn't re-run:`, e);
+        }
+      }
+
+      if (sidechainIds.length > 0) {
+        const stmts = sidechainIds.map(id => ({
+          sql: 'UPDATE usage_events SET is_sidechain = 1 WHERE session_id = ? AND message_id = ?',
+          args: [sid, id],
+        }));
+        for (let off = 0; off < stmts.length; off += 500) {
+          await client.batch(stmts.slice(off, off + 500), 'write');
+        }
+        flagged += sidechainIds.length;
+      }
+
+      // Always stamp the flag — including for raw-less/unparseable sessions and
+      // ones with no sidechains — so this can never re-select them next boot.
+      const existing = await client.execute({
+        sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+        args: [sid],
+      });
+      let meta: Record<string, unknown> = {};
+      if (existing.rows[0]?.metadata) {
+        try { meta = JSON.parse(existing.rows[0].metadata as string); } catch {}
+      }
+      meta.hasSidechainFlag = true;
+      await client.execute({
+        sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+        args: [JSON.stringify(meta), sid],
+      });
+      updated++;
+    }
+    if (updated > 0) {
+      console.log(`[DB] Backfilled is_sidechain for ${updated} sessions (${flagged} subagent events flagged)`);
+    }
+  } catch (err) {
+    console.error('[DB] is_sidechain backfill error:', err);
   }
 
   await syncPricingLog(client);
@@ -477,7 +662,7 @@ async function scanAndArchiveAll(client: Client): Promise<void> {
           continue;
         }
 
-        const { messages, rawLines, numCompactions, totalOutputTokens, usageEvents } = parseTranscriptJsonl(content);
+        const { messages, rawLines, numCompactions, totalOutputTokens, usageEvents, contextTokens } = parseTranscriptJsonl(content);
         if (messages.length === 0) {
           skipped++;
           continue;
@@ -493,7 +678,7 @@ async function scanAndArchiveAll(client: Client): Promise<void> {
         const project = info.project;
         const display = info.display || messages[0]?.content?.substring(0, 200) || sessionId;
 
-        await archiveTranscript(sessionId, project, display, content, messages, rawLines, true, { numCompactions, totalOutputTokens, usageEvents });
+        await archiveTranscript(sessionId, project, display, content, messages, rawLines, true, { numCompactions, totalOutputTokens, usageEvents, contextTokens });
         archived++;
       } catch (err) {
         errors++;

@@ -57,6 +57,14 @@ interface SessionAgg {
   priced: boolean;
   messages: number;
   lastMs: number;
+  /** Largest main-thread prompt this session ever assembled. */
+  peakContext: number;
+  /** Prompt size of the session's most recent main-thread call. */
+  finalContext: number;
+  /** Timestamp backing finalContext (internal; not serialized). */
+  contextMs: number;
+  /** Model context window; 0 = unknown (never guess a denominator). */
+  contextWindow: number;
 }
 
 export async function GET(req: Request) {
@@ -67,9 +75,18 @@ export async function GET(req: Request) {
     const res = await db.execute(`
       SELECT u.session_id, u.model, u.ts, u.input, u.output,
              u.cache_write, u.cache_write_5m, u.cache_write_1h, u.cache_read,
+             u.context_window, u.is_sidechain,
              s.project, s.display, s.metadata, s.message_count, s.created_at
       FROM usage_events u
-      JOIN sessions s ON s.session_id = u.session_id`);
+      JOIN sessions s ON s.session_id = u.session_id
+      -- finalContext takes the LAST main-thread row per session, so row order
+      -- must be defined rather than left to the query planner. rowid is
+      -- insertion order (= transcript line order), which breaks ts ties
+      -- deterministically. Ties are not hypothetical: the parser writes ts ''
+      -- when a JSONL entry has no timestamp, which Date.parse turns into NaN and
+      -- the reader falls back to created_at — identical for every event in the
+      -- session, collapsing them all to one ms.
+      ORDER BY u.session_id, u.ts, u.rowid`);
 
     // (day|model) -> per-type token totals + cost
     const daily = new Map<string, {
@@ -137,6 +154,7 @@ export async function GET(req: Request) {
           cost: 0, priced: true,
           messages: Number(r.message_count) || 0,
           lastMs: 0,
+          peakContext: 0, finalContext: 0, contextMs: -1, contextWindow: 0,
         };
         sessions.set(sid, s);
       }
@@ -145,6 +163,24 @@ export async function GET(req: Request) {
       if (!priced) s.priced = false;
       if (model !== 'unknown') s.models.add(model);
       if (ms > s.lastMs) s.lastMs = ms;
+
+      // Context occupancy at this call = its prompt size. Already stored per
+      // event, so peak/final need no new columns.
+      //
+      // Sidechains are EXCLUDED: a subagent runs its own fresh (much smaller)
+      // context under a possibly different model, so counting it would dent the
+      // curve and — since `final` is the latest event — could report a
+      // subagent's ~3k call as the session's ending context. Its tokens still
+      // count toward cost above; only the context view filters.
+      if (Number(r.is_sidechain) !== 1) {
+        const eventContext = input + cacheWrite + cacheRead;
+        if (eventContext > s.peakContext) s.peakContext = eventContext;
+        // Latest main-thread call wins — ts ties resolve to the last row read,
+        // which is insertion (line) order.
+        if (ms >= s.contextMs) { s.contextMs = ms; s.finalContext = eventContext; }
+        const win = Number(r.context_window) || 0;
+        if (win > s.contextWindow) s.contextWindow = win;
+      }
     }
 
     // Stable model ordering by total cost desc → fixed color slots on the client.
@@ -163,6 +199,13 @@ export async function GET(req: Request) {
       messages: s.messages,
       day: localDay(s.lastMs),
       lastMs: s.lastMs,
+      // Context view (main thread only — see the aggregation above).
+      peakContext: s.peakContext,
+      finalContext: s.finalContext,
+      // 0 = unknown denominator (session predates window capture) — the client
+      // renders the size but no fill %, rather than guessing.
+      contextWindow: s.contextWindow,
+      peakFill: s.contextWindow > 0 ? s.peakContext / s.contextWindow : 0,
     })).sort((a, b) => b.lastMs - a.lastMs);
 
     return NextResponse.json({
