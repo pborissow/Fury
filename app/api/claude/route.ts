@@ -42,6 +42,25 @@ export async function POST(req: NextRequest) {
       console.error('[Claude API] settings load failed, defaulting to SDK path:', err);
     }
 
+    // A parked question blocks the turn mid-tool. sendMessage REJECTS in that
+    // case, but the dispatch below is fire-and-forget — the rejection would
+    // become a server-side console line while the client is told {ok:true},
+    // then waits forever for SSE that can never arrive (sendMessage throws
+    // before startQuery, so no health event ever fires). Spinner forever,
+    // message silently gone.
+    //
+    // So the check has to happen HERE, where a status code can still be
+    // returned. ChatTab's send already renders a non-ok `error` and clears the
+    // spinner, which is the "reject with a clear error" the design called for.
+    // sendMessage keeps its own guard as defense in depth (another client, a
+    // race) — this is the one that can actually talk to the user.
+    if (useSdk && sdkSessionManager.getPendingAsk(sessionId)) {
+      return Response.json(
+        { error: 'Claude is waiting for an answer to its question. Answer or dismiss it first.' },
+        { status: 409 },
+      );
+    }
+
     // Fire-and-forget: the manager runs in the background, emitting stream
     // events and health updates via the eventBus.
     if (useSdk) {

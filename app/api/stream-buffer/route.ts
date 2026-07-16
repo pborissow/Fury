@@ -33,10 +33,22 @@ export async function GET(req: NextRequest) {
   // isProcessing:false and clears transcriptLoading (no dots, no stream).
   const isProcessing = health.isProcessing || sdkSessionManager.isSessionProcessing(sessionId);
 
+  // A question the SDK session is parked on, awaiting this user. Server-held
+  // state is the ONLY source of a pending question on the SDK path — the JSONL
+  // replay that serves the CLI path can't answer one (it has no toolUseID), so
+  // without this a browser refresh strands the turn: Claude waits forever on a
+  // dialog that no longer exists on screen.
+  //
+  // Fetched independently of `buffer` and returned on BOTH branches on purpose.
+  // This response whitelists its fields, so anything not named here is dropped —
+  // and a pending question must survive even when the buffer is missing/expired.
+  const pendingAsk = sdkSessionManager.getPendingAsk(sessionId);
+
   if (!buffer) {
     return Response.json({
       hasBuffer: false,
       isProcessing,
+      pendingAsk,
     });
   }
 
@@ -48,5 +60,6 @@ export async function GET(req: NextRequest) {
     events: buffer.events,
     isActive: buffer.isActive,
     startedAt: buffer.startedAt,
+    pendingAsk,
   });
 }

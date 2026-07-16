@@ -132,6 +132,26 @@ interface SdkSession {
   // streamed text / tool events / the elapsed timer from it when the user opens
   // or switches back to a session mid-turn.
   streamBuffer?: StreamBuffer;
+  /**
+   * A question the model is currently parked on, awaiting the user.
+   *
+   * Held on the SESSION, not the manager, and that is load-bearing:
+   * adoptSessionsFrom() carries session records BY REFERENCE across an HMR
+   * reload, so the resolver survives for free. Parked on the manager instead,
+   * a reload would strand it — the dialog would hang forever with no way to
+   * resolve the turn, and the warm process would sit blocked in canUseTool.
+   *
+   * `resolve` settles the held canUseTool promise. It MUST be called exactly
+   * once on every path (answer, skip, abort, teardown) or the tool stays
+   * blocked indefinitely: permission prompts have no park deadline
+   * (sdk.d.ts:204). See docs/ask-user-question-sdk.md TRAP #1 / #2.
+   */
+  pendingAsk?: {
+    toolUseID: string;
+    questions: unknown[];
+    input: Record<string, unknown>;
+    resolve: (r: PermissionResult) => void;
+  };
 }
 
 const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
@@ -181,6 +201,15 @@ class SdkSessionManager {
   async sendMessage(sessionId: string, prompt: string, projectPath?: string): Promise<void> {
     const s = this.getOrCreate(sessionId);
     if (projectPath) s.projectPath = projectPath;
+
+    // A parked question blocks the turn mid-tool. Pushing a prompt into the
+    // input stream now would NOT answer it (the tool result is the only thing
+    // that unblocks the model) — it would queue behind the parked tool call and
+    // surface later, out of context, while the dialog still waits. Reject with a
+    // clear message instead: answer or dismiss first.
+    if (s.pendingAsk) {
+      throw new Error('Claude is waiting for an answer to its question. Answer or dismiss it first.');
+    }
 
     // MUST precede startQuery: it replays s.model into options.model, so a
     // session resumed after a restart would otherwise open its query on the
@@ -437,9 +466,48 @@ class SdkSessionManager {
     eventBus.emitApp({ type: 'session:model', sessionId: s.sessionId, model });
   }
 
+  /**
+   * Settle a parked question with a deny, and tell any open dialog to close.
+   *
+   * Every teardown path MUST funnel through here. A dropped resolver leaves the
+   * CLI blocked in canUseTool forever (no park deadline), and the session then
+   * reports isProcessing:false while the process is still stuck — idle to the
+   * UI, wedged in reality. Idempotent: `resolve` is the router's own `settle`,
+   * which no-ops after the first call.
+   */
+  private settlePendingAsk(s: SdkSession, message: string): void {
+    if (!s.pendingAsk) return;
+    s.pendingAsk.resolve({ behavior: 'deny', message });
+    s.pendingAsk = undefined;
+    eventBus.emitApp({
+      type: 'session:stream',
+      sessionId: s.sessionId,
+      askUserQuestion: { cleared: true },
+    });
+  }
+
   /** Interrupt the in-flight turn without tearing down the session. */
   async interrupt(sessionId: string): Promise<void> {
     const s = this.sessions.get(sessionId);
+
+    // Settle BEFORE interrupting, for two reasons.
+    //
+    // 1. Correctness: interrupt() is the ONE teardown that neither aborts the
+    //    abortController nor ends the input stream — so the router's abort
+    //    listener never fires and consume()'s finally never runs (the message
+    //    stream stays open for the next turn). Without this the question stays
+    //    parked while isProcessing flips false: the UI says idle, the CLI is
+    //    still blocked, and a later answer would RESUME the turn the user just
+    //    stopped. Stop has to actually stop.
+    // 2. Liveness: the CLI is blocked awaiting our control_response, so
+    //    `await s.q.interrupt()` could wait on a process that isn't listening.
+    //    Unblocking it first means interrupt() can be serviced.
+    //
+    // Both recovery buttons land here (handleTranscriptStop and
+    // handleKillStuckSession), so this is the escape hatch — it cannot be the
+    // one path that strands the turn.
+    if (s) this.settlePendingAsk(s, 'Session interrupted.');
+
     if (s?.q) {
       try {
         await s.q.interrupt();
@@ -466,6 +534,11 @@ class SdkSessionManager {
     // Abort first so the pending for-await in consume() unwinds knowing the
     // teardown was intentional (its catch checks signal.aborted).
     try { s.abortController?.abort(); } catch { /* best effort */ }
+    // Belt and braces: the abort above already settles a parked question via the
+    // router's signal listener. This makes the teardown correct on its own terms
+    // rather than by tracing the abort wiring — and covers an abortController
+    // that's already been cleared, where the listener can never fire.
+    this.settlePendingAsk(s, 'Session interrupted.');
     s.input?.end();
     s.q = null;
     s.input = null;
@@ -486,6 +559,9 @@ class SdkSessionManager {
     const s = this.sessions.get(sessionId);
     if (s) {
       try { s.abortController?.abort(); } catch { /* best effort */ }
+      // As in stop(): the abort settles a parked question through the router's
+      // listener, but the teardown shouldn't depend on that to be correct.
+      this.settlePendingAsk(s, 'Session interrupted.');
       s.input?.end();
       s.q = null;
       s.input = null;
@@ -731,22 +807,164 @@ class SdkSessionManager {
     }
   }
 
-  private allowAll = async (
-    _toolName: string,
-    input: Record<string, unknown>,
-  ): Promise<PermissionResult> => {
-    // This callback is where a REAL permission prompt would live, and because
-    // the session is bidirectional, AskUserQuestion works here too (unlike the
-    // shipping `--print` path that auto-errors it).
-    //
-    // IMPORTANT: with `permissionMode: 'bypassPermissions'` below, the SDK
-    // auto-approves every tool BEFORE consulting this callback, so it is never
-    // invoked (the runtime warns CLAUDE_SDK_CAN_USE_TOOL_SHADOWED). To actually
-    // gate tools through this callback, switch to `permissionMode: 'default'`
-    // (or 'acceptEdits'), or register a PreToolUse hook. Kept here to document
-    // the seam; the prototype runs bypass for behavior parity with today.
-    return { behavior: 'allow', updatedInput: input };
-  };
+  /**
+   * The permission callback. Today it does exactly two things: allow every
+   * ordinary tool through untouched, and PARK on AskUserQuestion until a human
+   * answers.
+   *
+   * On `permissionMode: 'bypassPermissions'` (below) and this callback:
+   * bypass auto-approves permission-GATED tools before consulting us, and the
+   * runtime warns CLAUDE_SDK_CAN_USE_TOOL_SHADOWED to that effect. That warning
+   * does NOT apply to AskUserQuestion. It is not permission-gated — it is a
+   * user-INPUT tool, and the permission component is the only channel that can
+   * collect its answers, so it routes here regardless of mode. Verified at SDK
+   * 0.3.210 under BOTH bypassPermissions and default: the callback fires, the
+   * promise is awaited for as long as we hold it, and updatedInput.answers is
+   * threaded back into the same turn (scripts/probe-ask-user-question.mjs).
+   *
+   * So we keep bypassPermissions: switching to 'default' would force a callback
+   * round-trip on every Bash/Edit/Read and break behavior parity for no gain.
+   * That the shadowing warning does not cover user-input tools is OBSERVED, not
+   * promised by the types — hence the exact version pin in package.json and the
+   * canary test that fails loudly if a future SDK changes it.
+   *
+   * Gating other tools behind a real UI prompt is deliberately out of scope; the
+   * `allow` fallthrough is the seam where that would live.
+   */
+  private canUseTool(s: SdkSession) {
+    return async (
+      toolName: string,
+      input: Record<string, unknown>,
+      { signal, toolUseID, agentID }: { signal: AbortSignal; toolUseID: string; agentID?: string },
+    ): Promise<PermissionResult> => {
+      if (toolName !== 'AskUserQuestion') {
+        return { behavior: 'allow', updatedInput: input };
+      }
+
+      // A subagent has no dialog to render into: Fury's UI renders questions for
+      // the main chat only. Parking here would block a sidechain forever on a
+      // prompt nobody can see, and — with a single-slot pendingAsk — a sidechain
+      // question would silently overwrite the main turn's slot and resolve the
+      // WRONG promise. Deny instead; the model handles it gracefully.
+      if (agentID) {
+        return {
+          behavior: 'deny',
+          message:
+            'AskUserQuestion is not available to subagents in this environment. ' +
+            'Proceed with your best judgment, or ask the user from the main thread.',
+        };
+      }
+
+      // Single slot. The model cannot ask twice concurrently (its turn is
+      // blocked right here), so an overwrite means an assumption broke — resolve
+      // the old promise rather than leak it, and say so loudly.
+      if (s.pendingAsk) {
+        console.warn(
+          `[SdkSessionManager] ${s.sessionId} pendingAsk overwritten ` +
+            `(${s.pendingAsk.toolUseID} -> ${toolUseID}); resolving the stale one.`,
+        );
+        s.pendingAsk.resolve({ behavior: 'deny', message: 'Superseded by a newer question.' });
+        s.pendingAsk = undefined;
+      }
+
+      const questions = Array.isArray(input.questions) ? (input.questions as unknown[]) : [];
+
+      return new Promise<PermissionResult>((resolve) => {
+        let settled = false;
+        const settle = (r: PermissionResult) => {
+          if (settled) return;
+          settled = true;
+          if (s.pendingAsk?.toolUseID === toolUseID) s.pendingAsk = undefined;
+          resolve(r);
+        };
+
+        // TRAP #2: stop() and killSession() abort the controller. Without this
+        // listener the held promise NEVER settles — the callback leaks and
+        // teardown hangs behind a dialog nobody is looking at.
+        if (signal.aborted) {
+          settle({ behavior: 'deny', message: 'Session interrupted.' });
+          return;
+        }
+        signal.addEventListener(
+          'abort',
+          () => {
+            settle({ behavior: 'deny', message: 'Session interrupted.' });
+            eventBus.emitApp({
+              type: 'session:stream',
+              sessionId: s.sessionId,
+              askUserQuestion: { cleared: true },
+            });
+          },
+          { once: true },
+        );
+
+        s.pendingAsk = { toolUseID, questions, input, resolve: settle };
+
+        // Announce to any live dialog. A client that missed this (mid-refresh)
+        // re-hydrates from /api/stream-buffer instead — server-held state is the
+        // ONLY source of a pending question on the SDK path (TRAP #4).
+        eventBus.emitApp({
+          type: 'session:stream',
+          sessionId: s.sessionId,
+          askUserQuestion: { toolUseID, questions },
+        });
+      });
+    };
+  }
+
+  /**
+   * Resolve a parked question. Called by POST /api/claude-sdk/answer.
+   *
+   * Returns false when nothing was resolved — no session, nothing parked, or a
+   * toolUseID mismatch. The mismatch check is the point: a stale dialog left
+   * open from a previous turn must not answer the current question.
+   */
+  resolveAsk(
+    sessionId: string,
+    toolUseID: string,
+    result: { answers: Record<string, string>; annotations?: Record<string, unknown> } | { skip: true },
+  ): boolean {
+    const s = this.sessions.get(sessionId);
+    if (!s?.pendingAsk || s.pendingAsk.toolUseID !== toolUseID) return false;
+
+    const { input, resolve } = s.pendingAsk;
+    s.pendingAsk = undefined;
+
+    if ('skip' in result) {
+      resolve({
+        behavior: 'deny',
+        message: 'The user dismissed the question without answering.',
+      });
+    } else {
+      resolve({
+        behavior: 'allow',
+        updatedInput: {
+          ...input,
+          answers: result.answers,
+          ...(result.annotations ? { annotations: result.annotations } : {}),
+        },
+      });
+    }
+    eventBus.emitApp({
+      type: 'session:stream',
+      sessionId,
+      askUserQuestion: { cleared: true },
+    });
+    return true;
+  }
+
+  /**
+   * The serializable half of a parked question (no `resolve`), for
+   * /api/stream-buffer to re-hydrate a dialog after a browser refresh.
+   *
+   * Deliberately NOT folded into StreamBuffer: that shape is shared with the CLI
+   * manager, which has no concept of a parked question. A separate accessor also
+   * keeps this answerable when no buffer exists (or one has expired).
+   */
+  getPendingAsk(sessionId: string): { toolUseID: string; questions: unknown[] } | null {
+    const p = this.sessions.get(sessionId)?.pendingAsk;
+    return p ? { toolUseID: p.toolUseID, questions: p.questions } : null;
+  }
 
   private startQuery(s: SdkSession): void {
     // Reclaim any CLI process still running for this session before spawning a
@@ -789,7 +1007,7 @@ class SdkSessionManager {
           // shipping manager runs on stderr. Left as a log for the prototype.
           if (data.trim()) console.error('[SdkSessionManager] stderr:', data.trim());
         },
-        canUseTool: this.allowAll,
+        canUseTool: this.canUseTool(s),
       },
     });
 
@@ -813,6 +1031,12 @@ class SdkSessionManager {
       s.isProcessing = false;
       s.q = null;
       s.input = null;
+      // Settle any still-parked question. RESOLVE rather than just drop it: the
+      // turn is over, so nothing will ever answer this promise, and a dropped
+      // one leaves the canUseTool callback pending forever (no park deadline).
+      // Normally already undefined — the answer/abort paths clear their own slot
+      // — so reaching here means the stream ended under an open dialog.
+      this.settlePendingAsk(s, 'The turn ended before the question was answered.');
       this.closeBuffer(s);
       this.emitHealth(s, false);
     }
@@ -1024,7 +1248,7 @@ class SdkSessionManager {
 // stripped (they render as intermediary bubbles above the composer), and the
 // next send spawns a SECOND process for the same session. Editing this file
 // while a session is working used to reproduce exactly that, every time.
-const SINGLETON_VERSION = 14;
+const SINGLETON_VERSION = 16;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

@@ -144,6 +144,54 @@ export default function ChatTab({
   // AskUserQuestion dialog state
   const [askUserQuestion, setAskUserQuestion] = useState<AskUserQuestionState | null>(null);
 
+  /** When a question last PARKED, via SSE. Guards the stale-close race below. */
+  const lastAskEventAtRef = useRef(0);
+
+  /**
+   * Re-open (or close) the dialog from a /api/stream-buffer response.
+   *
+   * On the SDK path the server holds the pending question and Claude is parked
+   * on it indefinitely, so this is what makes a browser refresh, a switch-back,
+   * or a backgrounded tab survivable: without it the turn is stranded — the
+   * process waits forever on a dialog that no longer exists on screen. Called
+   * from every buffer restore site, since each is a moment the dialog could have
+   * been lost.
+   *
+   * A null pendingAsk closes a stale SDK dialog (the question was answered
+   * elsewhere — another tab, an abort). Guarded on toolUseID so it never closes
+   * a CLI-sourced dialog, which the server has no record of.
+   *
+   * `issuedAt` is when the fetch was SENT, and the null branch needs it: the
+   * response is a snapshot of the past with no ordering guarantee against SSE.
+   * If a question parks after we asked but before the answer lands, that stale
+   * null would close a dialog that had only just opened — and Claude would park
+   * forever with nothing on screen to answer it. Narrow (fetches return in ms,
+   * parks happen seconds in) but it's the failure this whole design exists to
+   * prevent, so: never let a snapshot older than the last park close anything.
+   */
+  const applyPendingAskFromBuffer = (
+    bufData: { pendingAsk?: { toolUseID?: string; questions?: unknown } | null },
+    issuedAt: number,
+  ) => {
+    if (!sdkSessionsEnabled) return;
+    const pending = bufData?.pendingAsk;
+    if (pending?.toolUseID && Array.isArray(pending.questions)) {
+      lastAskEventAtRef.current = Date.now();
+      setAskUserQuestion({
+        toolUseID: pending.toolUseID,
+        input: { questions: pending.questions as AskUserQuestionState['input']['questions'] },
+      });
+    } else if (pending === null) {
+      // >= not >: a park stamped in the same millisecond the fetch was issued is
+      // unordered with respect to it, so treat it as newer. Ties fail toward
+      // KEEPING the dialog — the safe direction, since the cost of a wrong close
+      // is a turn parked forever with nothing on screen, and the cost of a wrong
+      // keep is a stale dialog whose answer gets a harmless 409.
+      if (lastAskEventAtRef.current >= issuedAt) return; // snapshot predates the park
+      setAskUserQuestion(prev => (prev?.toolUseID ? null : prev));
+    }
+  };
+
   // Session-scoped SSE ref
   const sessionEsRef = useRef<EventSource | null>(null);
 
@@ -435,8 +483,29 @@ export default function ChatTab({
         // that hasn't been answered by a subsequent user prompt. Without
         // this, navigating away from a session while AskUserQuestion was
         // in flight loses the dialog forever.
-        if (data.pendingAskUserQuestion) {
-          setAskUserQuestion({ input: data.pendingAskUserQuestion });
+        //
+        // CLI PATH ONLY — deliberately ignored when SDK sessions are on.
+        // transcriptParser derives this from the JSONL, and its state machine is
+        // permanently stuck-on for us: it SETS pendingAskUserQuestion for any
+        // AskUserQuestion tool_use, and its only clear lives behind
+        // `typeof msg.content === 'string'`. On the SDK path the answer arrives
+        // as a tool_result — a user entry whose content is an ARRAY — so the
+        // clear never runs and the flag survives for the life of the session.
+        // Honoring it here would re-open the dialog on EVERY navigation to a
+        // session that ever asked anything, for a question already answered, and
+        // the JSONL has no toolUseID so that dialog could never resolve anything.
+        // A pending SDK question comes from server-held state instead (the
+        // stream-buffer's pendingAsk, below) — see docs/ask-user-question-sdk.md
+        // TRAP #4. The CLI path keeps the heuristic untouched: we stop LISTENING
+        // to it rather than teach the parser about tool_results.
+        if (!sdkSessionsEnabled && data.pendingAskUserQuestion) {
+          setAskUserQuestion({
+            // null, not an id: the CLI path cannot answer a tool call — the
+            // answer is re-sent as a fresh prose turn — so there is nothing to
+            // correlate with. The type says so out loud.
+            toolUseID: null,
+            input: data.pendingAskUserQuestion,
+          });
         }
 
         if (data.currentModel) {
@@ -449,9 +518,13 @@ export default function ChatTab({
       // from the buffer if available, and check health as a fallback.
       let detectedProcessing = false;
       try {
+        const bufIssuedAt = Date.now();
         const bufRes = await fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(sessionId)}`);
         if (bufRes.ok) {
           const bufData = await bufRes.json();
+          // Before the isActive branch: a parked question must re-open whether
+          // or not the buffer is still active.
+          applyPendingAskFromBuffer(bufData, bufIssuedAt);
           if (bufData.hasBuffer && bufData.isActive) {
             // The JSONL contains partial assistant messages for the in-flight
             // turn that the stream buffer is handling. Strip everything this
@@ -625,10 +698,15 @@ export default function ChatTab({
     es.addEventListener('connected', () => {
       if (!shouldProcess()) return;
 
+      const bufIssuedAt = Date.now();
       fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(mySessionId)}`)
         .then(res => res.json())
         .then(bufData => {
           if (!shouldProcess()) return;
+
+          // A question could have been asked in the gap between the initial
+          // restore and this connect — that emit would have had no listener.
+          applyPendingAskFromBuffer(bufData, bufIssuedAt);
 
           if (bufData.hasBuffer) {
             // Only update if the buffer has more data than what we currently have
@@ -696,9 +774,33 @@ export default function ChatTab({
           // block, so we don't need to issue the stop here — that's
           // necessary so the kill still happens when the user is viewing
           // a different session at the moment the tool fires.
-          if (tool.name === 'AskUserQuestion' && tool.input?.questions) {
-            setAskUserQuestion({ input: tool.input });
+          //
+          // CLI PATH ONLY. This event carries no toolUseID (see
+          // SessionStreamEvent.toolUse), so a dialog opened from it could never
+          // resolve the parked tool call. The SDK backend emits its own
+          // `askUserQuestion` event WITH the id — handled below — and this event
+          // fires for SDK sessions too, so without this guard both would race to
+          // open the dialog and the id-less one could win.
+          if (!sdkSessionsEnabled && tool.name === 'AskUserQuestion' && tool.input?.questions) {
+            setAskUserQuestion({ toolUseID: null, input: tool.input });
           }
+        }
+      } else if (data.askUserQuestion) {
+        // The SDK backend is parked in canUseTool awaiting this answer. Unlike
+        // the toolUse event above, this one carries the toolUseID that
+        // /api/claude-sdk/answer needs to resolve the right tool call.
+        // `cleared` = someone else settled it (abort, another tab, teardown), so
+        // close the dialog rather than leave the user answering a dead question.
+        if (data.askUserQuestion.cleared) {
+          setAskUserQuestion(null);
+        } else if (data.askUserQuestion.questions) {
+          // Stamp the park so an in-flight buffer fetch, issued before this and
+          // answering `pendingAsk: null`, can't close the dialog we just opened.
+          lastAskEventAtRef.current = Date.now();
+          setAskUserQuestion({
+            toolUseID: data.askUserQuestion.toolUseID,
+            input: { questions: data.askUserQuestion.questions },
+          });
         }
       } else if (data.toolResult) {
         setStreamEvents(prev => [...prev, { type: 'tool_result' as const, preview: data.toolResult.preview, ts: Date.now() }]);
@@ -929,10 +1031,15 @@ export default function ChatTab({
     const mySessionId = viewingTranscriptId;
     const myProject = historyTranscriptProject;
 
+    const bufIssuedAt = Date.now();
     fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(mySessionId)}`)
       .then(res => res.json())
       .then(bufData => {
         if (activeSessionRef.current !== mySessionId) return;
+
+        // SSE was ignored while hidden, so a question asked in that window never
+        // reached us — and Claude is still parked on it.
+        applyPendingAskFromBuffer(bufData, bufIssuedAt);
 
         if (bufData.isProcessing || (bufData.hasBuffer && bufData.isActive)) {
           // Session is still processing — restore stream state
@@ -1363,6 +1470,69 @@ export default function ChatTab({
     }
   };
 
+  /**
+   * SDK path: resolve the parked tool call in place. No kill, no re-prompt, no
+   * new turn — Claude is still sitting in canUseTool waiting on this promise, so
+   * the answer lands as the tool's own result and the SAME turn continues.
+   */
+  /**
+   * POST an answer (or a skip) for the parked question, closing the dialog
+   * optimistically and putting it BACK if the post didn't land.
+   *
+   * The optimistic close keeps the common path instant. But if the request fails,
+   * the server is still parked: isProcessing stays true, so the composer stays
+   * locked and the user is left staring at a spinner with no dialog and no error
+   * — the exact stranded turn this design exists to prevent. Restoring the dialog
+   * is the only thing that gives them a retry.
+   *
+   * NOT restored on 409: that means the question was legitimately settled by
+   * someone else (another tab, an abort, a superseding ask). Re-opening it would
+   * put an unanswerable dialog back on screen.
+   */
+  const postAskAnswer = async (
+    body: Record<string, unknown>,
+    label: string,
+  ) => {
+    const current = askUserQuestion;
+    const toolUseID = current?.toolUseID;
+    const mySessionId = viewingTranscriptId;
+    setAskUserQuestion(null);
+    if (!toolUseID || !mySessionId) return;
+
+    // Only restore if nothing newer took the slot and we're still on the same
+    // session — a plain set would clobber a question that parked while we waited.
+    const restore = () => {
+      if (activeSessionRef.current !== mySessionId) return;
+      setAskUserQuestion(prev => prev ?? current);
+    };
+
+    try {
+      const res = await fetch('/api/claude-sdk/answer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: mySessionId, toolUseID, ...body }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        console.error(`Failed to ${label} question:`, data.error || `HTTP ${res.status}`);
+        if (res.status !== 409) restore();
+      }
+    } catch (error) {
+      // Network failure — the server never heard us, so it is definitely still parked.
+      console.error(`Failed to ${label} question:`, error);
+      restore();
+    }
+  };
+
+  /** SDK path: resolve the parked tool call in place. */
+  const handleAskUserQuestionStructured = (result: {
+    answers: Record<string, string>;
+    annotations?: Record<string, { notes?: string }>;
+  }) => postAskAnswer(result, 'answer');
+
+  /** SDK path: dismissal denies the tool, which the model handles gracefully. */
+  const handleAskUserQuestionSkipSdk = () => postAskAnswer({ skip: true }, 'skip');
+
   const handleAskUserQuestionResponse = async (answers: string) => {
     setAskUserQuestion(null);
     if (!answers.trim()) return;
@@ -1618,18 +1788,38 @@ export default function ChatTab({
                           />
                           {transcriptLoading && (
                             <div className="flex justify-start">
-                              <button
-                                onClick={() => setRightPanelView('stream')}
-                                className="max-w-[80%] rounded-lg pl-4 pr-2 py-2 bg-muted text-foreground border border-border cursor-pointer hover:border-ring transition-colors text-left"
-                                title="View live stream"
-                              >
-                                <div className="text-xs opacity-70 mb-1">Claude</div>
-                                <div data-testid="processing-dots" className="flex items-center gap-1 py-2">
-                                  <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
-                                  <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
-                                  <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
+                              {/*
+                                While parked on a question the turn IS live and
+                                isProcessing IS true — correct, but the thinking
+                                dots would spin for as long as the human takes
+                                and read as a hang. The turn is not blocked on
+                                Claude; it's blocked on the user. Say that.
+                                Waiting on the DIALOG (not just isAwaitingAnswer)
+                                so this only shows while the question is on screen
+                                to answer.
+                              */}
+                              {askUserQuestion ? (
+                                <div
+                                  data-testid="awaiting-answer"
+                                  className="max-w-[80%] rounded-lg px-4 py-2 bg-muted text-foreground border border-border text-left"
+                                >
+                                  <div className="text-xs opacity-70 mb-1">Claude</div>
+                                  <div className="text-sm">Waiting for your answer…</div>
                                 </div>
-                              </button>
+                              ) : (
+                                <button
+                                  onClick={() => setRightPanelView('stream')}
+                                  className="max-w-[80%] rounded-lg pl-4 pr-2 py-2 bg-muted text-foreground border border-border cursor-pointer hover:border-ring transition-colors text-left"
+                                  title="View live stream"
+                                >
+                                  <div className="text-xs opacity-70 mb-1">Claude</div>
+                                  <div data-testid="processing-dots" className="flex items-center gap-1 py-2">
+                                    <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
+                                    <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
+                                    <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
+                                  </div>
+                                </button>
+                              )}
                             </div>
                           )}
                           {suggestedPrompt && !transcriptLoading && promptSuggestionsEnabled && (
@@ -1789,7 +1979,19 @@ export default function ChatTab({
           ''
         }
         onSubmit={handleAskUserQuestionResponse}
-        onSkip={handleAskUserQuestionSkip}
+        // Only pass the structured path when there is a live tool call to
+        // resolve. A CLI-sourced question has toolUseID null and MUST fall
+        // through to the prose path, which re-sends the answer as a new turn.
+        onSubmitStructured={
+          sdkSessionsEnabled && askUserQuestion.toolUseID
+            ? handleAskUserQuestionStructured
+            : undefined
+        }
+        onSkip={
+          sdkSessionsEnabled && askUserQuestion.toolUseID
+            ? handleAskUserQuestionSkipSdk
+            : handleAskUserQuestionSkip
+        }
       />
     )}
 

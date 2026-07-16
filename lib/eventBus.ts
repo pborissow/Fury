@@ -18,6 +18,15 @@ export interface SessionStreamEvent {
   toolUse?: { name: string; status: string; input?: any };
   toolResult?: { preview: string };
   error?: string;
+  /**
+   * The model is parked in canUseTool awaiting an answer to AskUserQuestion.
+   * Carries its OWN toolUseID: the `toolUse` event above deliberately does not
+   * include one, so this is the only channel that can correlate a rendered
+   * dialog back to the parked tool call that /api/claude-sdk/answer resolves.
+   * `cleared` fires when the question was settled by someone else (abort,
+   * another tab, teardown) so open dialogs can close themselves.
+   */
+  askUserQuestion?: { toolUseID: string; questions: any[] } | { cleared: true };
 }
 
 export interface SessionHealthEvent {
