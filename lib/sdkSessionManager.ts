@@ -800,4 +800,29 @@ if (!globalForSdk.__sdkSessionManager || globalForSdk.__sdkSessionManagerV !== S
   globalForSdk.__sdkSessionManager = replacement;
   globalForSdk.__sdkSessionManagerV = SINGLETON_VERSION;
 }
-export const sdkSessionManager = globalForSdk.__sdkSessionManager;
+// Always resolve the CURRENT instance, never capture one.
+//
+// `export const x = globalForSdk.__sdkSessionManager` freezes the reference at
+// module-evaluation time. When the block above swaps in a replacement, every
+// route module that was ALREADY evaluated keeps pointing at the old instance —
+// so routes silently disagree about the same session. Observed in the wild:
+// /api/stream-buffer (recompiled after a bump) reported isProcessing:true while
+// /api/health (not recompiled, still holding the old instance) reported false
+// for the same live session. ChatTab's 15s health poll then cleared
+// transcriptLoading mid-turn — dots vanish — and refetched the transcript, whose
+// in-flight partials render as intermediary bubbles.
+//
+// A proxy keeps the `sdkSessionManager.foo()` call sites unchanged while looking
+// the instance up on every access. Methods are bound to the live instance so
+// `this` isn't the proxy.
+export const sdkSessionManager: SdkSessionManager = new Proxy({} as SdkSessionManager, {
+  get(_target, prop) {
+    const live = globalForSdk.__sdkSessionManager as unknown as Record<string | symbol, unknown>;
+    const value = live[prop];
+    return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(live) : value;
+  },
+  set(_target, prop, value) {
+    (globalForSdk.__sdkSessionManager as unknown as Record<string | symbol, unknown>)[prop] = value;
+    return true;
+  },
+});

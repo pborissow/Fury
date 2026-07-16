@@ -164,6 +164,28 @@ export default function Home() {
   // Persisted workflow ID (loaded from UI state, saved on change)
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
 
+  // Deep link from the Stats sessions table into a Chat transcript. Stats can
+  // find the expensive/bloated session but has no way to open it, so the
+  // request is lifted here (the only common ancestor) and handed to ChatTab.
+  // A monotonic `nonce` makes re-opening the SAME session re-fire the effect —
+  // without it, clicking the same row twice after navigating away would be a
+  // no-op, since the payload would be referentially identical.
+  const [sessionToOpen, setSessionToOpen] = useState<
+    { sessionId: string; project: string; display: string; nonce: number } | null
+  >(null);
+  const openSessionNonce = useRef(0);
+
+  const handleOpenSessionFromStats = useCallback(
+    (sessionId: string, project: string, display: string) => {
+      openSessionNonce.current += 1;
+      setSessionToOpen({ sessionId, project, display, nonce: openSessionNonce.current });
+      // Same render as the state set: ChatTab's SSE/effects are gated on
+      // isActive, so the tab must already be 'chat' when the open fires.
+      setActiveTab('chat');
+    },
+    [],
+  );
+
   // Panel layout state
   const [chatHorizontalLayout, setChatHorizontalLayout] = useState<number[]>([20, 45, 35]);
   const [chatVerticalLayout, setChatVerticalLayout] = useState<number[]>([70, 30]);
@@ -366,6 +388,7 @@ export default function Home() {
                 promptSuggestionsEnabled={promptSuggestionsEnabled}
                 ttsEnabled={ttsEnabled}
                 sdkSessionsEnabled={sdkSessionsEnabled}
+                openSessionRequest={sessionToOpen}
               />
             </div>
           )}
@@ -392,7 +415,10 @@ export default function Home() {
               className="absolute inset-0"
               style={activeTab !== 'stats' ? { visibility: 'hidden', pointerEvents: 'none' } : undefined}
             >
-              <StatsTab isActive={activeTab === 'stats'} />
+              <StatsTab
+                isActive={activeTab === 'stats'}
+                onOpenSession={handleOpenSessionFromStats}
+              />
             </div>
           )}
         </div>

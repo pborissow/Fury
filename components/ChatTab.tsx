@@ -41,6 +41,10 @@ interface ChatTabProps {
   /** When on, stop/rewind route to the persistent SDK session endpoints
    *  (/api/claude-sdk/interrupt, /rewind) instead of the CLI kill + LLM-undo. */
   sdkSessionsEnabled: boolean;
+  /** A request from another tab (Stats) to open a transcript here. `nonce`
+   *  changes on every request so re-opening the same session re-fires; null
+   *  when nothing is pending. */
+  openSessionRequest?: { sessionId: string; project: string; display: string; nonce: number } | null;
 }
 
 export default function ChatTab({
@@ -52,6 +56,7 @@ export default function ChatTab({
   promptSuggestionsEnabled,
   ttsEnabled,
   sdkSessionsEnabled,
+  openSessionRequest,
 }: ChatTabProps) {
   // --- State moved from page.tsx ---
 
@@ -435,28 +440,28 @@ export default function ChatTab({
           const bufData = await bufRes.json();
           if (bufData.hasBuffer && bufData.isActive) {
             // The JSONL contains partial assistant messages for the in-flight
-            // turn that the stream buffer is handling. Strip the trailing
-            // messages from the current turn so the chat shows bouncing dots
-            // instead of intermediary assistant bubbles.
+            // turn that the stream buffer is handling. Strip everything this
+            // turn has written so the chat shows bouncing dots instead of
+            // intermediary assistant bubbles.
+            //
+            // Anchor on the buffer's startedAt, NOT on matching userPrompt. A
+            // message sent mid-turn ("please continue") is folded by the CLI
+            // into the next tool_result — array content, which the parser never
+            // emits as a user message — so the string match silently found
+            // nothing (verified live: findLastIndex -> -1) and fell through to a
+            // heuristic that walked back over EVERY trailing assistant, cutting
+            // earlier completed turns too. It also broke on a repeated prompt.
+            // startedAt vs each message's timestamp identifies this turn's
+            // output exactly, whatever the prompt was.
             setHistoryTranscript(prev => {
-              const lastUserIdx = prev.findLastIndex(
-                m => m.role === 'user' && m.content === bufData.userPrompt
-              );
-              if (lastUserIdx >= 0) {
-                return prev.slice(0, lastUserIdx);
-              }
-              const lastIdx = prev.length - 1;
-              if (lastIdx >= 0 && prev[lastIdx].role === 'assistant') {
-                let cutIdx = lastIdx;
-                while (cutIdx >= 0 && prev[cutIdx].role === 'assistant') {
-                  cutIdx--;
-                }
-                if (cutIdx >= 0 && prev[cutIdx].role === 'user') {
-                  return prev.slice(0, cutIdx);
-                }
-                return prev.slice(0, cutIdx + 1);
-              }
-              return prev;
+              const startedAt = typeof bufData.startedAt === 'number' ? bufData.startedAt : 0;
+              if (!startedAt) return prev; // no anchor — leave the transcript alone
+              const cutIdx = prev.findIndex(m => {
+                if (!m.timestamp) return false;
+                const t = Date.parse(m.timestamp);
+                return Number.isFinite(t) && t >= startedAt;
+              });
+              return cutIdx >= 0 ? prev.slice(0, cutIdx) : prev;
             });
 
             setTranscriptOverlayMessages([{ role: 'user' as const, content: bufData.userPrompt }]);
@@ -505,6 +510,22 @@ export default function ChatTab({
       setTimeout(() => scrollTranscriptToBottom(), 100);
     }
   };
+
+  // Open a transcript requested by another tab (Stats → "open this session").
+  //
+  // Keyed on the request's nonce alone, NOT on fetchTranscript: that's a plain
+  // arrow re-created every render, so depending on it would re-open the session
+  // on every state change. The ref keeps the effect pinned to the nonce while
+  // still calling the current closure.
+  const fetchTranscriptRef = useRef(fetchTranscript);
+  fetchTranscriptRef.current = fetchTranscript;
+  useEffect(() => {
+    if (!openSessionRequest) return;
+    const { sessionId, project, display } = openSessionRequest;
+    if (!sessionId || !project) return;
+    fetchTranscriptRef.current(sessionId, project, display);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openSessionRequest?.nonce]);
 
   // --- Global SSE connection for live-sessions and history-updated events ---
   // Connects when the tab becomes active, disconnects when hidden to save resources.

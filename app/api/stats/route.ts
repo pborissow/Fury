@@ -65,6 +65,9 @@ interface SessionAgg {
   contextMs: number;
   /** Model context window; 0 = unknown (never guess a denominator). */
   contextWindow: number;
+  /** Times the session was auto-summarised. The strongest bloat signal we have:
+   *  it means the conversation hit the wall and detail was thrown away. */
+  numCompactions: number;
 }
 
 export async function GET(req: Request) {
@@ -139,10 +142,16 @@ export async function GET(req: Request) {
       let s = sessions.get(sid);
       if (!s) {
         // Prefer the user-set session label (metadata.label) over the
-        // first-prompt snippet, matching the chat sidebar.
+        // first-prompt snippet, matching the chat sidebar. numCompactions comes
+        // from the same blob — parse once and reuse.
         let label: string | undefined;
+        let numCompactions = 0;
         if (r.metadata) {
-          try { label = JSON.parse(r.metadata as string)?.label || undefined; } catch { /* ignore */ }
+          try {
+            const m = JSON.parse(r.metadata as string);
+            label = m?.label || undefined;
+            numCompactions = Number(m?.numCompactions) || 0;
+          } catch { /* ignore */ }
         }
         s = {
           sessionId: sid,
@@ -155,6 +164,7 @@ export async function GET(req: Request) {
           messages: Number(r.message_count) || 0,
           lastMs: 0,
           peakContext: 0, finalContext: 0, contextMs: -1, contextWindow: 0,
+          numCompactions,
         };
         sessions.set(sid, s);
       }
@@ -206,6 +216,18 @@ export async function GET(req: Request) {
       // renders the size but no fill %, rather than guessing.
       contextWindow: s.contextWindow,
       peakFill: s.contextWindow > 0 ? s.peakContext / s.contextWindow : 0,
+      numCompactions: s.numCompactions,
+      // Normalized efficiency. Raw cost/tokens only ever surface the LONGEST
+      // sessions — "I did a lot of work" — which is not the same question as
+      // "was that work efficient". Per-message divides that out, so a 20-message
+      // session that cost $12 outranks a 300-message one that cost $15.
+      // Serialized (not derived on the client) so the table can sort on it like
+      // any other column. messages can be 0 for a session whose history entry
+      // never landed; 0 sorts to the bottom rather than dividing by zero.
+      costPerMsg: s.messages > 0 ? s.cost / s.messages : 0,
+      tokensPerMsg: s.messages > 0
+        ? (s.input + s.output + s.cacheWrite + s.cacheRead) / s.messages
+        : 0,
     })).sort((a, b) => b.lastMs - a.lastMs);
 
     return NextResponse.json({
