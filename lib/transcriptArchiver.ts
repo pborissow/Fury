@@ -17,6 +17,12 @@ export interface SessionMetadata {
   [key: string]: unknown;
 }
 
+/**
+ * Session lifecycle status. 'archived' is a soft delete — the row and all its
+ * child data survive intact; only the sidebar hides it. See setSessionStatus.
+ */
+export type SessionStatus = 'active' | 'archived';
+
 export interface SessionRecord {
   session_id: string;
   project: string;
@@ -25,6 +31,7 @@ export interface SessionRecord {
   created_at: number;
   updated_at: number;
   metadata?: SessionMetadata;
+  status?: SessionStatus;
 }
 
 export function computeHash(content: string): string {
@@ -147,6 +154,13 @@ export async function archiveTranscript(
   // Build statements: UPSERT session (with NULL hash), clear old data, then insert new data.
   // The hash is set to NULL initially so that if a later batch fails, the incomplete
   // archive will be retried on the next call (NULL hash never matches).
+  //
+  // NOTE: `status` is deliberately absent from both the INSERT column list and
+  // the DO UPDATE set-list, and must stay that way. On INSERT it takes the
+  // 'active' column default; on CONFLICT it is left untouched, so re-archiving
+  // an archived session (reactive listener, startup scan, transcript GET) can't
+  // resurrect it into the sidebar. `status` is owned exclusively by the
+  // delete/restore actions. See docs/delete-to-archive.md (trap #2).
   const preamble = [
     {
       sql: `INSERT INTO sessions (session_id, project, display, message_count, created_at, updated_at, jsonl_hash)
@@ -361,22 +375,41 @@ export async function restoreJsonlFromArchive(
 
 /**
  * Load archived sessions for the history list.
+ *
+ * Defaults to active sessions only. This filter is load-bearing: /api/history
+ * merges these rows in specifically to surface sessions whose JSONL file is gone
+ * but whose DB row survives — which is *exactly* the shape of an archived
+ * session (row kept, file deleted). Without it every archived session would
+ * reappear in the sidebar on the next history refresh and archiving would look
+ * like a no-op. See docs/delete-to-archive.md (trap #1).
+ *
+ * Pass `includeArchived` to get every status (a future restore UI will want it).
+ * Legacy pre-migration rows are covered by the column's 'active' default.
  */
 export async function loadArchivedSessions(opts?: {
   limit?: number;
   offset?: number;
   project?: string;
+  /** Include soft-deleted ('archived') sessions. Default: active only. */
+  includeArchived?: boolean;
 }): Promise<SessionRecord[]> {
   const db = await getDb();
   const limit = opts?.limit ?? 200;
   const offset = opts?.offset ?? 0;
 
-  let sql = 'SELECT session_id, project, display, message_count, created_at, updated_at, metadata FROM sessions';
+  let sql = 'SELECT session_id, project, display, message_count, created_at, updated_at, metadata, status FROM sessions';
   const args: any[] = [];
+  const where: string[] = [];
 
+  if (!opts?.includeArchived) {
+    where.push("status = 'active'");
+  }
   if (opts?.project) {
-    sql += ' WHERE project = ?';
+    where.push('project = ?');
     args.push(opts.project);
+  }
+  if (where.length > 0) {
+    sql += ' WHERE ' + where.join(' AND ');
   }
 
   sql += ' ORDER BY updated_at DESC LIMIT ? OFFSET ?';
@@ -397,8 +430,32 @@ export async function loadArchivedSessions(opts?: {
       created_at: row.created_at as number,
       updated_at: row.updated_at as number,
       metadata,
+      status: row.status as SessionStatus,
     };
   });
+}
+
+/**
+ * The session_ids of every soft-deleted session.
+ *
+ * The sidebar's authority on what's hidden. /api/history builds its primary list
+ * from history.jsonl, which carries no status, so the DB flag has to be applied
+ * to that list explicitly — otherwise hiding an archived session depends
+ * entirely on the delete route's best-effort history-strip having succeeded, and
+ * an archived session whose history entry survives (failed strip; or an external
+ * `claude --resume <id>` appending a fresh line) renders in the sidebar forever.
+ *
+ * Deliberately NOT loadArchivedSessions({ includeArchived: true }) partitioned
+ * in JS: that applies its LIMIT in SQL, so archived rows would eat the budget
+ * and silently drop active sessions off the end of the sidebar. This is an
+ * unbounded single-column read covered by idx_sessions_status.
+ */
+export async function loadArchivedSessionIds(): Promise<Set<string>> {
+  const db = await getDb();
+  const result = await db.execute(
+    "SELECT session_id FROM sessions WHERE status = 'archived'"
+  );
+  return new Set(result.rows.map(row => row.session_id as string));
 }
 
 /**
@@ -427,6 +484,35 @@ export async function updateSessionMetadata(sessionId: string, patch: Partial<Se
   });
 }
 
+/**
+ * Set a session's lifecycle status. 'archived' soft-deletes it: the row and all
+ * its usage_events / raw_jsonl / messages are preserved (Stats keeps counting
+ * it; a future restore can bring it back), but the sidebar hides it.
+ *
+ * No-ops if the session has no DB row (e.g. a brand-new session deleted before
+ * its first archive) — there's no accounting to preserve, so no tombstone is
+ * written. Idempotent: re-archiving an archived session is an UPDATE to the
+ * same value.
+ */
+export async function setSessionStatus(
+  sessionId: string,
+  status: SessionStatus
+): Promise<void> {
+  const db = await getDb();
+  await db.execute({
+    sql: 'UPDATE sessions SET status = ? WHERE session_id = ?',
+    args: [status, sessionId],
+  });
+}
+
+/**
+ * Hard-delete a session and — via ON DELETE CASCADE — its messages, raw_jsonl
+ * and usage_events.
+ *
+ * NOT used by the delete route any more: deleting a session archives it instead
+ * (see setSessionStatus), because dropping usage_events retroactively rewrites
+ * the Stats tab's history. Kept as the seam for a future explicit hard-purge.
+ */
 export async function deleteArchivedSession(sessionId: string): Promise<void> {
   const db = await getDb();
   await db.execute({

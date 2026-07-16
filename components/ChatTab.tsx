@@ -160,7 +160,7 @@ export default function ChatTab({
   const [contextMenu, setContextMenu] = useState<{
     x: number; y: number; sessionId: string; project: string; display: string; isLive: boolean;
   } | null>(null);
-  const [deleteConfirm, setDeleteConfirm] = useState<{
+  const [archiveConfirm, setArchiveConfirm] = useState<{
     sessionId: string; project: string; display: string; isLive: boolean;
   } | null>(null);
   const [labelEdit, setLabelEdit] = useState<{
@@ -1339,7 +1339,7 @@ export default function ChatTab({
     }
   };
 
-  const handleSessionDeleted = (sessionId: string) => {
+  const handleSessionArchived = (sessionId: string) => {
     if (viewingTranscriptId === sessionId) {
       setViewingTranscriptId(null);
       setHistoryTranscript([]);
@@ -1384,8 +1384,12 @@ export default function ChatTab({
     if (isCodeFile(fileName)) setCodeViewerPath(filePath);
   }, []);
 
-  const handleDeleteSession = async (sessionId: string, project: string) => {
-    setDeleteConfirm(null);
+  // Archives (soft-deletes) the session: DELETE /api/session kills the process,
+  // marks the row 'archived' in SQLite, and removes the on-disk JSONL + history
+  // entries. The transcript and its usage_events are preserved. See
+  // docs/delete-to-archive.md.
+  const handleArchiveSession = async (sessionId: string, project: string) => {
+    setArchiveConfirm(null);
     try {
       const res = await fetch(
         `/api/session?sessionId=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(project)}`,
@@ -1393,13 +1397,13 @@ export default function ChatTab({
       );
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        setErrorDialog({ title: 'Failed to delete session', message: data.error || `Server returned ${res.status}` });
+        setErrorDialog({ title: 'Failed to archive session', message: data.error || `Server returned ${res.status}` });
         return;
       }
-      handleSessionDeleted(sessionId);
+      handleSessionArchived(sessionId);
       fetchHistory();
     } catch (error) {
-      setErrorDialog({ title: 'Failed to delete session', message: error instanceof Error ? error.message : 'An unexpected error occurred' });
+      setErrorDialog({ title: 'Failed to archive session', message: error instanceof Error ? error.message : 'An unexpected error occurred' });
     }
   };
 
@@ -1463,7 +1467,7 @@ export default function ChatTab({
             onSelectSession={fetchTranscript}
             onRestorePending={restorePendingSession}
             onLabelEdit={(sessionId, currentLabel) => setLabelEdit({ sessionId, currentLabel })}
-            onDeleteConfirm={setDeleteConfirm}
+            onArchiveConfirm={setArchiveConfirm}
             onContextMenu={(e, entry) => {
               setContextMenu({
                 x: e.clientX, y: e.clientY,
@@ -1758,7 +1762,7 @@ export default function ChatTab({
     {contextMenu && (
       <SessionContextMenu
         {...contextMenu}
-        onDelete={setDeleteConfirm}
+        onArchive={setArchiveConfirm}
         onClose={() => setContextMenu(null)}
       />
     )}
@@ -1799,24 +1803,23 @@ export default function ChatTab({
     </Dialog>
 
     <ConfirmDialog
-      open={!!deleteConfirm}
-      onOpenChange={(open) => { if (!open) setDeleteConfirm(null); }}
-      title="Delete session?"
+      open={!!archiveConfirm}
+      onOpenChange={(open) => { if (!open) setArchiveConfirm(null); }}
+      title="Archive session?"
       message={<>
-        {deleteConfirm?.isLive && (
+        {archiveConfirm?.isLive && (
           <>
             <span className="text-yellow-500 font-semibold">This session is currently live.</span> The running process will be terminated.
             <br /><br />
           </>
         )}
-        This will permanently delete the session transcript and remove it from history. This action cannot be undone.
+        This will remove the session from your list. The transcript and its usage history are kept, and it will still count in Stats.
         <br /><br />
-        <span className="text-xs font-mono break-all">{deleteConfirm?.display}</span>
+        <span className="text-xs font-mono break-all">{archiveConfirm?.display}</span>
       </>}
-      confirmLabel="Delete"
-      confirmVariant="destructive"
-      onConfirm={() => { if (deleteConfirm) handleDeleteSession(deleteConfirm.sessionId, deleteConfirm.project); }}
-      onCancel={() => setDeleteConfirm(null)}
+      confirmLabel="Archive"
+      onConfirm={() => { if (archiveConfirm) handleArchiveSession(archiveConfirm.sessionId, archiveConfirm.project); }}
+      onCancel={() => setArchiveConfirm(null)}
     />
 
     {labelEdit && (

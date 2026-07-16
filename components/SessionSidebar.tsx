@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useLayoutEffect, useRef } from 'react';
-import { AlertTriangle, ShieldAlert, Pencil, Trash2 } from 'lucide-react';
+import { AlertTriangle, ShieldAlert, Pencil, Archive } from 'lucide-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import HistoryTimestamp from '@/components/HistoryTimestamp';
 import type { HistoryEntry, PendingSession } from '@/lib/types';
@@ -30,7 +30,7 @@ interface SessionSidebarProps {
   onSelectSession: (sessionId: string, project: string, display: string) => void;
   onRestorePending: (pending: PendingSession) => void;
   onLabelEdit: (sessionId: string, currentLabel: string) => void;
-  onDeleteConfirm: (entry: { sessionId: string; project: string; display: string; isLive: boolean }) => void;
+  onArchiveConfirm: (entry: { sessionId: string; project: string; display: string; isLive: boolean }) => void;
   onContextMenu: (e: React.MouseEvent, entry: HistoryEntry & { isLive: boolean }) => void;
 }
 
@@ -49,7 +49,7 @@ export default function SessionSidebar({
   onSelectSession,
   onRestorePending,
   onLabelEdit,
-  onDeleteConfirm,
+  onArchiveConfirm,
   onContextMenu,
 }: SessionSidebarProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -171,11 +171,11 @@ export default function SessionSidebar({
                     <Pencil className="h-3.5 w-3.5" />
                   </button>
                   <button
-                    className="cursor-pointer p-1 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
-                    title="Delete session"
+                    className="cursor-pointer p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+                    title="Archive session"
                     onClick={(e) => {
                       e.stopPropagation();
-                      onDeleteConfirm({
+                      onArchiveConfirm({
                         sessionId: entry.sessionId!,
                         project: entry.project,
                         display: entry.display,
@@ -183,7 +183,7 @@ export default function SessionSidebar({
                       });
                     }}
                   >
-                    <Trash2 className="h-3.5 w-3.5" />
+                    <Archive className="h-3.5 w-3.5" />
                   </button>
                 </div>
               )}

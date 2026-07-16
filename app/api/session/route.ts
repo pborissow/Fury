@@ -5,7 +5,7 @@ import { join } from 'path';
 import { sessionManager } from '@/lib/sessionManager';
 import { sdkSessionManager } from '@/lib/sdkSessionManager';
 import { projectPathToSlug } from '@/lib/utils';
-import { deleteArchivedSession, invalidateArchive, updateSessionMetadata } from '@/lib/transcriptArchiver';
+import { setSessionStatus, invalidateArchive, updateSessionMetadata } from '@/lib/transcriptArchiver';
 import { isInternalContent } from '@/lib/transcriptParser';
 
 export const runtime = 'nodejs';
@@ -13,14 +13,20 @@ export const runtime = 'nodejs';
 /**
  * DELETE /api/session?sessionId=...&project=...
  *
- * Deletes a Claude CLI session. This is separate from /api/claude because
- * that route handles the real-time streaming conversation flow (SSE), while
- * this route handles session lifecycle management (filesystem cleanup).
+ * Archives a Claude CLI session (a soft delete — nothing in SQLite is dropped).
+ * This is separate from /api/claude because that route handles the real-time
+ * streaming conversation flow (SSE), while this route handles session lifecycle
+ * management (filesystem cleanup).
  *
  * Steps:
- * 1. Kills the process if it's live in Fury's sessionManager
- * 2. Removes the session JSONL from ~/.claude/projects/<slug>/
- * 3. Removes matching entries from ~/.claude/history.jsonl
+ * 1. Kills the process if it's live in Fury's sessionManager / sdkSessionManager
+ * 2. Marks the session 'archived' in SQLite — the row, transcript and
+ *    usage_events are all preserved, so Stats keeps counting it
+ * 3. Removes the session JSONL from ~/.claude/projects/<slug>/
+ * 4. Removes matching entries from ~/.claude/history.jsonl
+ *
+ * Ordering matters: killing first guarantees no live turn writes the transcript
+ * while we flip status. See docs/delete-to-archive.md.
  */
 export async function DELETE(request: NextRequest) {
   const sessionId = request.nextUrl.searchParams.get('sessionId');
@@ -56,10 +62,18 @@ export async function DELETE(request: NextRequest) {
     // Not an SDK-managed session — fine
   }
 
-  // 2. Remove from SQLite archive FIRST — before deleting the JSONL file,
-  //    so the history watcher can't re-archive from the still-existing file.
-  await deleteArchivedSession(sanitizedSessionId).catch(err =>
-    console.error('[DeleteSession] Failed to delete from archive:', err)
+  // 2. Soft-delete in SQLite: flip status to 'archived' rather than deleting the
+  //    row. The row's usage_events survive, so archiving a session no longer
+  //    retroactively rewrites the Stats tab's spend history, and the transcript
+  //    stays intact for a future restore.
+  //
+  //    This flag — not the file cleanup in steps 3/4 — is what hides the session:
+  //    /api/history filters BOTH its history.jsonl-sourced list and its DB merge
+  //    against it. That's what makes steps 3/4 safe to be best-effort. A racing
+  //    re-archive is benign too: archiveTranscript never writes status on
+  //    conflict. See docs/delete-to-archive.md.
+  await setSessionStatus(sanitizedSessionId, 'archived').catch(err =>
+    console.error('[DeleteSession] Failed to archive session:', err)
   );
 
   // 3. Delete the session JSONL file
@@ -97,7 +111,13 @@ export async function DELETE(request: NextRequest) {
     }
   } catch (err: any) {
     if (err.code !== 'ENOENT') {
+      // Non-fatal: the session is already hidden by its 'archived' status, which
+      // /api/history applies to the history-sourced list too. But history.jsonl
+      // is rewritten read-filter-write and is concurrently appended by both the
+      // Claude CLI and sdkSessionManager, so an EBUSY/EPERM here is plausible —
+      // report it rather than leaving stale entries behind under success:true.
       console.error('[DeleteSession] Failed to update history.jsonl:', err);
+      results.push(`Failed to remove history entries: ${err.message ?? err}`);
     }
   }
 

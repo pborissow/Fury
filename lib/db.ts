@@ -37,7 +37,12 @@ async function initDb(client: Client): Promise<void> {
       created_at    INTEGER NOT NULL,
       updated_at    INTEGER NOT NULL,
       jsonl_hash    TEXT,
-      metadata      TEXT
+      metadata      TEXT,
+      -- Lifecycle status. 'archived' is a soft delete: the row and all its
+      -- messages / raw_jsonl / usage_events are preserved (Stats keeps counting
+      -- it) but the sidebar hides it. Owned exclusively by the delete/restore
+      -- actions — the archiver must never write it. See docs/delete-to-archive.md.
+      status        TEXT NOT NULL DEFAULT 'active'
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
     CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
@@ -146,6 +151,25 @@ async function initDb(client: Client): Promise<void> {
   } catch {
     // Column already exists — expected after first migration
   }
+
+  // Migration: soft-delete support. 'archived' rows are preserved intact
+  // (transcript + usage_events + metadata) but hidden from the sidebar; Stats
+  // still counts them. The NOT NULL DEFAULT backfills every pre-existing row to
+  // 'active', so no separate backfill is needed. See docs/delete-to-archive.md.
+  try {
+    await client.execute(
+      "ALTER TABLE sessions ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+    );
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
+  // Index the sidebar's hot-path filter. Must run AFTER the ALTER above, not in
+  // the CREATE TABLE block: on a pre-migration DB the column doesn't exist yet,
+  // and a failed CREATE INDEX would abort the whole executeMultiple.
+  await client.execute(
+    'CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)'
+  );
 
   // Migration: add effective_from to pricing_log (point-in-time pricing).
   try {
