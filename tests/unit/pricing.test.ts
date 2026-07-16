@@ -1,5 +1,54 @@
 import { describe, it, expect } from 'vitest';
-import { costForUsage, latestRate } from '../../lib/pricing';
+import { cacheRewriteCost, costForUsage, latestRate, modelTierRank } from '../../lib/pricing';
+
+describe('modelTierRank — picker ordering', () => {
+  it('orders the catalog most-capable-first: fable, opus, sonnet, haiku', () => {
+    // The real catalog's resolvedModel values, deliberately shuffled — the CLI
+    // ships them as default/opus/fable/sonnet/haiku, which is not the order we
+    // want to render.
+    const shuffled = [
+      'claude-haiku-4-5-20251001',
+      'claude-opus-4-8[1m]',
+      'claude-sonnet-5',
+      'claude-fable-5',
+    ];
+    const sorted = [...shuffled].sort((a, b) => modelTierRank(a) - modelTierRank(b));
+    expect(sorted).toEqual([
+      'claude-fable-5',
+      'claude-opus-4-8[1m]',
+      'claude-sonnet-5',
+      'claude-haiku-4-5-20251001',
+    ]);
+  });
+
+  it('sorts unknown families last without disturbing their order', () => {
+    const rank = (m: string) => modelTierRank(m);
+    expect(rank('claude-fable-5')).toBeLessThan(rank('claude-opus-4-8'));
+    expect(rank('claude-opus-4-8')).toBeLessThan(rank('claude-sonnet-5'));
+    expect(rank('claude-sonnet-5')).toBeLessThan(rank('claude-haiku-4-5'));
+    expect(rank('some-future-model')).toBeGreaterThan(rank('claude-haiku-4-5'));
+  });
+});
+
+describe('cacheRewriteCost — the model-switch quote', () => {
+  it('prices the re-write at the 1h TTL, not 5m', () => {
+    // Claude Code writes at the 1h TTL (verified: 1,026/1,026 TTL-split rows in
+    // usage_events are 1h; the sibling test above already calls all-5m "the
+    // bug"). 400k on Opus 4.8 = 0.4 * $10/Mtok (2x the $5 input) = $4.00.
+    // At the 5m rate this quotes $2.50 — 1.6x low, and softest on exactly the
+    // big sessions the confirm dialog exists to warn about.
+    expect(cacheRewriteCost('claude-opus-4-8', 400_000)).toBeCloseTo(4.0, 6);
+    expect(cacheRewriteCost('claude-haiku-4-5', 400_000)).toBeCloseTo(0.8, 6);
+  });
+
+  it('returns null rather than quoting $0 when the model has no published rate', () => {
+    // Bedrock ids keep their `us.` prefix through normalizeModelId, so they miss
+    // the table. Callers must omit the cost line, not claim it's free.
+    expect(cacheRewriteCost('us.anthropic.claude-sonnet-4-6', 400_000)).toBeNull();
+    expect(cacheRewriteCost('claude-opus-4-8', 0)).toBeNull();
+    expect(cacheRewriteCost(null, 400_000)).toBeNull();
+  });
+});
 
 describe('costForUsage — cache TTL pricing', () => {
   it('reproduces Anthropic total_cost_usd exactly for a 1h cache write', () => {

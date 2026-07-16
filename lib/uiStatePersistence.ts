@@ -2,7 +2,9 @@ import fs from 'fs/promises';
 import path from 'path';
 
 interface UIState {
-  activeTab: 'chat' | 'canvas' | 'stats';
+  // NOTE: activeTab is intentionally absent. Fury always starts on the Chat
+  // tab, so there's nothing to restore. Any activeTab left in an existing
+  // state.json is ignored and dropped on the next write.
   activeWorkflowId: string | null;
   chatHorizontalLayout: number[] | null;
   chatVerticalLayout: number[] | null;
@@ -60,7 +62,6 @@ class UIStatePersistence {
       // Load existing state and merge with new state
       const existingState = await this.loadState();
       const newState: UIState = {
-        activeTab: state.activeTab ?? existingState?.activeTab ?? 'chat',
         activeWorkflowId: state.activeWorkflowId ?? existingState?.activeWorkflowId ?? null,
         chatHorizontalLayout: state.chatHorizontalLayout ?? existingState?.chatHorizontalLayout ?? null,
         chatVerticalLayout: state.chatVerticalLayout ?? existingState?.chatVerticalLayout ?? null,

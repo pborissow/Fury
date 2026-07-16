@@ -138,8 +138,23 @@ function liveProcsForSession(sessionId: string): number[] {
 // rows in ~/.claude. The built calculator app is intentionally left on disk.
 let createdSessionId: string | null = null;
 
-test.afterAll(() => {
+/** Mirrors playwright.config.ts's baseURL — afterAll gets no `request` fixture. */
+const BASE_URL = 'http://localhost:3879';
+
+test.afterAll(async () => {
   if (!createdSessionId) return;
+  // Archive via the app's own endpoint — the same call the UI's Delete button
+  // makes below. On the happy path this test already deleted through the UI and
+  // this is a benign re-archive (the route never re-writes status). When the test
+  // fails BEFORE that step, this is what stops an 'active' row being orphaned in
+  // the sidebar — the model-selection e2e leaked 14 of them that way by
+  // hand-rolling the JSONL/history cleanup and skipping the status flip.
+  try {
+    await fetch(
+      `${BASE_URL}/api/session?sessionId=${encodeURIComponent(createdSessionId)}&project=${encodeURIComponent(PROJECT)}`,
+      { method: 'DELETE' },
+    );
+  } catch { /* server already down — the disk fallback below still runs */ }
   try {
     const jsonl = jsonlPath(createdSessionId);
     if (jsonl) rmSync(jsonl);

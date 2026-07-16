@@ -201,7 +201,11 @@ export default function Home() {
         if (res.ok) {
           const { state } = await res.json();
           if (state) {
-            if (state.activeTab) setActiveTab(state.activeTab);
+            // activeTab is deliberately NOT restored — Chat is always the
+            // startup tab. Restoring it stranded people on whatever they last
+            // opened (typically Stats), and because this restore lands after
+            // mount it silently overrode the 'chat' initial state a moment
+            // later, which is unpleasant to debug from the outside.
             if (state.activeWorkflowId) setActiveWorkflowId(state.activeWorkflowId);
             if (state.chatHorizontalLayout) setChatHorizontalLayout(state.chatHorizontalLayout);
             if (state.chatVerticalLayout) setChatVerticalLayout(state.chatVerticalLayout);
@@ -217,21 +221,23 @@ export default function Home() {
     loadUIState();
   }, []);
 
-  // Save UI state when activeTab or activeWorkflowId changes
+  // Save UI state when activeWorkflowId changes. activeTab is not persisted:
+  // startup is always Chat, so storing it would be a write nobody reads. This
+  // also stops a POST firing on every tab switch.
   useEffect(() => {
     const saveUIState = async () => {
       try {
         await fetch('/api/ui-state', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ activeTab, activeWorkflowId }),
+          body: JSON.stringify({ activeWorkflowId }),
         });
       } catch (error) {
         console.error('[App] Failed to save UI state:', error);
       }
     };
     saveUIState();
-  }, [activeTab, activeWorkflowId]);
+  }, [activeWorkflowId]);
 
   // Debounced save for panel layout changes
   const saveLayoutState = useCallback((updates: Record<string, number[]>) => {

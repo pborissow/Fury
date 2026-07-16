@@ -1,9 +1,16 @@
-import { query, type Query, type SDKMessage, type SDKUserMessage, type PermissionResult, type RewindFilesResult } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Query, type SDKMessage, type SDKUserMessage, type PermissionResult, type RewindFilesResult, type ModelInfo } from '@anthropic-ai/claude-agent-sdk';
 import { appendFile } from 'fs/promises';
 import { readdirSync, readFileSync, rmSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { persistSessionContextWindow } from './transcriptArchiver';
+import {
+  persistSessionContextWindow,
+  persistSessionModel,
+  loadSessionModel,
+  loadSessionMeta,
+  modelFromMeta,
+  contextTokensFromMeta,
+} from './transcriptArchiver';
 import { eventBus } from './eventBus';
 import { findSessionJsonlDir } from './sessionPaths';
 // Type-only (erased at compile time) — no runtime coupling to the CLI manager.
@@ -102,6 +109,22 @@ interface SdkSession {
   // the SDK's documented hard-stop (Options.abortController) — used by stop()
   // and killSession() so deleting a session actually kills its warm process.
   abortController?: AbortController;
+  // The user's chosen model for this session, or undefined for the CLI default.
+  // Load-bearing in TWO places, because the query object comes and goes:
+  //   1. Pushed live via Query.setModel() when a query is open (no restart).
+  //   2. Replayed into options.model by startQuery() — covers both a session
+  //      picked before its first send (q is still null) and a re-open after
+  //      interrupt/stop, which would otherwise silently revert to the default.
+  model?: string;
+  // Whether `model` has been reconciled with the persisted override. Guards two
+  // things: a redundant DB read per session, and hydration racing a user action
+  // (a deliberate "clear to Default" leaves model undefined, which is exactly
+  // what an un-guarded hydrate would helpfully overwrite with the stale value).
+  modelHydrated?: boolean;
+  // Dedup for session:model emission (mirrors emitModelIfNew in the CLI
+  // manager). The SDK reports the model on system.init AND on every assistant
+  // message; without this we'd re-emit the same value on every turn.
+  lastEmittedModel: string | null;
   // Server-side buffer of the current turn's stream, mirroring the CLI manager.
   // Load-bearing for the UI: ChatTab keys its "strip the in-flight turn's
   // partial assistant messages" logic on this (otherwise the JSONL's partials
@@ -120,6 +143,9 @@ const PROCESS_STARTED_AT = Date.now() - Math.floor(process.uptime() * 1000);
 
 class SdkSessionManager {
   private sessions = new Map<string, SdkSession>();
+  /** Last catalog any session reported, for sessions with no live query to ask.
+   *  See listModels() for why this is served with live:false. */
+  private lastKnownModels: ModelInfo[] | null = null;
   /** Keep completed stream buffers this long so a user switching back right
    *  after a turn still sees its final state (matches the CLI manager). */
   private readonly BUFFER_TTL = 60 * 1000;
@@ -140,6 +166,7 @@ class SdkSessionManager {
         lastEmittedTokens: -1,
         lastEmittedContext: -1,
         lastEmittedWindow: -1,
+        lastEmittedModel: null,
       };
       this.sessions.set(sessionId, s);
     }
@@ -154,6 +181,11 @@ class SdkSessionManager {
   async sendMessage(sessionId: string, prompt: string, projectPath?: string): Promise<void> {
     const s = this.getOrCreate(sessionId);
     if (projectPath) s.projectPath = projectPath;
+
+    // MUST precede startQuery: it replays s.model into options.model, so a
+    // session resumed after a restart would otherwise open its query on the
+    // default model and only correct itself on some later turn.
+    await this.ensureModelHydrated(s);
 
     if (!s.q) this.startQuery(s);
 
@@ -216,6 +248,193 @@ class SdkSessionManager {
     // persisted checkpoints are reachable; the interrupt() path keeps it live.
     if (!s.q) this.startQuery(s);
     return s.q!.rewindFiles(messageUuid);
+  }
+
+  /**
+   * The selectable model catalog for a session.
+   *
+   * Query.supportedModels() resolves from the CACHED initialize response
+   * (`(await this.initialization).models`) — it does not round-trip to the
+   * subprocess, so calling it on every dialog open is free.
+   *
+   * When a session has no live query (never sent a message, or post-interrupt)
+   * there's nothing to ask, so we fall back to the last catalog any session
+   * reported. The catalog is a function of provider + settings cascade + cwd,
+   * so a cached list from a different cwd can in principle differ — `live:false`
+   * tells the UI to say so rather than present a guess as fact.
+   */
+  /**
+   * Reconcile `s.model` with the override persisted in sessions.metadata.
+   *
+   * Runs once per session per process life. In-memory always wins — a value set
+   * during this process is fresher than the DB, and setModel marks the session
+   * hydrated so a user's choice is never clobbered by a late read.
+   */
+  private async ensureModelHydrated(s: SdkSession): Promise<void> {
+    if (s.modelHydrated) return;
+    const stored = await loadSessionModel(s.sessionId);
+    if (s.modelHydrated) return; // a setModel landed while we were reading
+    if (stored && s.model === undefined) s.model = stored;
+    s.modelHydrated = true;
+  }
+
+  async listModels(
+    sessionId: string,
+  ): Promise<{ models: ModelInfo[]; live: boolean; current?: string; contextTokens: number }> {
+    const s = this.sessions.get(sessionId);
+    if (s) await this.ensureModelHydrated(s);
+    // Read straight through to the DB when the session isn't in the map
+    // (restarted server, or never sent) — going via getOrCreate would add a map
+    // entry for every picker open, including on archived sessions that will
+    // never run again. One read for both fields.
+    //
+    // BOTH must read through, not just the override. contextTokens drives the
+    // confirm step's cost line and its window-overflow warning, so falling back
+    // to 0 here silently degrades the dialog to generic prose — on exactly the
+    // long-lived session you reopened after a restart, which is the case it
+    // exists for. The archiver persists it; it just has to be read.
+    const meta = s ? null : await loadSessionMeta(sessionId);
+    const current = s ? s.model : modelFromMeta(meta) ?? undefined;
+    // Current prompt occupancy. 0 when genuinely unknown (no turn yet); the
+    // picker treats 0 as "don't claim".
+    const contextTokens = s ? s.contextTokens : contextTokensFromMeta(meta);
+    if (s?.q) {
+      try {
+        const models = await s.q.supportedModels();
+        // Only answer `live` with a catalog we actually got. An empty result
+        // falls through to the cache below: telling the user of a RUNNING
+        // session to "send a message first" is worse than showing a stale list.
+        if (models?.length) {
+          this.lastKnownModels = models;
+          return { models, live: true, current, contextTokens };
+        }
+      } catch (err) {
+        console.warn('[SdkSessionManager] supportedModels failed:', err);
+      }
+    }
+    return { models: this.lastKnownModels ?? [], live: false, current, contextTokens };
+  }
+
+  /**
+   * Change the model for a session. `undefined` restores the CLI default.
+   *
+   * Records the choice on the session FIRST so it survives a later restart,
+   * then pushes it to the live query if there is one. With no live query the
+   * record alone is enough — startQuery() replays it into options.model.
+   *
+   * setModel() is only available in streaming input mode; we always pass an
+   * AsyncGenerator as `prompt` (see createInputStream), so the control channel
+   * to the subprocess is open for the life of the query.
+   */
+  async setModel(sessionId: string, model?: string): Promise<{ applied: 'live' | 'pending' }> {
+    const s = this.getOrCreate(sessionId);
+    const prev = s.model;
+    s.model = model;
+    // A deliberate choice outranks whatever is on disk — mark hydrated so an
+    // in-flight ensureModelHydrated can't overwrite it (notably when clearing to
+    // Default, which leaves model undefined and would otherwise look unhydrated).
+    s.modelHydrated = true;
+    // Persist even on the pending path: the choice must survive a restart before
+    // the session's first turn. No-ops if the sessions row doesn't exist yet —
+    // the result handler re-persists once it does.
+    void persistSessionModel(sessionId, model);
+
+    if (!s.q) return { applied: 'pending' };
+
+    // Since SDK 0.3.200 an unrecognized model is rejected before latching, so a
+    // throw here means the id is bad or unavailable under the current policy —
+    // and the live query is still on whatever it was.
+    //
+    // Restore the PREVIOUS override, not undefined: a failed switch must not
+    // mutate state at all. Clearing it would make a session pinned to (say)
+    // Haiku report `current: undefined` while Haiku is still serving — the
+    // picker would badge Default, and the next stop→send would silently revert
+    // the session to the CLI default, which is the exact drift s.model exists
+    // to prevent.
+    try {
+      await s.q.setModel(model);
+    } catch (err) {
+      s.model = prev;
+      void persistSessionModel(sessionId, prev); // keep disk in step with the rollback
+      throw err;
+    }
+
+    // The SDK only reports the model on system.init, so a live switch produces
+    // no message of its own — emit so the status bar reflects it immediately
+    // instead of at the next init.
+    //
+    // Emit the WIRE id, not the picked value: the catalog is full of aliases
+    // ('sonnet', 'opus[1m]', 'default') and the label formatter expects a real
+    // model id — it renders a bare "Claude" for anything else.
+    //
+    // Resolving needs the catalog, so fetch it if nothing has yet. Don't rely
+    // on listModels having run: that's true for the dialog (it fetches on open)
+    // but makes the emit silently wrong for any other caller. supportedModels()
+    // resolves from the cached init response, so this costs nothing.
+    if (model) {
+      let catalog = this.lastKnownModels;
+      if (!catalog) {
+        try {
+          catalog = await s.q.supportedModels();
+          if (catalog?.length) this.lastKnownModels = catalog;
+        } catch { /* fall back to the raw id below */ }
+      }
+      const resolved = catalog?.find(m => m.value === model)?.resolvedModel;
+      this.emitModelIfNew(s, resolved || model);
+    }
+    // Deliberately no emit when clearing to the default: we can't know what the
+    // CLI will pick, and guessing would put a wrong model in the status bar.
+    // The next assistant turn reports the truth.
+    return { applied: 'live' };
+  }
+
+  /**
+   * The context window bounding the MAIN thread's next turn, from a result's
+   * `modelUsage`.
+   *
+   * `modelUsage` is CUMULATIVE across the session, not per-turn — verified: a
+   * session that switches to Haiku reports BOTH
+   *   { 'claude-opus-4-8[1m]': 1_000_000, 'claude-haiku-4-5-20251001': 200_000 }
+   * on every subsequent result. So taking the max (what this used to do) pins
+   * the window to the roomiest model the session EVER ran: a session moved to
+   * Haiku keeps reporting 1M forever, its fill % understates by 5x, and the
+   * >=70% "context filling up" warning never fires — on the one model where
+   * running out actually bites. That was invisible before the model picker,
+   * because the main model never changed.
+   *
+   * So prefer the main model's OWN entry. Fall back to the max only when it
+   * can't be identified, which preserves the original rationale: a subagent on
+   * a small-window model must not drag the main window down and push fill
+   * above 100%.
+   */
+  private windowForMainModel(s: SdkSession, mu: Record<string, { contextWindow?: number }>): number {
+    // modelUsage keys carry the context-variant suffix ('claude-opus-4-8[1m]')
+    // but assistant messages report the bare id ('claude-opus-4-8'), so compare
+    // stripped. Haiku matches exactly either way.
+    const strip = (v: string) => v.replace(/\[[^\]]*\]/g, '');
+    const main = s.lastEmittedModel;
+    if (main) {
+      for (const [id, v] of Object.entries(mu)) {
+        if (strip(id) === strip(main)) {
+          const w = num(v?.contextWindow);
+          if (w > 0) return w;
+        }
+      }
+    }
+    let win = 0;
+    for (const v of Object.values(mu)) {
+      const w = num(v?.contextWindow);
+      if (w > win) win = w;
+    }
+    return win;
+  }
+
+  /** Emit session:model, deduped — the model arrives on init AND every turn. */
+  private emitModelIfNew(s: SdkSession, model: string | undefined): void {
+    if (!model || model === '<synthetic>') return;
+    if (model === s.lastEmittedModel) return;
+    s.lastEmittedModel = model;
+    eventBus.emitApp({ type: 'session:model', sessionId: s.sessionId, model });
   }
 
   /** Interrupt the in-flight turn without tearing down the session. */
@@ -283,14 +502,6 @@ class SdkSessionManager {
   }
 
   /**
-   * Tear down every session this manager owns. Call on server shutdown: the SDK
-   * spawns the CLI as a child of this process, but a dying parent does NOT take
-   * its children with it — they get reparented and keep running. Without this,
-   * every restart (Ctrl+C, deploy, nodemon) leaks a warm process that still
-   * burns tokens, still writes the session JSONL, and still shows up in the PID
-   * scanner as Live while the fresh manager has no handle to stream or stop it.
-   */
-  /**
    * Take over the live session records from the previous instance when this
    * module hot-reloads (see the SINGLETON_VERSION block at the bottom).
    *
@@ -311,6 +522,14 @@ class SdkSessionManager {
     }
   }
 
+  /**
+   * Tear down every session this manager owns. Call on server shutdown: the SDK
+   * spawns the CLI as a child of this process, but a dying parent does NOT take
+   * its children with it — they get reparented and keep running. Without this,
+   * every restart (Ctrl+C, deploy, nodemon) leaks a warm process that still
+   * burns tokens, still writes the session JSONL, and still shows up in the PID
+   * scanner as Live while the fresh manager has no handle to stream or stop it.
+   */
   async killAll(): Promise<number> {
     const ids = [...this.sessions.keys()];
     for (const id of ids) await this.killSession(id);
@@ -557,6 +776,10 @@ class SdkSessionManager {
         includePartialMessages: true,
         permissionMode: 'bypassPermissions',
         enableFileCheckpointing: true,
+        // Replay the session's chosen model. Omitted entirely when unset so the
+        // CLI default applies — passing model: undefined is equivalent, but
+        // being explicit keeps the "we never chose" case out of the options.
+        ...(s.model ? { model: s.model } : {}),
         // Pin Fury's client-generated UUID so the on-disk JSONL matches what
         // sessionPaths/transcriptParser expect. resume for an existing session,
         // sessionId to create one with our id.
@@ -601,9 +824,7 @@ class SdkSessionManager {
 
     switch (msg.type) {
       case 'system':
-        if (anyMsg.subtype === 'init' && anyMsg.model) {
-          eventBus.emitApp({ type: 'session:model', sessionId: s.sessionId, model: anyMsg.model });
-        }
+        if (anyMsg.subtype === 'init') this.emitModelIfNew(s, anyMsg.model);
         break;
 
       case 'stream_event': {
@@ -653,6 +874,19 @@ class SdkSessionManager {
       }
 
       case 'assistant': {
+        // Report the model that actually served this turn (parity with the CLI
+        // manager, which emits here too). init alone isn't enough once the model
+        // can change: a setModel() switch, or a fallbackModel demotion under
+        // load, would otherwise leave the status bar asserting a stale model.
+        //
+        // Sidechain guard (same reason as contextTokens below): a subagent's
+        // assistant message carries the SUBAGENT's model, so emitting it would
+        // flip the status bar to e.g. Haiku mid-turn on an Opus session — and
+        // the result handler now derives the context window from this model, so
+        // it would mis-size the fill bar too.
+        if (anyMsg.parent_tool_use_id == null) {
+          this.emitModelIfNew(s, anyMsg.message?.model);
+        }
         const content = anyMsg.message?.content;
         if (Array.isArray(content)) {
           for (const block of content) {
@@ -702,27 +936,29 @@ class SdkSessionManager {
       case 'result': {
         s.isProcessing = false;
         this.closeBuffer(s);
-        // The SDK reports the context window per model it used this turn. Take
-        // the largest: on a model switch mid-turn the surviving conversation is
-        // bounded by the roomiest window it ran under, and picking the smallest
-        // would show a fill % over 100.
         const mu = anyMsg.modelUsage as Record<string, { contextWindow?: number }> | undefined;
         if (mu) {
-          let win = 0;
-          for (const v of Object.values(mu)) {
-            const w = num(v?.contextWindow);
-            if (w > win) win = w;
-          }
+          const win = this.windowForMainModel(s, mu);
           if (win > 0) {
             s.contextWindow = win;
             // Persist on EVERY result, not only when the value changes: at the
             // first result the sessions row usually doesn't exist yet (the
-            // archiver creates it), so that write is a no-op — and since the
-            // window never changes afterwards, a change-gated retry would never
-            // fire and the window would be lost for good. The helper itself
-            // no-ops when the stored value already matches.
+            // archiver creates it), so that write is a no-op and a change-gated
+            // retry would never fire — the window would be lost for good. The
+            // helper itself no-ops when the stored value already matches.
+            //
+            // (This used to also reason "the window never changes afterwards".
+            // It can now: pinning a session to Haiku moves it 1M -> 200k.)
             void persistSessionContextWindow(s.sessionId, win);
           }
+        }
+        // Same reasoning as the window above: the sessions row usually doesn't
+        // exist at the first result, so the write from setModel() may have been
+        // a no-op. Re-persist here until it lands (no-ops once it matches).
+        // Deliberately OUTSIDE the modelUsage block — whether the row exists yet
+        // has nothing to do with whether this result carried usage.
+        if (s.modelHydrated) {
+          void persistSessionModel(s.sessionId, s.model);
         }
         this.emitUsage(s);
         this.emitHealth(s, false);
@@ -788,7 +1024,7 @@ class SdkSessionManager {
 // stripped (they render as intermediary bubbles above the composer), and the
 // next send spawns a SECOND process for the same session. Editing this file
 // while a session is working used to reproduce exactly that, every time.
-const SINGLETON_VERSION = 8;
+const SINGLETON_VERSION = 14;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

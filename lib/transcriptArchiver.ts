@@ -265,6 +265,94 @@ export async function archiveTranscript(
 }
 
 /**
+ * Persist a session's model override (the catalog id the user picked, e.g.
+ * 'haiku' or 'opus[1m]'; undefined = follow the CLI default).
+ *
+ * The override otherwise lives only in sdkSessionManager's in-memory map, so a
+ * server restart drops it and the session silently reverts to the default on its
+ * next turn — the exact drift the override exists to prevent. It's stored beside
+ * contextWindow because it has the same property: chosen at runtime and
+ * unrecoverable from the transcript, which logs the model that SERVED each turn,
+ * never the one that was selected (they differ under a fallbackModel demotion).
+ *
+ * Best-effort: a failure costs the override across a restart, never a turn.
+ * Safe to call on every result — it no-ops when the stored value is unchanged.
+ */
+export async function persistSessionModel(
+  sessionId: string,
+  model: string | undefined
+): Promise<void> {
+  try {
+    const db = await getDb();
+    const row = await db.execute({
+      sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+      args: [sessionId],
+    });
+    // Same as persistSessionContextWindow: the row may not exist yet on the
+    // first turn (the archiver creates it), so callers re-persist on later
+    // results rather than gating on change alone.
+    if (row.rows.length === 0) return;
+    let meta: Record<string, unknown> = {};
+    if (row.rows[0]?.metadata) {
+      try { meta = JSON.parse(row.rows[0].metadata as string); } catch {}
+    }
+    const stored = typeof meta.model === 'string' ? meta.model : undefined;
+    if (stored === model) return;
+    // Delete rather than store null: "no override" and "key absent" mean the
+    // same thing, and loadSessionModel only trusts a string.
+    if (model === undefined) delete meta.model;
+    else meta.model = model;
+    await db.execute({
+      sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+      args: [JSON.stringify(meta), sessionId],
+    });
+  } catch (err) {
+    console.warn(`[persistSessionModel] failed for ${sessionId}:`, err);
+  }
+}
+
+/**
+ * Parsed sessions.metadata for a session, or null when there's no row yet /
+ * it's unreadable. The single read behind the typed loaders below — callers
+ * needing several fields should use this directly rather than one query each.
+ */
+export async function loadSessionMeta(sessionId: string): Promise<Record<string, unknown> | null> {
+  try {
+    const db = await getDb();
+    const row = await db.execute({
+      sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+      args: [sessionId],
+    });
+    if (row.rows.length === 0 || !row.rows[0]?.metadata) return null;
+    return JSON.parse(row.rows[0].metadata as string);
+  } catch (err) {
+    console.warn(`[loadSessionMeta] failed for ${sessionId}:`, err);
+    return null;
+  }
+}
+
+/** The persisted model override for a session, or null if none/unreadable. */
+export async function loadSessionModel(sessionId: string): Promise<string | null> {
+  return modelFromMeta(await loadSessionMeta(sessionId));
+}
+
+/** The model override held in an already-loaded metadata blob. */
+export function modelFromMeta(meta: Record<string, unknown> | null): string | null {
+  const m = meta?.model;
+  return typeof m === 'string' && m ? m : null;
+}
+
+/**
+ * The context occupancy (latest call's prompt size) held in an already-loaded
+ * metadata blob — written by the archiver, and the only source once a session
+ * is no longer in the manager's memory.
+ */
+export function contextTokensFromMeta(meta: Record<string, unknown> | null): number {
+  const t = meta?.contextTokens;
+  return typeof t === 'number' && t > 0 ? t : 0;
+}
+
+/**
  * Persist a session's context window onto its metadata.
  *
  * The window is only ever reported by the running CLI/SDK (on the `result`
