@@ -20,7 +20,10 @@ function makeRequest(body: unknown): Request {
 
 describe('POST /api/tts', () => {
   beforeEach(() => {
-    vi.restoreAllMocks();
+    // clearAllMocks resets call history between tests (restoreAllMocks does not
+    // clear a vi.mock factory's vi.fn, so calls used to accumulate across tests).
+    // Implementations set per-test via mockResolvedValue/mockRejectedValue persist.
+    vi.clearAllMocks();
   });
 
   it('returns 400 for missing text', async () => {
@@ -69,10 +72,28 @@ describe('POST /api/tts', () => {
     expect(json.error).toContain('synthesis failed');
   });
 
-  it('passes the text to generateSpeech', async () => {
+  it('passes the text, an abort signal, and settings to generateSpeech', async () => {
     mockGenerateSpeech.mockResolvedValue(Buffer.from('wav'));
 
     await POST(makeRequest({ text: 'Test input' }));
-    expect(mockGenerateSpeech).toHaveBeenCalledWith('Test input', expect.anything(), expect.anything());
+
+    // Signature: generateSpeech(text, signal, settings, turnMeta?). Assert the
+    // forwarded args positionally so it stays robust as the trailing optional
+    // (turnMeta) comes and goes, rather than pinning an exact arg list.
+    expect(mockGenerateSpeech).toHaveBeenCalledOnce();
+    const [text, signal, settings] = mockGenerateSpeech.mock.calls[0];
+    expect(text).toBe('Test input');
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(settings).toBeDefined();
+  });
+
+  it('forwards turnMeta to generateSpeech when the request includes it', async () => {
+    mockGenerateSpeech.mockResolvedValue(Buffer.from('wav'));
+    const turnMeta = { totalTools: 2, writeFileCount: 1, toolCounts: { Edit: 1, Bash: 1 } };
+
+    await POST(makeRequest({ text: 'Test input', turnMeta }));
+
+    expect(mockGenerateSpeech).toHaveBeenCalledOnce();
+    expect(mockGenerateSpeech.mock.calls[0][3]).toEqual(turnMeta);
   });
 });

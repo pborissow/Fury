@@ -131,7 +131,6 @@ export function parseTranscriptJsonl(content: string): {
   const rawLines = content.split('\n').filter(line => line.trim());
 
   let pendingAssistant: TranscriptMessage | null = null;
-  let inInternalExchange = false;
   let planSlug: string | null = null;
   let planWriteTimestamp: string | null = null;
   let numCompactions = 0;
@@ -190,26 +189,20 @@ export function parseTranscriptJsonl(content: string): {
       if (!msg) continue;
 
       if (entry.type === 'user') {
-        const isToolResult = Array.isArray(msg.content);
         const isInternalString = typeof msg.content === 'string' && isInternalContent(msg.content);
-        const isTaskNotification = typeof msg.content === 'string' &&
-          msg.content.trim().startsWith('<task-notification>');
 
-        if (isTaskNotification) {
-          inInternalExchange = true;
-          continue;
-        }
-
+        // Internal user strings — slash-command markers, system reminders, and
+        // the synthetic <task-notification> injected when a background task
+        // finishes — are hidden and must NOT act as a turn boundary. A
+        // task-notification is a mid-turn internal event, not a new prompt: the
+        // assistant's real reply to it flows through the pendingAssistant path
+        // below and renders as the turn's completion, exactly like any other
+        // assistant message. (Any synthetic stub it emits — e.g. "No response
+        // requested." — is dropped by provenance in the assistant branch.)
         if (isInternalString) continue;
 
         // Tool results are arrays (never displayed as user messages) but must
-        // still flow through so inInternalExchange gets cleared below.  The
-        // old `if (isToolResult && inInternalExchange) continue;` caused the
-        // flag to stick permanently after a <task-notification>, hiding every
-        // subsequent message for the rest of the transcript.
-
-        inInternalExchange = false;
-
+        // still flow through to flush the pending assistant turn below.
         if (pendingAssistant) {
           pendingAssistant.turnMeta = snapshotTurnMeta();
           messages.push(pendingAssistant);
@@ -292,7 +285,14 @@ export function parseTranscriptJsonl(content: string): {
             }
           }
         }
-        if (inInternalExchange) continue;
+        // Suppress by provenance, not by a post-notification window: only
+        // synthetic CLI-injected assistant messages (e.g. the "No response
+        // requested." stub emitted when a <task-notification> needs no reply,
+        // usage-limit notices, compaction stubs) are hidden. Real assistant
+        // text — including a terminal answer synthesized in reply to a
+        // task-notification — must render. (Belt-and-suspenders: the
+        // "No response requested." text guard below also catches the stub.)
+        if (msg.model === '<synthetic>') continue;
         if (!Array.isArray(msg.content)) continue;
 
         // Track the most recent real model id for this session — skipping
