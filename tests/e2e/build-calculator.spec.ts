@@ -317,12 +317,12 @@ test('Fury builds a calculator, then stop + rewind reverts the refinement', asyn
   // And the whole tree matches the turn-1 snapshot (new files, if any, removed).
   expect(snapshotsEqual(snapshotDir(PROJECT), t1), 'working tree should match turn-1 snapshot').toBe(true);
 
-  // ---- Delete via the real UI, and verify the warm process is killed ----
+  // ---- Archive via the real UI, and verify the warm process is killed ----
   // The session is idle now (interrupted before rewind), so its warm SDK
-  // process is alive but NOT "live" — exactly the leak the delete must clean up.
+  // process is alive but NOT "live" — exactly the leak the archive must clean up.
   const procsBefore = liveProcsForSession(sessionId);
-  console.log(`[E2E] live process(es) for session before delete: [${procsBefore.join(', ')}]`);
-  expect(procsBefore.length, 'session should have a live CLI process before delete').toBeGreaterThan(0);
+  console.log(`[E2E] live process(es) for session before archive: [${procsBefore.join(', ')}]`);
+  expect(procsBefore.length, 'session should have a live CLI process before archive').toBeGreaterThan(0);
 
   // Reload so the sidebar reflects the current (idle → non-live) state; the
   // rename/delete hover buttons only render on non-live rows.
@@ -346,18 +346,21 @@ test('Fury builds a calculator, then stop + rewind reverts the refinement', asyn
   // Now locate by the label and delete it through the UI.
   const labeledRow = page.locator('.group\\/session').filter({ hasText: label });
   await expect(labeledRow, 'renamed session should show its label').toBeVisible({ timeout: 15_000 });
-  console.log('[E2E] Clicking Delete → confirm');
+  console.log('[E2E] Clicking Archive → confirm');
   await labeledRow.hover();
-  await labeledRow.locator('button[title="Delete session"]').click();
+  // The destructive session action is "Archive" (soft delete) since the
+  // delete-to-archive migration — the row's hover button is titled accordingly
+  // and its confirm dialog is "Archive session?" / "Archive".
+  await labeledRow.locator('button[title="Archive session"]').click();
   const confirm = page.getByRole('dialog');
-  await expect(confirm).toContainText('Delete session?');
-  await confirm.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(confirm).toContainText('Archive session?');
+  await confirm.getByRole('button', { name: 'Archive', exact: true }).click();
 
-  // ---- Verify: row gone, process killed, transcript deleted ----
-  await expect(labeledRow, 'row should disappear after delete').toHaveCount(0, { timeout: 15_000 });
+  // ---- Verify: row gone, process killed, transcript removed from disk ----
+  await expect(labeledRow, 'row should disappear after archive').toHaveCount(0, { timeout: 15_000 });
 
   const dead = await poll(() => liveProcsForSession(sessionId).length === 0, 20_000, 300);
-  console.log(`[E2E] After UI delete: live process(es) = [${liveProcsForSession(sessionId).join(', ')}]`);
-  expect(dead, 'deleting the session should kill its warm CLI process(es)').toBe(true);
-  expect(jsonlPath(sessionId), 'session JSONL should be deleted').toBeNull();
+  console.log(`[E2E] After UI archive: live process(es) = [${liveProcsForSession(sessionId).join(', ')}]`);
+  expect(dead, 'archiving the session should kill its warm CLI process(es)').toBe(true);
+  expect(jsonlPath(sessionId), 'session JSONL should be removed from disk').toBeNull();
 });

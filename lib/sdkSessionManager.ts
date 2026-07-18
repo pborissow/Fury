@@ -3,6 +3,7 @@ import { appendFile } from 'fs/promises';
 import { readdirSync, readFileSync, rmSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { randomUUID } from 'crypto';
 import {
   persistSessionContextWindow,
   persistSessionModel,
@@ -166,6 +167,9 @@ class SdkSessionManager {
   /** Last catalog any session reported, for sessions with no live query to ask.
    *  See listModels() for why this is served with live:false. */
   private lastKnownModels: ModelInfo[] | null = null;
+  /** Single-flight guard for warmModels()'s throwaway query so concurrent
+   *  new-session wizard opens spawn at most one CLI. See warmModels(). */
+  private warmPromise: Promise<ModelInfo[]> | null = null;
   /** Keep completed stream buffers this long so a user switching back right
    *  after a turn still sees its final state (matches the CLI manager). */
   private readonly BUFFER_TTL = 60 * 1000;
@@ -342,6 +346,92 @@ class SdkSessionManager {
       }
     }
     return { models: this.lastKnownModels ?? [], live: false, current, contextTokens };
+  }
+
+  /**
+   * The selectable model catalog with NO session in hand — for the new-session
+   * wizard, which lets the user pick a model before a session id exists.
+   *
+   * Resolution order, cheapest first:
+   *   1. lastKnownModels — any prior session this process already reported it
+   *      (free; also the steady state once anything has run a turn).
+   *   2. A live session's supportedModels() — resolves from that query's cached
+   *      init response, so no subprocess round-trip (free).
+   *   3. A short-lived throwaway query — the ONLY path that spawns a CLI, and
+   *      only on a cold process with no session yet. Single-flighted via
+   *      warmPromise so concurrent wizard opens share one spawn.
+   *
+   * Never throws: on any failure it degrades to lastKnownModels ?? [] and the
+   * dialog shows its "no model list yet" copy rather than erroring.
+   */
+  async warmModels(): Promise<ModelInfo[]> {
+    if (this.lastKnownModels?.length) return this.lastKnownModels;
+
+    // Reuse any live query — supportedModels() reads its cached init, no spawn.
+    for (const s of this.sessions.values()) {
+      if (!s.q) continue;
+      try {
+        const models = await s.q.supportedModels();
+        if (models?.length) {
+          this.lastKnownModels = models;
+          return models;
+        }
+      } catch { /* fall through to a throwaway query */ }
+    }
+
+    if (!this.warmPromise) {
+      this.warmPromise = this.spawnWarmQuery().finally(() => { this.warmPromise = null; });
+    }
+    return this.warmPromise;
+  }
+
+  /**
+   * Spin up a disposable query solely to read supportedModels(), then tear it
+   * down. Only reached on a cold process with no live session (warmModels step
+   * 3). The query is never fed a prompt and never tracked as a Fury session, so
+   * it writes no history.jsonl entry and can't surface in the sidebar; the
+   * abort + PID sweep in `finally` terminates the CLI it spawned.
+   */
+  private async spawnWarmQuery(): Promise<ModelInfo[]> {
+    // A throwaway id so the PID sweep can target this spawn's process. Not a
+    // Fury session: no history entry is written, so the archiver ignores it.
+    const warmId = randomUUID();
+    const input = createInputStream();
+    const abortController = new AbortController();
+    let q: Query | null = null;
+    try {
+      q = query({
+        prompt: input.stream,
+        options: {
+          abortController,
+          cwd: process.cwd(),
+          permissionMode: 'bypassPermissions',
+          sessionId: warmId,
+        },
+      });
+      // Drain in the background so the query connects and initializes; we never
+      // push a prompt, so it settles at init and produces no turn.
+      const drained = q;
+      void (async () => {
+        try { for await (const _msg of drained) { /* ignore */ } } catch { /* aborted */ }
+      })();
+      // supportedModels() awaits the cached init response. Bound it so a stuck
+      // connect can't hang the wizard forever.
+      const models = await Promise.race([
+        q.supportedModels(),
+        new Promise<ModelInfo[]>((_, reject) =>
+          setTimeout(() => reject(new Error('warmModels timed out')), 10_000)),
+      ]);
+      if (models?.length) this.lastKnownModels = models;
+      return models ?? [];
+    } catch (err) {
+      console.warn('[SdkSessionManager] warmModels failed:', err);
+      return this.lastKnownModels ?? [];
+    } finally {
+      try { input.end(); } catch { /* best effort */ }
+      try { abortController.abort(); } catch { /* best effort */ }
+      this.killProcessesForSession(warmId);
+    }
   }
 
   /**
@@ -1158,6 +1248,13 @@ class SdkSessionManager {
       }
 
       case 'result': {
+        // Sidechain guard — mirrors the message_start/assistant cases above. Only
+        // the MAIN turn's result ends the turn. If the SDK ever surfaces a
+        // top-level `result` for a subagent (parent_tool_use_id != null), acting
+        // on it would flip isProcessing:false and close the buffer mid-turn — the
+        // exact transient false that makes /api/health report a live session idle
+        // and drops the in-flight view into un-stripped intermediary bubbles.
+        if (anyMsg.parent_tool_use_id != null) break;
         s.isProcessing = false;
         this.closeBuffer(s);
         const mu = anyMsg.modelUsage as Record<string, { contextWindow?: number }> | undefined;
@@ -1248,7 +1345,13 @@ class SdkSessionManager {
 // stripped (they render as intermediary bubbles above the composer), and the
 // next send spawns a SECOND process for the same session. Editing this file
 // while a session is working used to reproduce exactly that, every time.
-const SINGLETON_VERSION = 16;
+// 17: added warmModels()/spawnWarmQuery() (+ warmPromise) for the new-session
+//     model picker's session-less catalog. A running dev server on v16 has no
+//     warmModels on its live instance, so GET /api/claude-sdk/model without a
+//     sessionId threw "sdkSessionManager.warmModels is not a function".
+// 18: handle() 'result' case now guards on parent_tool_use_id — a subagent's
+//     result no longer tears down the main turn (isProcessing/closeBuffer).
+const SINGLETON_VERSION = 18;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

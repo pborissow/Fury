@@ -17,6 +17,7 @@ import IntermediaryMessagesDialog from '@/components/IntermediaryMessagesDialog'
 import SessionContextMenu from '@/components/SessionContextMenu';
 import LabelEditDialog from '@/components/LabelEditDialog';
 import ModelPickerDialog from '@/components/ModelPickerDialog';
+import NewSessionModelStep from '@/components/NewSessionModelStep';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
 import { getRecentDirectories } from '@/lib/recent-directories';
 import type { Message, TranscriptMsg, HistoryEntry, PendingSession, AskUserQuestionState } from '@/lib/types';
@@ -48,6 +49,42 @@ interface ChatTabProps {
   openSessionRequest?: { sessionId: string; project: string; display: string; nonce: number } | null;
 }
 
+/**
+ * Strip an in-flight turn's partial assistant messages from a freshly-fetched
+ * transcript. The JSONL holds every partial the live turn has written; while the
+ * stream buffer drives that turn the center panel must show the bouncing dots,
+ * not those partials rendered as intermediary bubbles.
+ *
+ * `startedAt` (the buffer's turn-start ms) is the exact anchor — slice off every
+ * message whose timestamp is at/after the turn began. It's preferred over a
+ * userPrompt match because a mid-turn "please continue" is folded by the CLI into
+ * the next tool_result (array content the parser never emits as a user message),
+ * so a string match silently finds nothing.
+ *
+ * Fallback when the anchor is absent (0): cut the trailing run of assistant
+ * messages (everything after the last real user prompt). Without a timestamp
+ * anchor this is the best approximation of "this turn's output" and is strictly
+ * safer than leaving the raw partials on screen — which was the pre-fix behavior
+ * of every branch that trusted an "ended" signal and refetched without stripping.
+ */
+function stripInFlightPartials<T extends { role: string; timestamp?: string }>(
+  messages: T[],
+  startedAt: number,
+): T[] {
+  if (startedAt > 0) {
+    const cutIdx = messages.findIndex(m => {
+      if (!m.timestamp) return false;
+      const t = Date.parse(m.timestamp);
+      return Number.isFinite(t) && t >= startedAt;
+    });
+    return cutIdx >= 0 ? messages.slice(0, cutIdx) : messages;
+  }
+  // No anchor — drop the trailing assistant run after the last real user prompt.
+  let end = messages.length;
+  while (end > 0 && messages[end - 1].role === 'assistant') end--;
+  return messages.slice(0, end);
+}
+
 export default function ChatTab({
   chatHorizontalLayout,
   chatVerticalLayout,
@@ -62,6 +99,10 @@ export default function ChatTab({
   // --- State moved from page.tsx ---
 
   const [showDirectoryPicker, setShowDirectoryPicker] = useState(false);
+  // New-session wizard step (b): model selection. `wizardPath` holds the
+  // directory chosen in step (a) until the user commits or backs out.
+  const [showModelStep, setShowModelStep] = useState(false);
+  const [wizardPath, setWizardPath] = useState<string | null>(null);
 
   // Health check state
   const [isStuck, setIsStuck] = useState(false);
@@ -115,6 +156,13 @@ export default function ChatTab({
   const [currentModel, setCurrentModel] = useState<string | null>(null);
   const transcriptLoadingRef = useRef(false);
   const transcriptStreamingRef = useRef('');
+  // Consecutive `/api/health` isProcessing:false readings from the 15s fallback
+  // poll. The SDK singleton swap on Next.js HMR can make a not-yet-recompiled
+  // /api/health route momentarily report a live session as idle (documented in
+  // lib/sdkSessionManager.ts). A lone transient false must NOT tear down the
+  // in-flight view — require two in a row before trusting "the turn ended", and
+  // let the authoritative session-health SSE handle real completions instantly.
+  const healthFalseStreakRef = useRef(0);
   const ttsEnabledRef = useRef(ttsEnabled);
   const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
   const ttsBlobUrlRef = useRef<string | null>(null);
@@ -540,16 +588,9 @@ export default function ChatTab({
             // earlier completed turns too. It also broke on a repeated prompt.
             // startedAt vs each message's timestamp identifies this turn's
             // output exactly, whatever the prompt was.
-            setHistoryTranscript(prev => {
-              const startedAt = typeof bufData.startedAt === 'number' ? bufData.startedAt : 0;
-              if (!startedAt) return prev; // no anchor — leave the transcript alone
-              const cutIdx = prev.findIndex(m => {
-                if (!m.timestamp) return false;
-                const t = Date.parse(m.timestamp);
-                return Number.isFinite(t) && t >= startedAt;
-              });
-              return cutIdx >= 0 ? prev.slice(0, cutIdx) : prev;
-            });
+            setHistoryTranscript(prev =>
+              stripInFlightPartials(prev, typeof bufData.startedAt === 'number' ? bufData.startedAt : 0),
+            );
 
             setTranscriptOverlayMessages([{ role: 'user' as const, content: bufData.userPrompt }]);
             setTranscriptStreaming(bufData.accumulatedText || '');
@@ -563,7 +604,12 @@ export default function ChatTab({
             setSubmitEndTime(bufData.events?.[0]?.ts ?? null);
             detectedProcessing = true;
           } else if (bufData.isProcessing) {
-            // Session is processing but buffer is inactive or missing.
+            // Session is processing but buffer is inactive or missing. Still strip
+            // this turn's partials — otherwise they render as intermediary bubbles
+            // above the dots (buffer inactive doesn't mean the JSONL is clean).
+            setHistoryTranscript(prev =>
+              stripInFlightPartials(prev, typeof bufData.startedAt === 'number' ? bufData.startedAt : 0),
+            );
             setTranscriptLoading(true);
             if (bufData.startedAt) setSubmitStartTime(bufData.startedAt);
             detectedProcessing = true;
@@ -842,9 +888,18 @@ export default function ChatTab({
       setIsStuck(data.isStuck);
       setStuckReason(data.stuckReason);
 
+      // Authoritative liveness signal — a real reading resets the poll's
+      // transient-false streak either way.
+      healthFalseStreakRef.current = 0;
+
       // If the session is actively processing, ensure the loading indicator
-      // (bouncing dots) is visible.
+      // (bouncing dots) is visible. Break the latch: if a transient false had
+      // already committed this turn's partials to historyTranscript, re-strip
+      // them so we return to dots instead of leaving the bubbles on screen.
       if (data.isProcessing && !transcriptLoadingRef.current) {
+        setHistoryTranscript(prev =>
+          stripInFlightPartials(prev, typeof data.startedAt === 'number' ? data.startedAt : 0),
+        );
         setTranscriptLoading(true);
       }
 
@@ -995,20 +1050,33 @@ export default function ChatTab({
         .then(res => res.json())
         .then(data => {
           if (!shouldProcess()) return;
-          if (!data.isProcessing && transcriptLoadingRef.current) {
-            setTranscriptLoading(false);
-            setTranscriptStreaming('');
-            fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
-              .then(res => res.json())
-              .then(refreshData => {
-                if (refreshData.messages && shouldProcess()) {
-                  setHistoryTranscript(refreshData.messages);
-                  setTranscriptOverlayMessages([]);
-                  setOverlayInsertPoint(null);
-                }
-              })
-              .catch(() => {});
+          if (data.isProcessing) {
+            // Live — reset the streak so an earlier isolated false is forgotten.
+            healthFalseStreakRef.current = 0;
+            return;
           }
+          if (!transcriptLoadingRef.current) return;
+          // Debounce: this poll is only a safety net for a dead SSE stream. A
+          // single false is untrustworthy (HMR singleton swap can momentarily
+          // report a live SDK session as idle), so require TWO consecutive false
+          // readings (~30s) before tearing down the in-flight view. Genuine
+          // completions are torn down instantly by the session-health SSE event;
+          // this only fires when that event never arrived.
+          healthFalseStreakRef.current += 1;
+          if (healthFalseStreakRef.current < 2) return;
+          healthFalseStreakRef.current = 0;
+          setTranscriptLoading(false);
+          setTranscriptStreaming('');
+          fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
+            .then(res => res.json())
+            .then(refreshData => {
+              if (refreshData.messages && shouldProcess()) {
+                setHistoryTranscript(refreshData.messages);
+                setTranscriptOverlayMessages([]);
+                setOverlayInsertPoint(null);
+              }
+            })
+            .catch(() => {});
         })
         .catch(() => {});
     }, 15_000);
@@ -1130,7 +1198,39 @@ export default function ChatTab({
     setShowDirectoryPicker(true);
   };
 
-  const handleDirectorySelected = (path: string) => {
+  // Step (a) → (b) of the new-session wizard: stash the chosen directory and
+  // advance to the model step. The session isn't created until the user commits
+  // a model (or backs out), so nothing is minted here.
+  const handleDirectoryNext = (path: string) => {
+    setShowDirectoryPicker(false);
+    // Model selection only means anything on the SDK backend (same gate as the
+    // mid-session picker). With it off, skip step (b) and create straight away
+    // on the default model rather than showing a step that can't take effect.
+    if (!sdkSessionsEnabled) {
+      createNewSession(path, null);
+      return;
+    }
+    setWizardPath(path);
+    setShowModelStep(true);
+  };
+
+  // Step (b) → (a): return to the directory picker, preserving no model choice.
+  const handleModelStepBack = () => {
+    setShowModelStep(false);
+    setShowDirectoryPicker(true);
+  };
+
+  // Step (b) commit: create the session on the chosen directory + model.
+  // `model` is null to follow the provider default (no override); `resolvedModel`
+  // is the picked model's wire id, used to update the status-bar label at once.
+  const handleModelStepCreate = (model: string | null, resolvedModel: string | null) => {
+    setShowModelStep(false);
+    const path = wizardPath;
+    setWizardPath(null);
+    if (path) createNewSession(path, model, resolvedModel);
+  };
+
+  const createNewSession = (path: string, model: string | null, resolvedModel: string | null = null) => {
     // Save current editor draft before switching
     if (viewingTranscriptId && chatEditorRef.current) {
       const draft = chatEditorRef.current.getContent();
@@ -1155,9 +1255,27 @@ export default function ChatTab({
     setStreamEvents([]);
     setTranscriptLoading(false);
     setTranscriptPartial(false);
-    setCurrentModel(null);
+    // Reflect the wizard's model in the status-bar label immediately, instead of
+    // showing the provider default until the first turn's session:model init
+    // event lands. formatModelName strips any [1m] suffix; a null resolvedModel
+    // (default row) leaves the label on the provider default. currentModel wants
+    // the WIRE id, not the alias ('haiku' would format to a bare "Claude").
+    setCurrentModel(resolvedModel);
     setSubmitStartTime(null);
     setSubmitEndTime(null);
+
+    // Record the chosen model as a PENDING override before the first send.
+    // sdkSessionManager.setModel persists it and startQuery() replays it into
+    // the query options on the very first turn. Null = follow the default, so
+    // no request is needed. Fire-and-forget: a failure just falls back to the
+    // default, and the mid-session picker remains available to correct it.
+    if (model) {
+      fetch('/api/claude-sdk/model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: newId, model }),
+      }).catch(() => { /* non-fatal — first turn falls back to the default */ });
+    }
 
     // Track this as a pending session so it persists in the sidebar
     setPendingNewSessions(prev => [...prev, { sessionId: newId, project: path, title: 'New Session', createdAt: Date.now() }]);
@@ -2071,12 +2189,22 @@ export default function ChatTab({
       message={errorDialog?.message}
     />
 
-    {/* Directory Picker Dialog */}
+    {/* New-session wizard — step (a): choose a directory, then Next → model */}
     <DirectoryPicker
       open={showDirectoryPicker}
       onOpenChange={setShowDirectoryPicker}
-      onSelect={handleDirectorySelected}
+      onSelect={handleDirectoryNext}
       recentDirectories={recentDirectories}
+      confirmLabel="Next →"
+    />
+
+    {/* New-session wizard — step (b): choose the model, then create */}
+    <NewSessionModelStep
+      open={showModelStep}
+      onOpenChange={(open) => { if (!open) { setShowModelStep(false); setWizardPath(null); } }}
+      onBack={handleModelStepBack}
+      onCreate={handleModelStepCreate}
+      directory={wizardPath ?? undefined}
     />
     </>
   );

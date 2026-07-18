@@ -265,6 +265,15 @@ export default function ModelPickerDialog({
                       active
                     </span>
                   )}
+                  {/* The `default` alias is folded into the row it resolves to
+                      (see DEFAULT_VALUE) and surfaced as this annotation rather
+                      than a duplicate row — selecting this row clears the
+                      override back to "follow the default". */}
+                  {m.value === defaultRowValue && (
+                    <span className="text-[10px] font-normal lowercase text-muted-foreground">
+                      (current default)
+                    </span>
+                  )}
                 </div>
                 {m.description && (
                   <div className="text-xs text-muted-foreground mt-0.5">{m.description}</div>
