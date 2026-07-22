@@ -20,6 +20,7 @@ import ModelPickerDialog from '@/components/ModelPickerDialog';
 import NewSessionModelStep from '@/components/NewSessionModelStep';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
 import { getRecentDirectories } from '@/lib/recent-directories';
+import { uiLog } from '@/lib/clientTelemetry';
 import type { Message, TranscriptMsg, HistoryEntry, PendingSession, AskUserQuestionState } from '@/lib/types';
 import type { TurnMeta } from '@/lib/transcriptParser';
 
@@ -269,8 +270,24 @@ export default function ChatTab({
   } | null>(null);
   const [intermediaryMessages, setIntermediaryMessages] = useState<TranscriptMsg[]>([]);
   const [showKillConfirm, setShowKillConfirm] = useState(false);
+  // Parked when a send hits a session that's live in an external terminal. The
+  // backend answers with a 409 {needsTakeoverConfirm}; this holds the owner info
+  // plus the confirm/cancel continuations so the user decides whether to take it
+  // over (which ends the terminal) or back out. See handleTranscriptSend.
+  const [takeoverConfirm, setTakeoverConfirm] = useState<{
+    owner: { pid?: number; name?: string; cwd?: string };
+    onConfirm: () => void;
+    onCancel: () => void;
+  } | null>(null);
   const [codeViewerPath, setCodeViewerPath] = useState<string | null>(null);
   const [errorDialog, setErrorDialog] = useState<{ title: string; message?: string } | null>(null);
+  // A turn-ending error surfaced by the backend (session:stream {error}) — e.g.
+  // "Failed to authenticate: OAuth session expired...". Held as a persistent
+  // center-panel notice, NOT just a stream event: the transcript parser drops
+  // the SDK's synthetic error message (transcriptParser.ts, `model==='<synthetic>'`),
+  // so a refetch would erase it and the chat would go silent (the 87487df4 bug).
+  // Cleared on the next send and on session switch.
+  const [sessionError, setSessionError] = useState<string | null>(null);
 
   // --- Scroll helper ---
   const scrollTranscriptToBottom = () => {
@@ -499,6 +516,7 @@ export default function ChatTab({
     setOverlayInsertPoint(null);
     setTranscriptStreaming('');
     setStreamEvents([]);
+    setSessionError(null);
     setTranscriptLoading(false);
     setTranscriptPartial(false);
     setSuggestedPrompt(null);
@@ -852,6 +870,13 @@ export default function ChatTab({
         setStreamEvents(prev => [...prev, { type: 'tool_result' as const, preview: data.toolResult.preview, ts: Date.now() }]);
       } else if (data.error) {
         setStreamEvents(prev => [...prev, { type: 'error' as const, content: data.error, ts: Date.now() }]);
+        // Persist it in the center panel too — the parser drops the SDK's
+        // synthetic error message, so this is the only durable surface.
+        setSessionError(data.error);
+        uiLog('error', 'chat.stream', 'error surfaced', {
+          sessionId: mySessionId,
+          data: { error: String(data.error).slice(0, 300) },
+        });
       }
     });
 
@@ -897,6 +922,10 @@ export default function ChatTab({
       // already committed this turn's partials to historyTranscript, re-strip
       // them so we return to dots instead of leaving the bubbles on screen.
       if (data.isProcessing && !transcriptLoadingRef.current) {
+        uiLog('warn', 'chat.health', 'latch-break re-strip (isProcessing true while not loading)', {
+          sessionId: mySessionId,
+          data: { startedAt: data.startedAt ?? null },
+        });
         setHistoryTranscript(prev =>
           stripInFlightPartials(prev, typeof data.startedAt === 'number' ? data.startedAt : 0),
         );
@@ -994,6 +1023,10 @@ export default function ChatTab({
 
     es.onerror = () => {
       if (es.readyState === EventSource.CONNECTING && shouldProcess()) {
+        uiLog('warn', 'chat.sse', 'reconnecting', {
+          sessionId: mySessionId,
+          data: { loading: transcriptLoadingRef.current },
+        });
         // SSE reconnecting — check if session completed while disconnected
         fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`)
           .then(res => res.json())
@@ -1052,6 +1085,12 @@ export default function ChatTab({
           if (!shouldProcess()) return;
           if (data.isProcessing) {
             // Live — reset the streak so an earlier isolated false is forgotten.
+            if (healthFalseStreakRef.current > 0) {
+              uiLog('debug', 'chat.healthPoll', 'false streak reset by live reading', {
+                sessionId: mySessionId,
+                data: { priorStreak: healthFalseStreakRef.current },
+              });
+            }
             healthFalseStreakRef.current = 0;
             return;
           }
@@ -1063,8 +1102,17 @@ export default function ChatTab({
           // completions are torn down instantly by the session-health SSE event;
           // this only fires when that event never arrived.
           healthFalseStreakRef.current += 1;
+          // This is the inflight-partials trigger. Log EVERY false (the server
+          // log will show whether isProcessing was really false or an HMR blip)
+          // and the teardown separately, so the loop between UI and server is
+          // reconstructable from one file.
+          uiLog('warn', 'chat.healthPoll', 'isProcessing:false while loading', {
+            sessionId: mySessionId,
+            data: { streak: healthFalseStreakRef.current },
+          });
           if (healthFalseStreakRef.current < 2) return;
           healthFalseStreakRef.current = 0;
+          uiLog('warn', 'chat.healthPoll', 'teardown after 2 consecutive false', { sessionId: mySessionId });
           setTranscriptLoading(false);
           setTranscriptStreaming('');
           fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
@@ -1257,9 +1305,12 @@ export default function ChatTab({
     setTranscriptPartial(false);
     // Reflect the wizard's model in the status-bar label immediately, instead of
     // showing the provider default until the first turn's session:model init
-    // event lands. formatModelName strips any [1m] suffix; a null resolvedModel
-    // (default row) leaves the label on the provider default. currentModel wants
-    // the WIRE id, not the alias ('haiku' would format to a bare "Claude").
+    // event lands. formatModelName strips any [1m] suffix. resolvedModel carries
+    // the CONCRETE wire id of the picked row — including for the default row,
+    // where `model` stays null (no override) but the label still names the real
+    // model. Only null when the catalog failed to load, which keeps the coarse
+    // "Claude" fallback. currentModel wants the WIRE id, not the alias ('haiku'
+    // would format to a bare "Claude").
     setCurrentModel(resolvedModel);
     setSubmitStartTime(null);
     setSubmitEndTime(null);
@@ -1383,12 +1434,34 @@ export default function ChatTab({
     setTranscriptLoading(true);
     setTranscriptStreaming('');
     setStreamEvents([]);
+    setSessionError(null);
     setSuggestedPrompt(null);
     setSubmitStartTime(Date.now());
     setSubmitEndTime(null);
     setTimeout(() => scrollTranscriptToBottom(), 50);
+    uiLog('info', 'chat.send', 'submit', { sessionId: mySessionId, data: { promptChars: userMessage.length } });
 
-    try {
+    // Undo the optimistic in-flight UI when a send doesn't actually start — the
+    // user backed out of a takeover. Pull the user bubble back off, drop the
+    // spinner/live badge, and return the text to the composer so they can retry
+    // or edit. (Genuine errors keep the existing assistant-error-bubble path.)
+    const rollbackSend = () => {
+      if (activeSessionRef.current !== mySessionId) return;
+      setTranscriptLoading(false);
+      setSubmitStartTime(null);
+      setTranscriptOverlayMessages(prev => prev.slice(0, -1));
+      setLiveSessionIds(prev => {
+        const next = new Set(prev);
+        next.delete(mySessionId);
+        return next;
+      });
+      setTimeout(() => chatEditorRef.current?.setContent(userMessage), 50);
+    };
+
+    // The POST, factored so the takeover-confirm path can replay it verbatim with
+    // confirmTakeover set. A 409 {needsTakeoverConfirm} parks on a dialog instead
+    // of erroring; the user's choice either replays this (confirm) or rolls back.
+    const submitTurn = async (confirmTakeover: boolean): Promise<void> => {
       const res = await fetch('/api/claude', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1396,14 +1469,35 @@ export default function ChatTab({
           prompt: userMessage,
           sessionId: mySessionId,
           projectPath: myProject,
+          ...(confirmTakeover ? { confirmTakeover: true } : {}),
         }),
       });
+      if (res.status === 409) {
+        const data = await res.json().catch(() => ({}));
+        if (data.needsTakeoverConfirm) {
+          setTakeoverConfirm({
+            owner: data.owner || {},
+            onConfirm: () => {
+              setTakeoverConfirm(null);
+              submitTurn(true).catch(handleSendError);
+            },
+            onCancel: () => {
+              setTakeoverConfirm(null);
+              rollbackSend();
+            },
+          });
+          return;
+        }
+        throw new Error(data.error || `HTTP ${res.status}`);
+      }
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || `HTTP ${res.status}`);
       }
       // Done. SSE delivers all stream events + session:health signals completion.
-    } catch (error) {
+    };
+
+    const handleSendError = (error: unknown) => {
       if (activeSessionRef.current === mySessionId) {
         setTranscriptOverlayMessages(prev => [...prev, {
           role: 'assistant' as const,
@@ -1411,6 +1505,12 @@ export default function ChatTab({
         }]);
         setTranscriptLoading(false);
       }
+    };
+
+    try {
+      await submitTurn(false);
+    } catch (error) {
+      handleSendError(error);
     }
   };
 
@@ -1940,6 +2040,17 @@ export default function ChatTab({
                               )}
                             </div>
                           )}
+                          {sessionError && (
+                            <div className="flex justify-start" data-testid="session-error">
+                              <div className="max-w-[80%] rounded-lg px-4 py-2 bg-destructive/10 text-foreground border border-destructive/40 text-left">
+                                <div className="text-xs text-destructive mb-1 flex items-center gap-1">
+                                  <AlertTriangle className="h-3 w-3" />
+                                  Session error
+                                </div>
+                                <div className="text-sm whitespace-pre-wrap">{sessionError}</div>
+                              </div>
+                            </div>
+                          )}
                           {suggestedPrompt && !transcriptLoading && promptSuggestionsEnabled && (
                             <div className="flex justify-start">
                               <button
@@ -2129,6 +2240,26 @@ export default function ChatTab({
       confirmLabel="Kill Process"
       confirmVariant="destructive"
       onConfirm={() => { setShowKillConfirm(false); handleKillStuckSession(); }}
+    />
+
+    <ConfirmDialog
+      open={!!takeoverConfirm}
+      onOpenChange={(open) => { if (!open) takeoverConfirm?.onCancel(); }}
+      title="Take over this session?"
+      message={
+        <>
+          This session is currently live in a terminal
+          {takeoverConfirm?.owner?.name ? <> (<span className="font-mono">{takeoverConfirm.owner.name}</span>)</> : ''}.
+          <br /><br />
+          Taking it over in Fury will end that terminal session so Fury can
+          continue it here. Any unsaved context only in the terminal will be lost.
+        </>
+      }
+      confirmLabel="Take Over"
+      confirmVariant="destructive"
+      cancelLabel="Cancel"
+      onConfirm={() => takeoverConfirm?.onConfirm()}
+      onCancel={() => takeoverConfirm?.onCancel()}
     />
 
     <Dialog

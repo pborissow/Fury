@@ -67,7 +67,7 @@ app.prepare().then(() => {
     // has no record. Killing them makes the UI honest and stops the token burn.
     try {
       const { sdkSessionManager } = await import('./lib/sdkSessionManager');
-      const reaped = sdkSessionManager.reapOrphanedProcesses();
+      const reaped = await sdkSessionManager.reapOrphanedProcesses();
       if (reaped > 0) {
         console.log(`[server] Reaped ${reaped} orphaned SDK session process(es) from a previous run`);
       }

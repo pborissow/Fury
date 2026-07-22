@@ -23,7 +23,7 @@ export const runtime = 'nodejs';
  */
 export async function POST(req: NextRequest) {
   try {
-    const { prompt, sessionId, projectPath } = await req.json();
+    const { prompt, sessionId, projectPath, confirmTakeover } = await req.json();
 
     if (!prompt) {
       return Response.json({ error: 'Prompt is required' }, { status: 400 });
@@ -61,10 +61,34 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // If this session is live in an external terminal, DON'T silently take it
+    // over: sending would spawn Fury's resume query alongside the terminal CLI,
+    // two writers on one JSONL, and (pre-fix) SIGKILL the user's terminal out
+    // from under them. Detect it here — where a status code can still reach the
+    // client — and return a 409 the UI renders as a takeover confirmation. The
+    // confirmed re-send carries confirmTakeover, which lets this check pass and
+    // instructs sendMessage to end the terminal cleanly (SIGTERM) first. Same
+    // shape as the pendingAsk guard above: a pre-dispatch 409, since the actual
+    // send is fire-and-forget over SSE. See
+    // docs/ticket-resume-live-cli-session-hard-kill.md.
+    if (useSdk && !confirmTakeover) {
+      const owner = await sdkSessionManager.detectExternalOwner(sessionId);
+      if (owner) {
+        return Response.json(
+          {
+            needsTakeoverConfirm: true,
+            owner: { pid: owner.pid, name: owner.name, cwd: owner.cwd },
+            error: 'This session is live in a terminal.',
+          },
+          { status: 409 },
+        );
+      }
+    }
+
     // Fire-and-forget: the manager runs in the background, emitting stream
     // events and health updates via the eventBus.
     if (useSdk) {
-      sdkSessionManager.sendMessage(sessionId, prompt, projectPath).catch(error => {
+      sdkSessionManager.sendMessage(sessionId, prompt, projectPath, { confirmTakeover: !!confirmTakeover }).catch(error => {
         console.error('[Claude API] SDK sendMessage failed:', error);
       });
     } else {

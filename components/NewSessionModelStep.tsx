@@ -107,11 +107,14 @@ export default function NewSessionModelStep({
   const selected = picked ?? defaultRowValue ?? rows[0]?.value ?? '';
 
   const handleCreate = useCallback(() => {
-    // Picking the default row means "follow the default", not "pin it": clear
-    // the override (model=null) and leave the label on the provider default
-    // (resolvedModel=null) rather than latching the default's current target.
+    // Picking the default row means "follow the default", not "pin it": clear the
+    // override (model=null). But still surface the default's CONCRETE wire id as
+    // the label — the wizard already knows what the default resolves to — so the
+    // status bar names the real model instead of a bare "Claude (Anthropic)"
+    // until the first turn's session:model init event lands. `resolvedModel` is
+    // label-only; it does not pin an override.
     const isDefault = !selected || selected === defaultRowValue;
-    const resolved = isDefault ? null : (rows.find(m => m.value === selected)?.resolvedModel ?? selected);
+    const resolved = rows.find(m => m.value === selected)?.resolvedModel ?? (selected || null);
     onCreate(isDefault ? null : selected, resolved);
     onOpenChange(false);
   }, [selected, defaultRowValue, rows, onCreate, onOpenChange]);

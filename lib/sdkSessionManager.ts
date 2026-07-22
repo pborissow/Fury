@@ -1,6 +1,8 @@
 import { query, type Query, type SDKMessage, type SDKUserMessage, type PermissionResult, type RewindFilesResult, type ModelInfo } from '@anthropic-ai/claude-agent-sdk';
 import { appendFile } from 'fs/promises';
 import { readdirSync, readFileSync, rmSync } from 'fs';
+import { spawn, execFile, type ChildProcess, type SpawnOptions } from 'child_process';
+import { promisify } from 'util';
 import { homedir } from 'os';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
@@ -13,6 +15,7 @@ import {
   contextTokensFromMeta,
 } from './transcriptArchiver';
 import { eventBus } from './eventBus';
+import { log } from './logger';
 import { findSessionJsonlDir } from './sessionPaths';
 // Type-only (erased at compile time) — no runtime coupling to the CLI manager.
 // Reusing its shapes keeps /api/stream-buffer and ChatTab identical for both
@@ -91,6 +94,11 @@ interface SdkSession {
   // Per-turn timing for the TTFT measurement.
   turnStartedAt?: number;
   ttftEmitted: boolean;
+  // Whether this turn has already surfaced an error to the client (via
+  // session:stream {error}). An auth failure arrives as a synthetic assistant
+  // message AND then a non-success result; without this flag we'd emit the same
+  // failure twice. Reset at every turn start alongside ttftEmitted.
+  turnErrorEmitted?: boolean;
   // Live billed-token tally, deduped by assistant message id (mirrors the
   // shipping manager's session:usage accounting).
   usageByMsg: Map<string, number>;
@@ -110,6 +118,16 @@ interface SdkSession {
   // the SDK's documented hard-stop (Options.abortController) — used by stop()
   // and killSession() so deleting a session actually kills its warm process.
   abortController?: AbortController;
+  // Every CLI pid THIS manager has spawned for this session and not yet seen
+  // exit. This is the ONLY provable "we own it" signal we have: the on-disk PID
+  // files are indistinguishable between Fury's own resume subprocess and an
+  // external interactive terminal (both write kind:'interactive',
+  // entrypoint:'sdk-ts' — see docs/ticket-resume-live-cli-session-hard-kill.md).
+  // So kills on the send/handoff path are scoped to THIS set, and any live pid
+  // for the session that is NOT in it is treated as an external owner (→
+  // confirmed graceful takeover), never a silent SIGKILL. Populated by the
+  // custom spawnClaudeCodeProcess in startQuery; pruned on the child's 'exit'.
+  spawnedPids: Set<number>;
   // The user's chosen model for this session, or undefined for the CLI default.
   // Load-bearing in TWO places, because the query object comes and goes:
   //   1. Pushed live via Query.setModel() when a query is open (no restart).
@@ -162,6 +180,83 @@ const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
  *  a previous server life apart from a live, unrelated SDK app. */
 const PROCESS_STARTED_AT = Date.now() - Math.floor(process.uptime() * 1000);
 
+const execFileP = promisify(execFile);
+
+/** Liveness probe: signal 0 throws iff the pid is gone (or not ours to signal). */
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/**
+ * Given a candidate process's parent pid, is it a PROVABLE orphaned leftover —
+ * i.e. safe for reapOrphanedProcesses to SIGKILL?
+ *
+ * ONLY two states prove orphan-hood: the parent is init (Linux re-parents orphans
+ * to pid 1) or the parent is dead (Windows leaves a stale ParentProcessId once the
+ * spawning server exits). EVERYTHING ELSE is spared:
+ *   - `ppid === null` — the OS lookup failed. parentPidOf's contract is explicit:
+ *     never kill on a failed lookup. Falling through to SIGKILL here is exactly
+ *     how a transient PowerShell failure at boot could take out a user's terminal.
+ *   - a live, non-init parent — the process is attached to a real shell/terminal
+ *     the user is in (an external session), not our leftover.
+ *   - `ppid === selfPid` — a child of THIS server (current life, not a leftover).
+ *
+ * Pure and injectable (`alive`) so the reap decision is unit-testable without the
+ * unscoped sweep, which can't run in a test (it would target real machine sessions).
+ */
+export function isProvableOrphan(
+  ppid: number | null,
+  selfPid: number,
+  alive: (pid: number) => boolean,
+): boolean {
+  if (ppid === null || ppid === selfPid) return false;
+  return ppid === 1 || !alive(ppid);
+}
+
+/**
+ * The parent pid of an arbitrary process, or null if it can't be determined.
+ *
+ * Node exposes process.ppid for ITSELF only, so ownership attribution
+ * (docs/ticket-resume-live-cli-session-hard-kill.md) has to go to the OS. This is
+ * the ancestry signal the ticket's process-model findings settled on: a
+ * Fury-spawned CLI is a direct child of this server process, so
+ * `parentPidOf(pid) === process.pid` proves ownership when no spawn record exists
+ * (e.g. a PID file we never got to record). PID files' kind/entrypoint/startedAt
+ * are all proven NON-discriminating — an external terminal is byte-for-byte the
+ * same shape — so this is the only field-independent test.
+ *
+ * Best-effort and defensive: any failure returns null, and callers MUST treat
+ * null as "cannot prove ownership" → leave the process alive (never kill on a
+ * failed lookup). One short-lived OS query per uncached candidate; the hot path
+ * (pid already in spawnedPids) never reaches here.
+ */
+async function parentPidOf(pid: number): Promise<number | null> {
+  try {
+    if (process.platform === 'win32') {
+      // Win32_Process.ParentProcessId — exactly what diagnosed this ticket.
+      const { stdout } = await execFileP('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command',
+        `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").ParentProcessId`,
+      ]);
+      const ppid = parseInt(stdout.trim(), 10);
+      return Number.isFinite(ppid) ? ppid : null;
+    }
+    if (process.platform === 'darwin') {
+      const { stdout } = await execFileP('ps', ['-o', 'ppid=', '-p', String(pid)]);
+      const ppid = parseInt(stdout.trim(), 10);
+      return Number.isFinite(ppid) ? ppid : null;
+    }
+    // Linux: field 4 of /proc/<pid>/stat, but comm (field 2) can contain spaces
+    // and parens, so index from the LAST ')' rather than splitting from the start.
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    const ppid = parseInt(rest[1], 10);
+    return Number.isFinite(ppid) ? ppid : null;
+  } catch {
+    return null;
+  }
+}
+
 class SdkSessionManager {
   private sessions = new Map<string, SdkSession>();
   /** Last catalog any session reported, for sessions with no live query to ask.
@@ -191,6 +286,7 @@ class SdkSessionManager {
         lastEmittedContext: -1,
         lastEmittedWindow: -1,
         lastEmittedModel: null,
+        spawnedPids: new Set<number>(),
       };
       this.sessions.set(sessionId, s);
     }
@@ -202,7 +298,12 @@ class SdkSessionManager {
    * Subsequent calls reuse the live process — this is the hot path that avoids
    * the cold start.
    */
-  async sendMessage(sessionId: string, prompt: string, projectPath?: string): Promise<void> {
+  async sendMessage(
+    sessionId: string,
+    prompt: string,
+    projectPath?: string,
+    opts?: { confirmTakeover?: boolean },
+  ): Promise<void> {
     const s = this.getOrCreate(sessionId);
     if (projectPath) s.projectPath = projectPath;
 
@@ -219,6 +320,15 @@ class SdkSessionManager {
     // session resumed after a restart would otherwise open its query on the
     // default model and only correct itself on some later turn.
     await this.ensureModelHydrated(s);
+
+    // When the session is live in an external terminal, POST /api/claude detects
+    // it and answers the send with a 409 the UI turns into a takeover dialog.
+    // The confirmed re-send arrives here with confirmTakeover: end that external
+    // process cleanly BEFORE opening our resume query — two live processes
+    // writing one JSONL would break single-writer. Only reached post-confirmation.
+    if (opts?.confirmTakeover) {
+      await this.takeoverExternalOwner(s);
+    }
 
     if (!s.q) this.startQuery(s);
 
@@ -252,6 +362,12 @@ class SdkSessionManager {
     s.startedAt = Date.now();
     s.turnStartedAt = Date.now();
     s.ttftEmitted = false;
+    s.turnErrorEmitted = false;
+    log.info('sdk.turn', 'start', {
+      sessionId: s.sessionId,
+      corrId: s.sessionId,
+      data: { model: s.model ?? 'default', promptChars: prompt.length, cwd: s.projectPath },
+    });
     this.emitHealth(s, true);
 
     s.input!.push({
@@ -684,6 +800,9 @@ class SdkSessionManager {
     const prior = (previous as unknown as { sessions?: Map<string, SdkSession> }).sessions;
     if (!(prior instanceof Map)) return;
     for (const [id, session] of prior) {
+      // A session built by an older module version predates spawnedPids; backfill
+      // so the ownership-scoped kill path never dereferences an undefined set.
+      if (!(session.spawnedPids instanceof Set)) session.spawnedPids = new Set<number>();
       if (!this.sessions.has(id)) this.sessions.set(id, session);
     }
   }
@@ -727,8 +846,17 @@ class SdkSessionManager {
    * a probe run outside the server has an empty map, so an unscoped call would
    * treat every live SDK process on the machine — including sessions the user is
    * actively using — as an orphan and kill them.
+   *
+   * ANCESTRY SAFEGUARD (unscoped boot sweep only): `startedAt < PROCESS_STARTED_AT`
+   * is a fragile proxy for ownership — an external terminal the user launched
+   * before this server ALSO predates it (docs/ticket-resume-live-cli-session-hard-kill.md,
+   * criterion 5 bonus). So before reaping, we spare any candidate still attached
+   * to a live, non-init parent: that's a session hanging off a real shell/terminal,
+   * not a leftover of ours. A genuine previous-life orphan has a dead parent
+   * (Windows: stale ParentProcessId) or has re-parented to init (Linux pid 1) — so
+   * it still gets reaped. Async because parentPidOf goes to the OS.
    */
-  reapOrphanedProcesses(opts?: { onlySessionId?: string }): number {
+  async reapOrphanedProcesses(opts?: { onlySessionId?: string }): Promise<number> {
     let dir: string;
     let files: string[];
     try {
@@ -749,10 +877,23 @@ class SdkSessionManager {
         // Predates this process => can't be ours => left over from a previous
         // life. Spares concurrently-running SDK apps (incl. our own probes).
         // Skipped when explicitly scoped to one session (tests).
-        if (!opts?.onlySessionId && !(typeof e.startedAt === 'number' && e.startedAt < PROCESS_STARTED_AT)) continue;
-        let alive = false;
-        try { process.kill(e.pid, 0); alive = true; } catch { /* already dead */ }
-        if (alive) {
+        if (!opts?.onlySessionId) {
+          if (!(typeof e.startedAt === 'number' && e.startedAt < PROCESS_STARTED_AT)) continue;
+          // Reap ONLY a provable orphan (parent is init, or dead). A null lookup,
+          // a live non-init parent (external terminal on a shell), or a child of
+          // this server are all SPARED — never SIGKILL what we can't prove is our
+          // leftover. This is the "prefer under-reaping" default the ticket calls
+          // for; a failed ancestry lookup must NOT fall through to a kill.
+          const ppid = await parentPidOf(e.pid);
+          if (!isProvableOrphan(ppid, process.pid, pidAlive)) {
+            log.info('sdk.handoff', 'reap: sparing unattributable/attached process', {
+              sessionId: typeof e.sessionId === 'string' ? e.sessionId : undefined,
+              data: { pid: e.pid, ppid },
+            });
+            continue;
+          }
+        }
+        if (pidAlive(e.pid)) {
           try { process.kill(e.pid, 'SIGKILL'); reaped++; } catch { /* raced */ }
         }
         try { rmSync(full); } catch { /* leave stale */ }
@@ -761,7 +902,17 @@ class SdkSessionManager {
     return reaped;
   }
 
-  /** SIGKILL every CLI process whose ~/.claude/sessions PID file names this id. */
+  /**
+   * SIGKILL every CLI process whose ~/.claude/sessions PID file names this id.
+   *
+   * DELIBERATELY UNSCOPED — this is the DESTROY sweep, wired only into
+   * killSession (DELETE /api/session). Deleting a session is an explicit user
+   * command to obliterate it, so hard-killing anything that claims the id
+   * (including an external terminal) is the intended behavior there. Do NOT call
+   * this from the send/handoff path: startQuery uses reclaimOwnLeaks (own pids
+   * only), and an external live owner is handled via takeoverExternalOwner behind
+   * a user confirmation. See docs/ticket-resume-live-cli-session-hard-kill.md.
+   */
   private killProcessesForSession(sessionId: string): void {
     let dir: string;
     let files: string[];
@@ -781,6 +932,169 @@ class SdkSessionManager {
           try { rmSync(full); } catch { /* leave stale file */ }
         }
       } catch { /* unreadable/foreign pid file — skip */ }
+    }
+  }
+
+  /**
+   * Can Fury prove it owns `pid`? Two signals, checked cheap-first:
+   *
+   *   1. Recorded spawn (PRIMARY). The pid is in s.spawnedPids — we captured it
+   *      from spawnClaudeCodeProcess when WE launched it. Synchronous, exact, and
+   *      the common case. (This is the ticket's recommended primary; the SDK's
+   *      spawn hook hands us the pid directly, cleaner than the snapshot-diff the
+   *      ticket sketched.)
+   *   2. Ancestry (FALLBACK). parentPidOf(pid) === process.pid — a Fury-spawned
+   *      CLI is a direct child of this server process. Covers a live child whose
+   *      spawn record we somehow don't have. One OS query, so only consulted when
+   *      (1) misses.
+   *
+   * Deliberately field-INDEPENDENT: kind/entrypoint/startedAt are all proven
+   * non-discriminating (an external terminal writes kind:"interactive",
+   * entrypoint:"sdk-ts" — identical to Fury's own spawn), so they are never
+   * consulted. A null parentPidOf (lookup failed, or a re-parented child after a
+   * server restart) means "cannot prove ownership" → NOT owned → left alive. See
+   * docs/ticket-resume-live-cli-session-hard-kill.md.
+   */
+  private async isFuryOwned(sessionId: string, pid: number): Promise<boolean> {
+    if (this.sessions.get(sessionId)?.spawnedPids.has(pid)) return true;
+    return (await parentPidOf(pid)) === process.pid;
+  }
+
+  /**
+   * Kill CLI processes THIS manager spawned for the session that are still alive
+   * even though s.q is null — a leak from a prior interrupted/ended turn (see the
+   * startQuery header). Scoped to s.spawnedPids (the spawn-record ownership
+   * signal), so it can NEVER touch an external terminal that merely shares the
+   * session id. This is the ownership discipline the ticket requires: only ever
+   * hard-kill a process we provably spawned. (No ancestry fallback is needed here:
+   * within a server life spawnedPids is complete, and after a restart the record
+   * is lost AND the children are re-parented — so nothing is attributable, and the
+   * correct default is to leave them for reapOrphanedProcesses rather than risk an
+   * unowned kill.)
+   */
+  private reclaimOwnLeaks(s: SdkSession): void {
+    for (const pid of [...s.spawnedPids]) {
+      if (pidAlive(pid)) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* raced */ }
+        log.info('sdk.handoff', 'reclaimed own leaked cli', {
+          sessionId: s.sessionId, corrId: s.sessionId, data: { pid },
+        });
+      }
+      s.spawnedPids.delete(pid);
+      this.removePidFileForPid(pid);
+    }
+  }
+
+  /**
+   * If the session is currently owned by a live process Fury cannot prove it owns
+   * — an external interactive terminal, or a zombie from a previous server life —
+   * return it. Otherwise null.
+   *
+   * Ownership is decided by isFuryOwned (recorded spawn, then ancestry), NEVER by
+   * a PID-file field: Fury's own resume subprocess and an external CLI write
+   * byte-for-byte identical files. Called by POST /api/claude to decide whether a
+   * send needs a takeover confirmation. Opportunistically sweeps stale dead-pid
+   * files it passes (Issue B). Read-only w.r.t. live processes — it never signals
+   * anything. Async because the ancestry fallback goes to the OS.
+   */
+  async detectExternalOwner(
+    sessionId: string,
+  ): Promise<{ pid: number; name?: string; cwd?: string; file: string } | null> {
+    let dir: string;
+    let files: string[];
+    try {
+      dir = join(homedir(), '.claude', 'sessions');
+      files = readdirSync(dir);
+    } catch {
+      return null;
+    }
+    for (const f of files) {
+      if (!f.endsWith('.json')) continue;
+      const full = join(dir, f);
+      let e: { sessionId?: unknown; pid?: unknown; name?: unknown; cwd?: unknown };
+      try {
+        e = JSON.parse(readFileSync(full, 'utf8'));
+      } catch { continue; } // unreadable/foreign pid file — skip
+      if (e.sessionId !== sessionId || typeof e.pid !== 'number') continue;
+      const pid = e.pid;
+      if (pid === process.pid) continue;              // never ourselves
+      if (!pidAlive(pid)) {
+        this.removePidFile(full);                     // stale file for a dead pid — sweep it
+        continue;
+      }
+      if (await this.isFuryOwned(sessionId, pid)) continue; // recorded ours, or a child of this server
+      return {
+        pid,
+        name: typeof e.name === 'string' ? e.name : undefined,
+        cwd: typeof e.cwd === 'string' ? e.cwd : undefined,
+        file: full,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * End the external process that currently owns this session so Fury's resume
+   * query can take over as the single writer. ONLY call this after the user has
+   * confirmed the takeover (POST /api/claude returns a 409 the UI renders as a
+   * dialog; the confirmed re-send carries confirmTakeover) — never silently.
+   *
+   * SIGTERM first so a POSIX CLI can flush and exit cleanly, then poll briefly and
+   * escalate to SIGKILL only if it ignores the term. NOTE: on Windows Node maps
+   * every signal except 0 to TerminateProcess, so there is no soft stop there —
+   * but the user has already agreed to end the terminal, which is the property
+   * that matters. Narrated to sdk.handoff so the whole exchange is reconstructable
+   * from ~/.claude/fury-logs/ the way this ticket was diagnosed.
+   */
+  private async takeoverExternalOwner(s: SdkSession): Promise<void> {
+    const owner = await this.detectExternalOwner(s.sessionId);
+    if (!owner) return; // gone between confirmation and now — nothing to end
+    log.info('sdk.handoff', 'takeover: signalling external owner', {
+      sessionId: s.sessionId, corrId: s.sessionId, data: { pid: owner.pid, name: owner.name },
+    });
+    try { process.kill(owner.pid, 'SIGTERM'); } catch { /* already gone */ }
+
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      let alive = false;
+      try { process.kill(owner.pid, 0); alive = true; } catch { /* exited */ }
+      if (!alive) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+
+    let stillAlive = false;
+    try { process.kill(owner.pid, 0); stillAlive = true; } catch { /* exited */ }
+    if (stillAlive) {
+      log.warn('sdk.handoff', 'takeover: owner ignored SIGTERM, escalating to SIGKILL', {
+        sessionId: s.sessionId, corrId: s.sessionId, data: { pid: owner.pid },
+      });
+      try { process.kill(owner.pid, 'SIGKILL'); } catch { /* raced */ }
+    }
+    await this.removePidFileWithRetry(owner.file);
+    log.info('sdk.handoff', 'takeover: external owner ended', {
+      sessionId: s.sessionId, corrId: s.sessionId, data: { pid: owner.pid },
+    });
+  }
+
+  /** Best-effort unlink of a PID file. Held handles / already-gone are non-fatal. */
+  private removePidFile(full: string): void {
+    try { rmSync(full); } catch { /* held or already gone */ }
+  }
+
+  /** Remove the ~/.claude/sessions/<pid>.json a spawned child writes for itself. */
+  private removePidFileForPid(pid: number): void {
+    this.removePidFile(join(homedir(), '.claude', 'sessions', `${pid}.json`));
+  }
+
+  /**
+   * Unlink a PID file, retrying a few times. On Windows the OS can briefly hold
+   * the handle of a just-killed process, so the immediate rmSync fails and the
+   * dead file lingers (Issue B). A short backoff clears it without blocking.
+   */
+  private async removePidFileWithRetry(full: string): Promise<void> {
+    for (let i = 0; i < 5; i++) {
+      try { rmSync(full); return; } catch { /* held — retry after a beat */ }
+      await new Promise((r) => setTimeout(r, 100));
     }
   }
 
@@ -1062,12 +1376,21 @@ class SdkSessionManager {
     // an interrupt) WITHOUT terminating the process, so the next sendMessage
     // would spawn a second process for the same session: both alive, both
     // writing the same JSONL, only the newest one tracked/abortable.
-    // startQuery only runs when s.q is null, so anything still alive here is a
-    // leak by definition.
+    //
+    // CRITICAL: reclaim only pids THIS manager spawned (s.spawnedPids), NOT every
+    // process whose PID file names this session id. An external interactive
+    // terminal writes an indistinguishable PID file (same kind/entrypoint), and
+    // hard-killing it here is exactly the regression this path caused — it
+    // executed the user's terminal session out from under them on the first Fury
+    // send (docs/ticket-resume-live-cli-session-hard-kill.md). An external live
+    // owner is handled deliberately upstream (sendMessage → takeoverExternalOwner,
+    // gated on a user confirmation); by the time we reach startQuery, any process
+    // still alive for this session that we DIDN'T spawn has already been dealt
+    // with, and s.spawnedPids holds only our own leaks.
     if (s.abortController && !s.abortController.signal.aborted) {
       try { s.abortController.abort(); } catch { /* best effort */ }
     }
-    this.killProcessesForSession(s.sessionId);
+    this.reclaimOwnLeaks(s);
 
     const cwd = s.projectPath || process.cwd();
     const existing = findSessionJsonlDir(s.sessionId, cwd) !== null;
@@ -1092,10 +1415,52 @@ class SdkSessionManager {
         // sessionPaths/transcriptParser expect. resume for an existing session,
         // sessionId to create one with our id.
         ...(existing ? { resume: s.sessionId } : { sessionId: s.sessionId }),
-        stderr: (data: string) => {
-          // Hook point for the usage-limit / provider-switch detection the
-          // shipping manager runs on stderr. Left as a log for the prototype.
-          if (data.trim()) console.error('[SdkSessionManager] stderr:', data.trim());
+        // Spawn the CLI ourselves so we can record the child's pid. This is the
+        // ONLY reliable "we own it" signal: Fury's resume subprocess and an
+        // external terminal write PID files we can't otherwise tell apart. It
+        // mirrors the SDK's default spawnLocalProcess exactly — direct spawn (no
+        // shell), windowsHide, and the FORWARDED signal (which fires only after
+        // the SDK's stdin-EOF + ~2 s grace window, so it's safe to pass through).
+        spawnClaudeCodeProcess: (opts) => {
+          const spawnOpts: SpawnOptions = {
+            cwd: opts.cwd,
+            // opts.env is the SDK's looser {[k]:string|undefined}; Node (with
+            // Next's ProcessEnv augmentation) wants NODE_ENV present, which it is
+            // at runtime since this derives from process.env.
+            env: opts.env as NodeJS.ProcessEnv,
+            signal: opts.signal,
+            windowsHide: true,
+            stdio: ['pipe', 'pipe', 'pipe'],
+          };
+          const child: ChildProcess = spawn(opts.command, opts.args, spawnOpts);
+          if (typeof child.pid === 'number') {
+            const pid = child.pid;
+            s.spawnedPids.add(pid);
+            log.debug('sdk.handoff', 'spawned cli', { sessionId: s.sessionId, corrId: s.sessionId, data: { pid } });
+            // Prune on exit and sweep the child's own PID file once it's provably
+            // gone, so no dead-pid *.json lingers after a normal turn/interrupt.
+            child.once('exit', () => {
+              s.spawnedPids.delete(pid);
+              this.removePidFileForPid(pid);
+            });
+          }
+          // The SDK bypasses its own stderr wiring when a custom spawn is given,
+          // so replicate the shipping stderr hook here (usage-limit / provider
+          // switch detection point; a log for the prototype).
+          child.stderr?.on('data', (d: Buffer) => {
+            const trimmed = d.toString().trim();
+            if (trimmed) log.warn('sdk.stderr', trimmed.slice(0, 500), { sessionId: s.sessionId, corrId: s.sessionId });
+          });
+          return {
+            stdin: child.stdin!,
+            stdout: child.stdout!,
+            get killed() { return child.killed; },
+            get exitCode() { return child.exitCode; },
+            kill: (signal) => child.kill(signal),
+            on: (event, listener) => { child.on(event, listener as never); },
+            once: (event, listener) => { child.once(event, listener as never); },
+            off: (event, listener) => { child.off(event, listener as never); },
+          };
         },
         canUseTool: this.canUseTool(s),
       },
@@ -1114,8 +1479,16 @@ class SdkSessionManager {
       // surfaces here as an AbortError — don't report it as a session error.
       if (!s.abortController?.signal.aborted) {
         const message = err instanceof Error ? err.message : String(err);
+        log.error('sdk.turn', 'query threw', {
+          sessionId: s.sessionId,
+          corrId: s.sessionId,
+          data: { message },
+        });
         this.bufferEvent(s, { type: 'error', content: message, ts: Date.now() });
         eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, error: message });
+        s.turnErrorEmitted = true;
+      } else {
+        log.debug('sdk.turn', 'query aborted', { sessionId: s.sessionId, corrId: s.sessionId });
       }
     } finally {
       s.isProcessing = false;
@@ -1148,7 +1521,11 @@ class SdkSessionManager {
           if (!s.ttftEmitted) {
             s.ttftEmitted = true;
             const ttft = Date.now() - (s.turnStartedAt ?? Date.now());
-            console.log(`[SdkSessionManager] ${s.sessionId} TTFT=${ttft}ms (sdk ttft_ms=${anyMsg.ttft_ms ?? '?'})`);
+            log.info('sdk.turn', 'ttft', {
+              sessionId: s.sessionId,
+              corrId: s.sessionId,
+              data: { ttftMs: ttft, sdkTtftMs: anyMsg.ttft_ms ?? null },
+            });
           }
           this.bufferText(s, ev.delta.text);
           eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, text: ev.delta.text });
@@ -1201,6 +1578,31 @@ class SdkSessionManager {
         if (anyMsg.parent_tool_use_id == null) {
           this.emitModelIfNew(s, anyMsg.message?.model);
         }
+
+        // Surface SDK-injected synthetic messages. `model: '<synthetic>'` marks a
+        // message the SDK fabricated rather than the model producing — the way it
+        // reports failures that DON'T throw, most importantly an expired OAuth
+        // token ("Failed to authenticate: OAuth session expired and could not be
+        // refreshed"). Such a message arrives as a COMPLETE assistant message,
+        // not as stream_event text deltas, so none of the streaming path runs:
+        // the UI would show the dots vanish and then silence (the "are you still
+        // there?" bug in session 87487df4). Emit it as an error so the failure is
+        // visible instead of swallowed. Main thread only — a subagent's synthetic
+        // message is its own business, not a main-turn failure.
+        if (anyMsg.parent_tool_use_id == null && anyMsg.message?.model === '<synthetic>') {
+          const text = this.textFromContent(anyMsg.message?.content);
+          if (text && !s.turnErrorEmitted) {
+            log.error('sdk.turn', 'synthetic message surfaced', {
+              sessionId: s.sessionId,
+              corrId: s.sessionId,
+              data: { text: text.slice(0, 500) },
+            });
+            this.bufferEvent(s, { type: 'error', content: text, ts: Date.now() });
+            eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, error: text });
+            s.turnErrorEmitted = true;
+          }
+        }
+
         const content = anyMsg.message?.content;
         if (Array.isArray(content)) {
           for (const block of content) {
@@ -1282,20 +1684,67 @@ class SdkSessionManager {
           void persistSessionModel(s.sessionId, s.model);
         }
         this.emitUsage(s);
-        this.emitHealth(s, false);
         if (anyMsg.subtype === 'success') {
-          console.log(
-            `[SdkSessionManager] ${s.sessionId} turn done: ttft_ms=${anyMsg.ttft_ms ?? '?'} ` +
-              `duration_ms=${anyMsg.duration_ms} warm_spare=${anyMsg.warm_spare_claimed ?? false} ` +
-              `cost_usd=${anyMsg.total_cost_usd}`,
-          );
+          log.info('sdk.turn', 'done', {
+            sessionId: s.sessionId,
+            corrId: s.sessionId,
+            data: {
+              subtype: anyMsg.subtype,
+              durationMs: anyMsg.duration_ms ?? null,
+              ttftMs: anyMsg.ttft_ms ?? null,
+              warmSpare: anyMsg.warm_spare_claimed ?? false,
+              costUsd: anyMsg.total_cost_usd ?? null,
+            },
+          });
+        } else {
+          // A non-success result ends the turn on an error the SDK did NOT throw
+          // (e.g. subtype 'error_during_execution', 'error_max_turns'). Previously
+          // this was swallowed entirely — isProcessing flipped false with nothing
+          // shown. Log it, and if the turn hasn't already surfaced an error (the
+          // synthetic-message path usually has, for auth), surface a fallback so
+          // the UI never just goes silent.
+          const errText =
+            this.textFromContent(anyMsg.result) ||
+            (typeof anyMsg.result === 'string' ? anyMsg.result : '') ||
+            `Turn ended with error (${anyMsg.subtype ?? 'unknown'}).`;
+          log.error('sdk.turn', 'done (error)', {
+            sessionId: s.sessionId,
+            corrId: s.sessionId,
+            data: { subtype: anyMsg.subtype ?? null, durationMs: anyMsg.duration_ms ?? null, result: errText.slice(0, 500) },
+          });
+          if (!s.turnErrorEmitted) {
+            this.bufferEvent(s, { type: 'error', content: errText, ts: Date.now() });
+            eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, error: errText });
+            s.turnErrorEmitted = true;
+          }
         }
+        // AFTER any error surfacing above: the client's session-stream handler
+        // drops events once transcriptLoading is false, and this flips it false.
+        this.emitHealth(s, false);
         break;
       }
     }
   }
 
+  /**
+   * Pull human-readable text out of an SDK message `content` (or a result's
+   * `result` field), which may be a string or an array of content blocks. Used to
+   * surface synthetic/error messages that would otherwise be swallowed.
+   */
+  private textFromContent(content: unknown): string {
+    if (typeof content === 'string') return content.trim();
+    if (Array.isArray(content)) {
+      return content
+        .map((b) => (b && typeof b === 'object' && (b as any).type === 'text' ? String((b as any).text ?? '') : ''))
+        .filter(Boolean)
+        .join(' ')
+        .trim();
+    }
+    return '';
+  }
+
   private emitHealth(s: SdkSession, isProcessing: boolean): void {
+    log.debug('sdk.health', isProcessing ? 'processing' : 'idle', { sessionId: s.sessionId, corrId: s.sessionId });
     eventBus.emitApp({ type: 'session:health', sessionId: s.sessionId, isProcessing, isStuck: false });
   }
 
@@ -1351,7 +1800,24 @@ class SdkSessionManager {
 //     sessionId threw "sdkSessionManager.warmModels is not a function".
 // 18: handle() 'result' case now guards on parent_tool_use_id — a subagent's
 //     result no longer tears down the main turn (isProcessing/closeBuffer).
-const SINGLETON_VERSION = 18;
+// 19: structured logging (lib/logger.ts) throughout handle()/startQuery/consume,
+//     AND the swallowed-error fix — synthetic assistant messages and non-success
+//     results are now surfaced to the client as session:stream {error}. Without
+//     this bump the live instance keeps the old method bodies and neither the
+//     logs nor the error surfacing fire.
+// 20: live-CLI handoff fix (docs/ticket-resume-live-cli-session-hard-kill.md).
+//     startQuery no longer SIGKILLs by session-id match. Ownership is now proven,
+//     never inferred from PID-file fields (kind/entrypoint/startedAt are identical
+//     for Fury's own spawn and an external terminal): PRIMARY is a recorded spawn
+//     pid (custom spawnClaudeCodeProcess → s.spawnedPids), FALLBACK is process
+//     ancestry (parentPidOf(pid) === process.pid). reclaimOwnLeaks kills only our
+//     recorded pids; detectExternalOwner (isFuryOwned = record ∨ ancestry) gates a
+//     confirmed graceful takeover (takeoverExternalOwner, via sendMessage's
+//     confirmTakeover); reapOrphanedProcesses gains the same ancestry safeguard so
+//     its startedAt heuristic can't reap a live external terminal. It and
+//     detectExternalOwner are now async. Without this bump the live instance keeps
+//     the old kill-on-match startQuery and the regression persists.
+const SINGLETON_VERSION = 20;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;
