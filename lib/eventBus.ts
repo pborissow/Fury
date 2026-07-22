@@ -35,6 +35,12 @@ export interface SessionHealthEvent {
   isProcessing: boolean;
   isStuck: boolean;
   stuckReason?: string;
+  /** The in-flight turn's start (ms) — the strip anchor. Present while
+   *  isProcessing is true (sourced from the stream buffer, the SAME value
+   *  /api/stream-buffer returns). The client's latch-break slices partials
+   *  at/after it instead of falling back to the trailing-assistant heuristic,
+   *  which over-strips when a mid-turn prompt was folded into a tool_result. */
+  startedAt?: number;
 }
 
 export interface SessionModelEvent {

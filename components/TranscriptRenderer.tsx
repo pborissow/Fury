@@ -123,7 +123,7 @@ export default function TranscriptRenderer({
             </div>
           )}
           {turn.assistant && (
-            <div className="flex justify-start" ref={i === lastAssistantTurnIndex ? lastAssistantRef : undefined}>
+            <div className="flex justify-start" data-testid="claude-turn" ref={i === lastAssistantTurnIndex ? lastAssistantRef : undefined}>
               <ChatBubble
                 label="Claude"
                 className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border transition-colors"

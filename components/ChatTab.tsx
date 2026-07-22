@@ -21,6 +21,7 @@ import NewSessionModelStep from '@/components/NewSessionModelStep';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
 import { getRecentDirectories } from '@/lib/recent-directories';
 import { uiLog } from '@/lib/clientTelemetry';
+import { stripInFlightPartials } from '@/lib/transcriptStrip';
 import type { Message, TranscriptMsg, HistoryEntry, PendingSession, AskUserQuestionState } from '@/lib/types';
 import type { TurnMeta } from '@/lib/transcriptParser';
 
@@ -50,41 +51,9 @@ interface ChatTabProps {
   openSessionRequest?: { sessionId: string; project: string; display: string; nonce: number } | null;
 }
 
-/**
- * Strip an in-flight turn's partial assistant messages from a freshly-fetched
- * transcript. The JSONL holds every partial the live turn has written; while the
- * stream buffer drives that turn the center panel must show the bouncing dots,
- * not those partials rendered as intermediary bubbles.
- *
- * `startedAt` (the buffer's turn-start ms) is the exact anchor — slice off every
- * message whose timestamp is at/after the turn began. It's preferred over a
- * userPrompt match because a mid-turn "please continue" is folded by the CLI into
- * the next tool_result (array content the parser never emits as a user message),
- * so a string match silently finds nothing.
- *
- * Fallback when the anchor is absent (0): cut the trailing run of assistant
- * messages (everything after the last real user prompt). Without a timestamp
- * anchor this is the best approximation of "this turn's output" and is strictly
- * safer than leaving the raw partials on screen — which was the pre-fix behavior
- * of every branch that trusted an "ended" signal and refetched without stripping.
- */
-function stripInFlightPartials<T extends { role: string; timestamp?: string }>(
-  messages: T[],
-  startedAt: number,
-): T[] {
-  if (startedAt > 0) {
-    const cutIdx = messages.findIndex(m => {
-      if (!m.timestamp) return false;
-      const t = Date.parse(m.timestamp);
-      return Number.isFinite(t) && t >= startedAt;
-    });
-    return cutIdx >= 0 ? messages.slice(0, cutIdx) : messages;
-  }
-  // No anchor — drop the trailing assistant run after the last real user prompt.
-  let end = messages.length;
-  while (end > 0 && messages[end - 1].role === 'assistant') end--;
-  return messages.slice(0, end);
-}
+// stripInFlightPartials moved to lib/transcriptStrip.ts (imported above) so its
+// anchor-vs-fallback behavior can be unit-tested without pulling in this client
+// component. See that file for the rationale on why the startedAt anchor matters.
 
 export default function ChatTab({
   chatHorizontalLayout,

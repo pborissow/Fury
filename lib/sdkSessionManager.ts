@@ -1,4 +1,4 @@
-import { query, type Query, type SDKMessage, type SDKUserMessage, type PermissionResult, type RewindFilesResult, type ModelInfo } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Query, type SDKMessage, type SDKUserMessage, type PermissionResult, type RewindFilesResult, type ModelInfo, type SDKAssistantMessageError } from '@anthropic-ai/claude-agent-sdk';
 import { appendFile } from 'fs/promises';
 import { readdirSync, readFileSync, rmSync } from 'fs';
 import { spawn, execFile, type ChildProcess, type SpawnOptions } from 'child_process';
@@ -1511,7 +1511,26 @@ class SdkSessionManager {
 
     switch (msg.type) {
       case 'system':
-        if (anyMsg.subtype === 'init') this.emitModelIfNew(s, anyMsg.model);
+        if (anyMsg.subtype === 'init') {
+          this.emitModelIfNew(s, anyMsg.model);
+        } else if (anyMsg.subtype === 'api_retry') {
+          // A transient API failure the SDK is AUTO-RETRYING (rate_limit /
+          // overloaded / connection timeout arrive here, NOT as a fatal assistant
+          // error). Surfacing it as session:stream {error} would be wrong — the
+          // turn is still going. Log it for diagnosis and leave turnErrorEmitted
+          // untouched so a genuine later error can still surface exactly once.
+          log.warn('sdk.retry', 'api retry', {
+            sessionId: s.sessionId,
+            corrId: s.sessionId,
+            data: {
+              code: anyMsg.error ?? null,
+              status: anyMsg.error_status ?? null,
+              attempt: anyMsg.attempt ?? null,
+              maxRetries: anyMsg.max_retries ?? null,
+              delayMs: anyMsg.retry_delay_ms ?? null,
+            },
+          });
+        }
         break;
 
       case 'stream_event': {
@@ -1579,26 +1598,46 @@ class SdkSessionManager {
           this.emitModelIfNew(s, anyMsg.message?.model);
         }
 
-        // Surface SDK-injected synthetic messages. `model: '<synthetic>'` marks a
-        // message the SDK fabricated rather than the model producing — the way it
-        // reports failures that DON'T throw, most importantly an expired OAuth
-        // token ("Failed to authenticate: OAuth session expired and could not be
-        // refreshed"). Such a message arrives as a COMPLETE assistant message,
-        // not as stream_event text deltas, so none of the streaming path runs:
-        // the UI would show the dots vanish and then silence (the "are you still
-        // there?" bug in session 87487df4). Emit it as an error so the failure is
-        // visible instead of swallowed. Main thread only — a subagent's synthetic
-        // message is its own business, not a main-turn failure.
-        if (anyMsg.parent_tool_use_id == null && anyMsg.message?.model === '<synthetic>') {
+        // Surface a failure the SDK reports WITHOUT throwing — most importantly an
+        // expired OAuth token. Such a failure arrives as a COMPLETE assistant
+        // message, not as stream_event text deltas, so none of the streaming path
+        // runs: the UI would show the dots vanish and then silence (the "are you
+        // still there?" bug in session 87487df4). Emit it as an error so it's
+        // visible instead of swallowed. Main thread only — a subagent's failure is
+        // its own business, not a main-turn failure.
+        //
+        // PRIMARY signal is the typed `error` field (SDKAssistantMessageError:
+        // 'authentication_failed', 'billing_error', …) — stable and specific.
+        // `model === '<synthetic>'` is only a legacy FALLBACK: it's broader (it
+        // also tags benign injected stubs like compaction / "no response
+        // requested"), so we act on it only when the typed code is absent AND the
+        // synthetic message actually carries text.
+        if (anyMsg.parent_tool_use_id == null && !s.turnErrorEmitted) {
+          const code: SDKAssistantMessageError | undefined = anyMsg.error;
           const text = this.textFromContent(anyMsg.message?.content);
-          if (text && !s.turnErrorEmitted) {
-            log.error('sdk.turn', 'synthetic message surfaced', {
+          const legacySynthetic = !code && anyMsg.message?.model === '<synthetic>' && !!text;
+          // rate_limit / overloaded are TRANSIENT — the SDK retries them (they also
+          // arrive as api_retry system messages) and the turn can still finish
+          // successfully. Surfacing them here would leave a fatal error bubble the
+          // success result never clears (that branch only logs, and turnErrorEmitted
+          // is sticky). A genuinely terminal rate limit comes back as a NON-success
+          // result and is caught by the result branch below.
+          const transient = code === 'rate_limit' || code === 'overloaded';
+          if (transient) {
+            log.warn('sdk.retry', 'assistant transient error (not surfaced)', {
               sessionId: s.sessionId,
               corrId: s.sessionId,
-              data: { text: text.slice(0, 500) },
+              data: { code },
             });
-            this.bufferEvent(s, { type: 'error', content: text, ts: Date.now() });
-            eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, error: text });
+          } else if (code || legacySynthetic) {
+            const errText = this.assistantErrorText(code, text);
+            log.error('sdk.turn', 'assistant error surfaced', {
+              sessionId: s.sessionId,
+              corrId: s.sessionId,
+              data: { code: code ?? null, synthetic: legacySynthetic, text: errText.slice(0, 500) },
+            });
+            this.bufferEvent(s, { type: 'error', content: errText, ts: Date.now() });
+            eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, error: errText });
             s.turnErrorEmitted = true;
           }
         }
@@ -1701,16 +1740,29 @@ class SdkSessionManager {
           // (e.g. subtype 'error_during_execution', 'error_max_turns'). Previously
           // this was swallowed entirely — isProcessing flipped false with nothing
           // shown. Log it, and if the turn hasn't already surfaced an error (the
-          // synthetic-message path usually has, for auth), surface a fallback so
-          // the UI never just goes silent.
-          const errText =
-            this.textFromContent(anyMsg.result) ||
-            (typeof anyMsg.result === 'string' ? anyMsg.result : '') ||
-            `Turn ended with error (${anyMsg.subtype ?? 'unknown'}).`;
+          // assistant-error path usually has, for auth), surface a fallback so the
+          // UI never just goes silent.
+          //
+          // The detail lives in `errors[]` (+ `terminal_reason`), NOT `result` —
+          // only SDKResultSuccess has a `result` string. Reading anyMsg.result
+          // here always got undefined and dropped the real cause; build from the
+          // right fields instead.
+          const detail =
+            Array.isArray(anyMsg.errors) && anyMsg.errors.length
+              ? anyMsg.errors.join('; ')
+              : anyMsg.terminal_reason
+                ? `terminated: ${anyMsg.terminal_reason}`
+                : '';
+          const errText = detail || `Turn ended with error (${anyMsg.subtype ?? 'unknown'}).`;
           log.error('sdk.turn', 'done (error)', {
             sessionId: s.sessionId,
             corrId: s.sessionId,
-            data: { subtype: anyMsg.subtype ?? null, durationMs: anyMsg.duration_ms ?? null, result: errText.slice(0, 500) },
+            data: {
+              subtype: anyMsg.subtype ?? null,
+              terminalReason: anyMsg.terminal_reason ?? null,
+              durationMs: anyMsg.duration_ms ?? null,
+              result: errText.slice(0, 500),
+            },
           });
           if (!s.turnErrorEmitted) {
             this.bufferEvent(s, { type: 'error', content: errText, ts: Date.now() });
@@ -1743,9 +1795,47 @@ class SdkSessionManager {
     return '';
   }
 
+  /**
+   * Human-readable text for a typed assistant error code. The friendly cases get
+   * an actionable message; the rest defer to the SDK's own prose (`text`) and fall
+   * back to a coded string only when there is none. `code` is undefined on the
+   * legacy `<synthetic>` fallback path, where `text` is all we have.
+   */
+  private assistantErrorText(code: SDKAssistantMessageError | undefined, text: string): string {
+    switch (code) {
+      case 'authentication_failed':
+      case 'oauth_org_not_allowed':
+        return 'Authentication failed — your session may have expired. Run `/login` and retry.';
+      case 'billing_error':
+        return 'Billing error — check your plan or credits.';
+      case 'model_not_found':
+        return 'The selected model is unavailable for this account.';
+      case 'max_output_tokens':
+        return text || 'The response reached the maximum output length.';
+      // invalid_request / server_error / overloaded / rate_limit / unknown, or no
+      // code at all (legacy synthetic): the SDK's own text is the most accurate
+      // thing we have — pass it through, else a coded/last-resort fallback.
+      default:
+        return text || (code ? `The model reported an error (${code}).` : 'The model reported an error.');
+    }
+  }
+
   private emitHealth(s: SdkSession, isProcessing: boolean): void {
-    log.debug('sdk.health', isProcessing ? 'processing' : 'idle', { sessionId: s.sessionId, corrId: s.sessionId });
-    eventBus.emitApp({ type: 'session:health', sessionId: s.sessionId, isProcessing, isStuck: false });
+    // Carry the turn's start so the client's latch-break can anchor its re-strip
+    // on the SAME timestamp the initial restore uses (/api/stream-buffer returns
+    // this exact buffer.startedAt). Without it the latch-break anchored on 0 and
+    // fell back to the trailing-assistant heuristic, which over-strips a prior
+    // completed turn when a mid-turn prompt was folded into a tool_result — the
+    // regression the anchor exists to prevent. Only load-bearing on the
+    // isProcessing:true branch; harmless (and still correct) on idle, where the
+    // buffer is closed-but-retained so startedAt is still present.
+    const startedAt = s.streamBuffer?.startedAt;
+    log.debug('sdk.health', isProcessing ? 'processing' : 'idle', {
+      sessionId: s.sessionId,
+      corrId: s.sessionId,
+      data: { startedAt },
+    });
+    eventBus.emitApp({ type: 'session:health', sessionId: s.sessionId, isProcessing, isStuck: false, startedAt });
   }
 
   // NOTE (cost accounting): we emit TOKEN COUNTS only, matching the shipping
@@ -1817,7 +1907,25 @@ class SdkSessionManager {
 //     its startedAt heuristic can't reap a live external terminal. It and
 //     detectExternalOwner are now async. Without this bump the live instance keeps
 //     the old kill-on-match startQuery and the regression persists.
-const SINGLETON_VERSION = 20;
+// 21: SDK error surfacing hardening (docs/ticket-sdk-error-surfacing-improvements.md).
+//     assistant errors are detected via the typed `error` field
+//     (SDKAssistantMessageError) mapped to human text by assistantErrorText, with
+//     `<synthetic>`-with-text kept only as a legacy fallback; the transient codes
+//     rate_limit/overloaded are NOT surfaced here (the SDK retries them and the turn
+//     can still succeed — a fatal bubble would never clear; a terminal one returns as
+//     a non-success result). result errors read detail from errors[]/terminal_reason
+//     (not the nonexistent result field on an error result); system 'api_retry' is
+//     logged (sdk.retry) and NOT surfaced as fatal; error logs carry {code,
+//     terminal_reason, subtype}. Without this bump the live instance keeps the old
+//     <synthetic>/anyMsg.result method bodies.
+// 22: emitHealth now carries the turn's startedAt (from s.streamBuffer?.startedAt,
+//     the same anchor /api/stream-buffer returns) on session:health events, so the
+//     client's latch-break re-strip anchors on the real turn start instead of
+//     falling back to the trailing-assistant heuristic that over-strips an earlier
+//     completed turn (docs/ticket-inflight-partials-health-startedat.md). Without
+//     this bump the live instance keeps the old emitHealth body and ships health
+//     events with no startedAt.
+const SINGLETON_VERSION = 22;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;
