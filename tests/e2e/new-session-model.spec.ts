@@ -201,8 +201,10 @@ test('New Session wizard: a model picked before the first prompt serves the firs
   createdSessions.push(sessionId!);
 
   // Confirm the override round-trips before the first turn (pending, per-session).
+  // The wizard pins the concrete version id the catalog offered (e.g.
+  // claude-haiku-4-5-20251001), not the floating 'haiku' alias.
   const got = await (await page.request.get(`/api/claude-sdk/model?sessionId=${sessionId}`)).json();
-  expect(got.current, 'the wizard-picked model is recorded as the pending override').toBe('haiku');
+  expect(got.current, 'the wizard-picked model is recorded as a concrete Haiku version override').toMatch(/^claude-haiku/);
 
   // ---- First prompt (via API for determinism, cwd pinned to PROJECT) ----
   // Sends stay on the API in this repo's e2e pattern (see build-calculator).

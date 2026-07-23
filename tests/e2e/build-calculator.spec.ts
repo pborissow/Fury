@@ -196,6 +196,15 @@ test('Fury builds a calculator, then stop + rewind reverts the refinement', asyn
   await page.waitForLoadState('domcontentloaded');
   console.log(`[E2E] session=${sessionId}  project=${PROJECT}`);
 
+  // ---- Pin the least-capable model (Haiku) so this build runs cheap ----
+  // A calculator is trivial; there's no reason to spend Opus tokens on it. No
+  // query is open yet, so this is recorded as a PENDING override and replayed
+  // into options.model when the first turn opens the query — the exact mechanism
+  // proven by model-selection.spec.ts ('a model chosen before the first send is
+  // replayed into the new query'). Verified below by asserting the turn-1
+  // transcript is served by Haiku.
+  await post('/api/claude-sdk/model', { sessionId, model: 'haiku' });
+
   // ---- Turn 1: build the calculator ----
   console.log('[E2E] Turn 1: create calculator.js');
   await post('/api/claude-sdk', {

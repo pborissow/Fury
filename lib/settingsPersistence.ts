@@ -26,6 +26,12 @@ export interface AppSettings {
   pricingPollEnabled: boolean;
   /** Days between pricing checks. Calibrated from the last recorded check on boot. */
   pricingPollIntervalDays: number;
+  /** Refresh the selectable model/version catalog (GET /v1/models via the CLI's
+   *  OAuth token) on a schedule. Feeds the model picker's version dropdowns. */
+  modelCatalogPollEnabled: boolean;
+  /** Days between model-catalog refreshes. Calibrated from the last recorded
+   *  check on boot, same durable-timer pattern as the pricing poller. */
+  modelCatalogPollIntervalDays: number;
   /** Route chat turns through the persistent @anthropic-ai/claude-agent-sdk
    *  session manager (lib/sdkSessionManager.ts) instead of the one-shot
    *  `claude --print` manager. Keeps the CLI process alive across turns, so
@@ -55,6 +61,8 @@ const DEFAULTS: AppSettings = {
   bedrockClaudeFailoverEnabled: false,
   pricingPollEnabled: true,
   pricingPollIntervalDays: 7,
+  modelCatalogPollEnabled: true,
+  modelCatalogPollIntervalDays: 7,
   sdkSessionsEnabled: true,
 };
 

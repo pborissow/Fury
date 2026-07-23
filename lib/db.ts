@@ -143,6 +143,38 @@ async function initDb(client: Client): Promise<void> {
       source         TEXT,
       UNIQUE(model, effective_from)
     );
+
+    -- Cached snapshot of the selectable model/version catalog, fetched from the
+    -- Anthropic Models API (GET /v1/models) using the CLI's OAuth token. Unlike
+    -- pricing_overrides this is REPLACED wholesale on each successful refresh —
+    -- it's a point-in-time mirror of what the account can select, not an
+    -- append-only history. Feeds the model picker's per-family version dropdowns.
+    CREATE TABLE IF NOT EXISTS model_catalog (
+      id                TEXT PRIMARY KEY,   -- wire model id passed to setModel()
+      family            TEXT NOT NULL,      -- 'opus' | 'sonnet' | 'haiku' | 'fable' | ...
+      version_label     TEXT NOT NULL,      -- '4.8', '5', '4.5' — the decimal-ish version
+      display_name      TEXT NOT NULL,      -- 'Claude Sonnet 4.6'
+      max_input_tokens  INTEGER,
+      max_output_tokens INTEGER,
+      supports_effort   INTEGER DEFAULT 0,  -- 0/1
+      created_at        TEXT,               -- model release date from the API
+      fetched_at        INTEGER NOT NULL    -- when this snapshot was written
+    );
+    CREATE INDEX IF NOT EXISTS idx_model_catalog_family ON model_catalog(family);
+
+    -- Every model-catalog refresh attempt (ok or failed). The poller calibrates
+    -- its next run from MAX(checked_at) on boot, so a restart doesn't reset the
+    -- weekly cadence — same durable-timer pattern as pricing_checks.
+    CREATE TABLE IF NOT EXISTS model_checks (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      checked_at   INTEGER NOT NULL,
+      status       TEXT NOT NULL,     -- 'ok' | 'failed'
+      http_status  INTEGER,
+      trigger      TEXT,              -- 'scheduled' | 'scheduled-overdue' | 'manual'
+      models_seen  INTEGER DEFAULT 0,
+      note         TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_model_checks_at ON model_checks(checked_at DESC);
   `);
 
   // Migration: add metadata column to existing databases

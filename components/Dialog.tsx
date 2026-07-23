@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { XIcon } from 'lucide-react';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { Button } from '@/components/ui/button';
@@ -86,6 +86,23 @@ export default function Dialog({
     }
     onOpenChange(nextOpen);
   }, [onOpenChange, defaultWidth, defaultHeight, resetOnOpen]);
+
+  // Reset geometry when a parent-CONTROLLED dialog transitions closed → open.
+  // handleOpenChange above only fires for Radix-initiated open changes, so a
+  // dialog opened by flipping the `open` prop (as all consumers here do) never
+  // re-applied its defaults — making resetOnOpen a no-op for controlled dialogs
+  // and letting a stale size (incl. one preserved across Fast Refresh) persist.
+  // Fires only on the false → true edge, so an in-session resize is preserved.
+  const prevOpenRef = useRef(open);
+  useEffect(() => {
+    const wasOpen = prevOpenRef.current;
+    prevOpenRef.current = open;
+    if (open && !wasOpen && resetOnOpen) {
+      setMaximized(false);
+      setPosition({ x: 0, y: 0 });
+      setSize({ width: defaultWidth, height: defaultHeight });
+    }
+  }, [open, resetOnOpen, defaultWidth, defaultHeight]);
 
   // Double-click the header to toggle maximize. Maximizing grows the window to
   // the same 95vw/95vh cap the panel is clamped to and re-centers it; restoring

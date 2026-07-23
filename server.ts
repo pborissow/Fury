@@ -58,6 +58,16 @@ app.prepare().then(() => {
       console.error('[server] Failed to start pricing poller:', err);
     }
 
+    // Start the model-catalog poller (GET /v1/models via the CLI's OAuth token),
+    // calibrated from the last recorded refresh so a restart continues the weekly
+    // cadence. Feeds the model picker's per-family version dropdowns.
+    try {
+      const { rehydrateModelCatalogPoller } = await import('./lib/modelCatalog');
+      await rehydrateModelCatalogPoller();
+    } catch (err) {
+      console.error('[server] Failed to start model-catalog poller:', err);
+    }
+
     // Reap SDK session processes left over from a previous server life. Unlike
     // the state above, SDK sessions can't be rehydrated: the manager is pure
     // in-memory and the SDK offers no way to re-attach to a running CLI. But the

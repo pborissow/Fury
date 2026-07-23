@@ -440,6 +440,7 @@ export async function generateSpeech(text: string, signal?: AbortSignal, setting
     bedrockSmallFastModel: '', bedrockAuthRefreshCmd: '',
     bedrockClaudeFailoverEnabled: false,
     pricingPollEnabled: true, pricingPollIntervalDays: 7,
+    modelCatalogPollEnabled: true, modelCatalogPollIntervalDays: 7,
     sdkSessionsEnabled: true,
   };
   const s = settings || defaultSettings;

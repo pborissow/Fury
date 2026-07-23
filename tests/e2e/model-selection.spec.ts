@@ -319,7 +319,11 @@ test('picker switches a live session to Haiku, and Haiku serves the next turn', 
   // persisted copy a restart silently reverts the session to the default on its
   // next turn. setModel writes it to sessions.metadata; the result handler
   // re-persists until the row exists (it usually doesn't at the first result).
-  const onDisk = await pollAsync(async () => (await loadSessionModel(sessionId)) === 'haiku', 30_000);
+  // The picker pins the CONCRETE version id the catalog offered (e.g.
+  // claude-haiku-4-5-20251001), not the floating 'haiku' alias — pinning a
+  // specific version is the point of the version dropdown. Match the family
+  // prefix so a future dated snapshot doesn't break the assertion.
+  const onDisk = await pollAsync(async () => /^claude-haiku/.test((await loadSessionModel(sessionId)) ?? ''), 30_000);
   console.log(`[E2E] override persisted to sessions.metadata: ${onDisk}`);
   expect(onDisk, 'the override must be persisted, or a restart loses it').toBe(true);
 
@@ -332,9 +336,9 @@ test('picker switches a live session to Haiku, and Haiku serves the next turn', 
     `[E2E] fresh-process listModels current=${afterRestart.current} contextTokens=${afterRestart.contextTokens}`,
   );
   expect(
-    afterRestart.current,
-    'a restarted server must still report the override, not Default',
-  ).toBe('haiku');
+    afterRestart.current ?? '',
+    'a restarted server must still report the pinned Haiku version, not Default',
+  ).toMatch(/^claude-haiku/);
   // contextTokens must read through too, not just the override: it drives the
   // confirm step's cost line AND its window-overflow warning, so a 0 here
   // silently strips both — on precisely the long-lived session you reopened
