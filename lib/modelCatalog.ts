@@ -24,6 +24,7 @@
  * never leaves the server — the picker receives only the parsed catalog.
  */
 
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -75,19 +76,44 @@ function state(): PollerState {
 
 // ---- OAuth token ----
 
+/** Pull `claudeAiOauth.accessToken` out of a raw credentials JSON blob. */
+function parseAccessToken(raw: string): string | null {
+  const tok = JSON.parse(raw)?.claudeAiOauth?.accessToken;
+  return typeof tok === 'string' && tok.length > 0 ? tok : null;
+}
+
 /**
- * The Claude Code OAuth access token from ~/.claude/.credentials.json.
+ * The Claude Code OAuth access token, read from wherever the CLI stores it on
+ * this platform:
+ *   - macOS: the login Keychain, under the generic-password item
+ *     'Claude Code-credentials'. There is NO ~/.claude/.credentials.json on Mac.
+ *   - Linux / everything else: ~/.claude/.credentials.json on disk.
  *
- * Read fresh on every call: the CLI rotates the short-lived access token on disk
- * (~6h TTL), so caching it in-process would go stale. Returns null when the file
- * is absent or malformed — the caller records a failed check and keeps the prior
+ * Read fresh on every call: the CLI rotates the short-lived access token (~6h
+ * TTL), so caching it in-process would go stale. Returns null when it can't be
+ * found or is malformed — the caller records a failed check and keeps the prior
  * snapshot. We do NOT attempt a refresh here; that's the CLI's job.
  */
 export function readOAuthToken(): string | null {
+  // macOS: credentials live in the Keychain, not on disk. Fall through to the
+  // file if the Keychain lookup fails (e.g. a non-standard setup).
+  if (process.platform === 'darwin') {
+    try {
+      const raw = execFileSync(
+        'security',
+        ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
+        { encoding: 'utf8', timeout: 5_000 },
+      );
+      const tok = parseAccessToken(raw);
+      if (tok) return tok;
+    } catch {
+      // fall through to the on-disk credentials file
+    }
+  }
+
   try {
     const raw = readFileSync(join(homedir(), '.claude', '.credentials.json'), 'utf8');
-    const tok = JSON.parse(raw)?.claudeAiOauth?.accessToken;
-    return typeof tok === 'string' && tok.length > 0 ? tok : null;
+    return parseAccessToken(raw);
   } catch {
     return null;
   }
@@ -231,7 +257,9 @@ export async function runModelCatalogCheck(trigger: string): Promise<CheckResult
 
   try {
     const token = readOAuthToken();
-    if (!token) throw new Error('no Claude Code OAuth token found (~/.claude/.credentials.json)');
+    if (!token) throw new Error(
+      'no Claude Code OAuth token found (macOS Keychain "Claude Code-credentials" / ~/.claude/.credentials.json)',
+    );
 
     let entries: CatalogEntry[];
     try {
