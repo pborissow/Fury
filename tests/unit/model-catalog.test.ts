@@ -1,5 +1,14 @@
-import { describe, it, expect } from 'vitest';
-import { parseModel, groupByFamily, familyRank, type CatalogEntry } from '../../lib/modelCatalog';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { parseModel, groupByFamily, familyRank, readOAuthToken, type CatalogEntry } from '../../lib/modelCatalog';
+
+vi.mock('node:child_process', () => ({ execFileSync: vi.fn() }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, readFileSync: vi.fn() };
+});
+
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 /** Real Models-API shapes captured from GET /v1/models on a Max account. */
 const API_SAMPLE = [
@@ -80,6 +89,52 @@ describe('groupByFamily', () => {
     const total = groups.reduce((n, g) => n + g.versions.length, 0);
     expect(total).toBe(entries.length);
     expect(entries.length).toBe(10);
+  });
+});
+
+describe('readOAuthToken', () => {
+  const CREDS = JSON.stringify({ claudeAiOauth: { accessToken: 'tok-abc123' } });
+  const origPlatform = process.platform;
+  const setPlatform = (p: string) =>
+    Object.defineProperty(process, 'platform', { value: p, configurable: true });
+
+  afterEach(() => {
+    setPlatform(origPlatform);
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(readFileSync).mockReset();
+  });
+
+  it('reads the token from the macOS Keychain on darwin', () => {
+    setPlatform('darwin');
+    vi.mocked(execFileSync).mockReturnValue(CREDS as any);
+    expect(readOAuthToken()).toBe('tok-abc123');
+    expect(execFileSync).toHaveBeenCalledWith(
+      'security',
+      ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
+      expect.any(Object),
+    );
+    expect(readFileSync).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the credentials file when the Keychain lookup fails on darwin', () => {
+    setPlatform('darwin');
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('item not found'); });
+    vi.mocked(readFileSync).mockReturnValue(CREDS as any);
+    expect(readOAuthToken()).toBe('tok-abc123');
+    expect(readFileSync).toHaveBeenCalled();
+  });
+
+  it('reads the credentials file directly on non-darwin platforms', () => {
+    setPlatform('linux');
+    vi.mocked(readFileSync).mockReturnValue(CREDS as any);
+    expect(readOAuthToken()).toBe('tok-abc123');
+    expect(execFileSync).not.toHaveBeenCalled();
+  });
+
+  it('returns null when no token can be found anywhere', () => {
+    setPlatform('linux');
+    vi.mocked(readFileSync).mockImplementation(() => { throw new Error('ENOENT'); });
+    expect(readOAuthToken()).toBeNull();
   });
 });
 
