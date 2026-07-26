@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { Leaf } from 'lucide-react';
+import { FRESHNESS_TTL_MS, computeFreshnessView } from '@/lib/freshness';
 
 /**
  * Prompt-cache freshness indicator. The Anthropic prompt cache has a ~5-minute
@@ -14,8 +15,10 @@ import { Leaf } from 'lucide-react';
  * the countdown must not expire mid-turn. Once the turn ends, `lastActiveAt`
  * (the completion/stop time) anchors the 5-minute green→yellow countdown, after
  * which the leaf disappears.
+ *
+ * The appearance decision lives in the pure `computeFreshnessView` (lib/freshness.ts)
+ * so it can be unit-tested; this component only owns the mount clock + tick.
  */
-const TTL_MS = 5 * 60 * 1000;
 const TICK_MS = 15 * 1000;
 
 export default function FreshnessLeaf({
@@ -34,39 +37,22 @@ export default function FreshnessLeaf({
     // Pinned warm while the turn runs — no countdown to tick.
     if (live) return;
     // Static & already expired — no need to tick.
-    if (Date.now() - lastActiveAt >= TTL_MS) return;
+    if (Date.now() - lastActiveAt >= FRESHNESS_TTL_MS) return;
     const id = setInterval(() => {
       setNow(Date.now());
-      if (Date.now() - lastActiveAt >= TTL_MS) clearInterval(id);
+      if (Date.now() - lastActiveAt >= FRESHNESS_TTL_MS) clearInterval(id);
     }, TICK_MS);
     return () => clearInterval(id);
   }, [lastActiveAt, live]);
 
   if (now === null) return null;
 
-  const age = now - lastActiveAt;
-  if (!live && age >= TTL_MS) return null;
-
-  // Interpolate green → yellow across the TTL. Pinned full-green while live.
-  const frac = live ? 0 : Math.min(1, Math.max(0, age / TTL_MS));
-  const hue = 140 - 90 * frac; // 140° green → 50° yellow
-  const sat = 65 + 25 * frac;
-  const light = 45 + 5 * frac;
-  const color = `hsl(${hue} ${sat}% ${light}%)`;
-
-  let title: string;
-  if (live) {
-    title = 'Session active — prompt cache warm';
-  } else {
-    const remainMs = Math.max(0, TTL_MS - age);
-    const m = Math.floor(remainMs / 60000);
-    const s = Math.floor((remainMs % 60000) / 1000);
-    title = `Prompt cache warm · ~${m}m ${s}s of warmth left`;
-  }
+  const view = computeFreshnessView(now, lastActiveAt, live);
+  if (!view) return null;
 
   return (
-    <span title={title} className="flex items-center shrink-0">
-      <Leaf className="h-3 w-3" style={{ color }} />
+    <span title={view.title} className="flex items-center shrink-0">
+      <Leaf className="h-3 w-3" style={{ color: view.color }} />
     </span>
   );
 }

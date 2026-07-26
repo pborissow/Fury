@@ -763,7 +763,17 @@ export default function ChatTab({
             fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
               .then(res => res.json())
               .then(refreshData => {
-                if (refreshData.messages && shouldProcess()) {
+                // Bail if a new turn began streaming between issuing this
+                // completion refetch and its resolution. Background-task turns
+                // now re-assert processing (docs/ticket-background-task-
+                // notification-turns-render-dark.md), so by the time this async
+                // fetch resolves the health latch-break may have already stripped
+                // the new turn's partials and set loading true. Committing the
+                // JSONL here would re-leak those in-flight partials as bubbles on
+                // top of the stripped view; skip and let the next completion /
+                // transcript-updated refetch commit the clean state once the turn
+                // truly ends. Matches the transcript-updated and reconnect guards.
+                if (refreshData.messages && shouldProcess() && !transcriptLoadingRef.current) {
                   setHistoryTranscript(refreshData.messages);
                   setTranscriptOverlayMessages([]);
                   setOverlayInsertPoint(null);
@@ -864,6 +874,21 @@ export default function ChatTab({
       if (!shouldProcess()) return;
       const data = JSON.parse(e.data);
       if (typeof data.contextTokens !== 'number') return;
+      // Anchor the freshness leaf's countdown on ACTUAL API-call activity, not on
+      // the transcriptLoading-gated turn boundary. Each session-usage event
+      // corresponds to a message_start/assistant — an API call that just reset the
+      // 5-min prompt-cache TTL — so stamping here keeps lastActiveAt current
+      // throughout ANY active turn, including background-task notification turns
+      // whose completion stamp (:921) fires only on the transcriptLoading flip
+      // (docs/ticket-freshness-leaf-false-stale.md). This makes the leaf correct
+      // independent of the isProcessing/live signal: even if `live` briefly gaps
+      // mid-activity, the countdown restarts from a fresh timestamp rather than a
+      // stale turn-boundary one, then freezes at the last call when things go idle.
+      // Known limitation (called out in the ticket, not fixed here): session-usage
+      // only flows for the currently-viewed session, so a session live in the
+      // background still anchors its post-idle countdown on entry.timestamp; its
+      // `live` prop (global live-sessions event) still pins it green while active.
+      setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
       setLiveContext(prev => {
         const prior = prev[mySessionId];
         // The window only arrives once the turn's `result` lands, and later
@@ -925,7 +950,17 @@ export default function ChatTab({
         fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
           .then(res => res.json())
           .then(refreshData => {
-            if (refreshData.messages && shouldProcess()) {
+            // Bail if a new turn began streaming between this idle refetch being
+            // issued and its resolution — routine now that background-task turns
+            // re-assert processing (docs/ticket-background-task-notification-turns-
+            // render-dark.md). The health latch-break may have already stripped
+            // the new turn's partials and flipped loading back on; committing the
+            // JSONL here would re-leak those partials as intermediary bubbles.
+            // Skip (incl. the TTS below, which would otherwise announce a stale
+            // intermediate turn) — the next completion refetch commits the clean
+            // state once the turn ends. Matches the transcript-updated (:1033) and
+            // reconnect (:1019) guards.
+            if (refreshData.messages && shouldProcess() && !transcriptLoadingRef.current) {
               setHistoryTranscript(refreshData.messages);
               setTranscriptOverlayMessages([]);
               setOverlayInsertPoint(null);

@@ -181,4 +181,15 @@ Open [http://localhost:3879](http://localhost:3879) in your browser.
 | `npm run build` | Production build |
 | `npm start` | Start production server on port 3879 |
 | `npm run lint` | Run ESLint |
+| `npm test` | Run the Vitest unit suite (fast, no server) |
+| `npm run test:e2e` | Run the Playwright browser/E2E suite (needs the dev server) |
 | `npx tsx scripts/populate-db.ts` | Populate transcript database from existing JSONL files |
+
+### Testing
+
+Fury has two test layers — a fast [Vitest](https://vitest.dev) unit suite (`tests/unit/`) and a
+[Playwright](https://playwright.dev) browser suite (everything else under `tests/`), including a
+few **live drives** that run real Claude turns and spend tokens.
+
+See **[`tests/README.md`](tests/README.md)** for the full breakdown: how to run each layer, which
+specs are token-spending live drives, the shared drive harness, and the directory-by-directory map.

@@ -1536,6 +1536,23 @@ class SdkSessionManager {
       case 'stream_event': {
         const ev = anyMsg.event;
         if (!ev) break;
+        // Re-assert processing when a NEW main-thread turn begins streaming while
+        // the session is marked idle. The SDK runs turns the user never submitted
+        // — most commonly a background task (Monitor/Bash/subagent) posting a
+        // <task-notification> back into the conversation, which is injected as a
+        // user message and drives a full model turn with its own `result`. The
+        // submit path (sendMessage) is the only place that turned dots ON, so
+        // without this such a turn streams with dots off and its partials leak as
+        // intermediary bubbles until it settles (docs/ticket-background-task-
+        // notification-turns-render-dark.md). message_start (or the first delta)
+        // is the earliest signal a turn has begun. Guard to the MAIN thread so a
+        // forwarded subagent block can't flip the session's liveness.
+        if (
+          anyMsg.parent_tool_use_id == null &&
+          (ev.type === 'message_start' || ev.type === 'content_block_delta')
+        ) {
+          this.reassertProcessing(s);
+        }
         if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
           if (!s.ttftEmitted) {
             s.ttftEmitted = true;
@@ -1689,13 +1706,17 @@ class SdkSessionManager {
       }
 
       case 'result': {
-        // Sidechain guard — mirrors the message_start/assistant cases above. Only
-        // the MAIN turn's result ends the turn. If the SDK ever surfaces a
-        // top-level `result` for a subagent (parent_tool_use_id != null), acting
-        // on it would flip isProcessing:false and close the buffer mid-turn — the
-        // exact transient false that makes /api/health report a live session idle
-        // and drops the in-flight view into un-stripped intermediary bubbles.
-        if (anyMsg.parent_tool_use_id != null) break;
+        // NO sidechain guard here — and that is deliberate. SDKResultMessage
+        // (SDKResultSuccess | SDKResultError) has NO parent_tool_use_id field at
+        // all (only assistant/user messages carry it), so the old
+        // `if (anyMsg.parent_tool_use_id != null) break;` was ALWAYS dead code:
+        // the value is forever undefined and the guard never fired. It was added
+        // in v18 for a hypothetical top-level subagent result that the SDK never
+        // emits. Every result ends the current turn; the re-assert on the next
+        // turn's stream activity (above) is what keeps a burst of background-task
+        // turns live. If a real subagent-result discriminator ever appears in the
+        // SDK, key on THAT — don't resurrect the parent_tool_use_id check.
+        const wasProcessing = s.isProcessing;
         s.isProcessing = false;
         this.closeBuffer(s);
         const mu = anyMsg.modelUsage as Record<string, { contextWindow?: number }> | undefined;
@@ -1772,10 +1793,62 @@ class SdkSessionManager {
         }
         // AFTER any error surfacing above: the client's session-stream handler
         // drops events once transcriptLoading is false, and this flips it false.
-        this.emitHealth(s, false);
+        //
+        // Emit idle ONLY when we actually transitioned from processing. A window
+        // of background-task turns produces many back-to-back results; gating on
+        // wasProcessing collapses those to one idle per real processing→idle
+        // cycle instead of a burst of redundant idle events (each of which would
+        // otherwise race the next turn's re-assert). The startedAt-anchored strip
+        // means a brief result→message_start→result flap still re-strips cleanly.
+        if (wasProcessing) this.emitHealth(s, false);
         break;
       }
     }
+  }
+
+  /**
+   * Re-enter the processing/dots state for a turn that began streaming while the
+   * session was marked idle — a turn Fury never submitted (a background task's
+   * <task-notification>, an auto-continue, any SDK-initiated turn). No-op when
+   * already processing, so it never disturbs a normal submitted turn (sendMessage
+   * sets isProcessing before any event arrives) or fires twice within one turn.
+   *
+   * Mirrors sendMessage's per-turn setup: reopen a FRESH stream buffer with a new
+   * startedAt (the strip anchor the client's latch-break re-strips on — reuses the
+   * v22 startedAt-on-health work), reset the per-turn tally and flags, then
+   * emitHealth(true). The buffer MUST be set before emitHealth so the re-emitted
+   * session:health carries the new turn's anchor, not a stale/closed one.
+   */
+  private reassertProcessing(s: SdkSession): void {
+    if (s.isProcessing) return;
+    const now = Date.now();
+    s.isProcessing = true;
+    s.startedAt = now;
+    s.turnStartedAt = now;
+    s.ttftEmitted = false;
+    s.turnErrorEmitted = false;
+    // A background turn has no user-typed prompt; the client strips its partials
+    // by the startedAt anchor, not userPrompt, so an empty prompt is correct here.
+    s.streamBuffer = {
+      userPrompt: '',
+      accumulatedText: '',
+      events: [],
+      isActive: true,
+      startedAt: now,
+    };
+    // Per-turn token tally is session-lived here, so reset it as sendMessage does
+    // or turnTokens would silently become cumulative across the notification turns.
+    // UI effect: the live turn-token counter visibly restarts at 0 for each
+    // background turn — correct (each is its own turn), just cosmetically distinct
+    // from one continuous submit→result count.
+    s.usageByMsg.clear();
+    s.lastEmittedTokens = -1;
+    log.info('sdk.turn', 'reassert', {
+      sessionId: s.sessionId,
+      corrId: s.sessionId,
+      data: { startedAt: now },
+    });
+    this.emitHealth(s, true);
   }
 
   /**
@@ -1925,7 +1998,20 @@ class SdkSessionManager {
 //     completed turn (docs/ticket-inflight-partials-health-startedat.md). Without
 //     this bump the live instance keeps the old emitHealth body and ships health
 //     events with no startedAt.
-const SINGLETON_VERSION = 22;
+// 23: background-task turns keep dots (docs/ticket-background-task-notification-
+//     turns-render-dark.md). handle() now RE-ASSERTS processing when a main-thread
+//     turn begins streaming (message_start / first content_block_delta) while the
+//     session is marked idle — the SDK runs turns the user never submitted (a
+//     background Monitor/Bash/subagent posting a <task-notification>), and only the
+//     submit path used to turn dots on, so those turns streamed dark and leaked
+//     partial bubbles. reassertProcessing reopens a fresh stream buffer with a new
+//     startedAt and emits session:health {processing,startedAt}, which the client's
+//     v22 latch-break re-strips on. The 'result' case now emits idle only when
+//     transitioning from processing (collapsing a burst of background-turn results
+//     to one idle per cycle) and its always-dead parent_tool_use_id sidechain guard
+//     was removed (results carry no such field). Without this bump the live instance
+//     keeps the old submit-only dots and flips idle at the first result.
+const SINGLETON_VERSION = 23;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

@@ -22,70 +22,18 @@
  */
 import { test, expect } from '@playwright/test';
 import { randomUUID } from 'crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
-import { homedir } from 'os';
+import { existsSync } from 'fs';
 import { join } from 'path';
-import { findSessionJsonlDir } from '../../lib/sessionPaths';
+import {
+  sleep, reapPidFiles, furyLogLinesFor, resetProjectDir, driveTurn, cleanupSession,
+} from './drive-helpers';
 
 const PROJECT = join(__dirname, '..', '..', '..', 'fury-e2e-inflight');
-const BASE_URL = 'http://localhost:3879';
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-const jsonlPath = (sessionId: string): string | null => {
-  const loc = findSessionJsonlDir(sessionId, PROJECT);
-  return loc ? join(loc.dir, `${sessionId}.jsonl`) : null;
-};
-
-function reapPidFiles(match: (entry: any) => boolean): void {
-  const dir = join(homedir(), '.claude', 'sessions');
-  if (!existsSync(dir)) return;
-  for (const f of readdirSync(dir)) {
-    if (!f.endsWith('.json')) continue;
-    const full = join(dir, f);
-    try {
-      const e = JSON.parse(readFileSync(full, 'utf8'));
-      if (match(e) && typeof e.pid === 'number') {
-        try { process.kill(e.pid, 'SIGKILL'); } catch { /* dead */ }
-        try { rmSync(full); } catch { /* leave stale */ }
-      }
-    } catch { /* skip */ }
-  }
-}
-
-/** All fury-log entries for a session, across daily files. */
-function furyLogLinesFor(sessionId: string): any[] {
-  const dir = join(homedir(), '.claude', 'fury-logs');
-  if (!existsSync(dir)) return [];
-  const out: any[] = [];
-  for (const f of readdirSync(dir)) {
-    if (!f.endsWith('.jsonl')) continue;
-    for (const line of readFileSync(join(dir, f), 'utf8').split('\n')) {
-      if (!line.trim()) continue;
-      try { const e = JSON.parse(line); if (e.sessionId === sessionId) out.push(e); } catch { /* partial */ }
-    }
-  }
-  return out;
-}
 
 let createdSessionId: string | null = null;
 
 test.afterAll(async () => {
-  if (!createdSessionId) return;
-  try {
-    await fetch(
-      `${BASE_URL}/api/session?sessionId=${encodeURIComponent(createdSessionId)}&project=${encodeURIComponent(PROJECT)}`,
-      { method: 'DELETE' },
-    );
-  } catch { /* server down — disk fallback below */ }
-  try { const p = jsonlPath(createdSessionId); if (p) rmSync(p); } catch { /* best effort */ }
-  reapPidFiles((e) => e.sessionId === createdSessionId);
-  try {
-    const hist = join(homedir(), '.claude', 'history.jsonl');
-    if (existsSync(hist)) {
-      const kept = readFileSync(hist, 'utf8').split('\n').filter((l) => !l.includes(createdSessionId!));
-      writeFileSync(hist, kept.join('\n'));
-    }
-  } catch { /* best effort */ }
+  await cleanupSession(createdSessionId, PROJECT);
 });
 
 test('in-flight partials stay stripped across health ticks; health carries startedAt', async ({ page }) => {
@@ -95,10 +43,7 @@ test('in-flight partials stay stripped across health ticks; health carries start
   createdSessionId = sessionId;
 
   reapPidFiles((e) => String(e.cwd || '').replace(/\\/g, '/').includes('/fury-e2e-inflight'));
-  for (let i = 0; i < 6; i++) {
-    try { rmSync(PROJECT, { recursive: true, force: true }); break; } catch { await sleep(500); }
-  }
-  mkdirSync(PROJECT, { recursive: true });
+  await resetProjectDir(PROJECT);
 
   await page.goto('/');
   await page.waitForLoadState('domcontentloaded');
@@ -112,8 +57,8 @@ test('in-flight partials stay stripped across health ticks; health carries start
     'time and strictly in order: for each stepN.js, first write the file with exactly ' +
     '`module.exports = () => N;`, then run `node -e "console.log(require(\'./stepN.js\')())"` ' +
     'to verify it prints N before moving to the next. Do not create any other files. No explanation.';
-  const res = await page.request.post('/api/claude-sdk', { data: { prompt, sessionId, projectPath: PROJECT } });
-  expect(res.ok(), '/api/claude-sdk accepts the turn').toBe(true);
+  const res = await driveTurn(sessionId, PROJECT, prompt);
+  expect(res.ok, '/api/claude-sdk accepts the turn').toBe(true);
 
   // Open the session in the UI so the transcript + dots render.
   await page.reload();
@@ -121,7 +66,14 @@ test('in-flight partials stay stripped across health ticks; health carries start
   const row = page.locator('.group\\/session').filter({ hasText: 'Create five files' }).first();
   await expect(row, 'session appears in the sidebar').toBeVisible({ timeout: 30_000 });
   await row.click();
-  await expect(page.getByTestId('send-button'), 'viewing the session shows the composer').toBeVisible({ timeout: 20_000 });
+  // The composer's action button is testid'd conditionally — 'stop-button' while
+  // the turn is processing (which it is right now), 'send-button' at rest
+  // (RichTextEditor.tsx). Accept either so this confirms the session view opened
+  // without assuming the turn's phase.
+  await expect(
+    page.getByTestId('send-button').or(page.getByTestId('stop-button')),
+    'viewing the session shows the composer',
+  ).toBeVisible({ timeout: 20_000 });
 
   const dots = page.getByTestId('processing-dots');
   await expect(dots, 'dots appear during the turn').toBeVisible({ timeout: 30_000 });
