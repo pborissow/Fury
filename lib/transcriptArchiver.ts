@@ -10,6 +10,7 @@ import { join } from 'path';
 import { getDb } from './db';
 import { eventBus } from './eventBus';
 import { parseTranscriptJsonl, type TranscriptMessage, type UsageEvent } from './transcriptParser';
+import { parseSubagentUsageEvents, subagentsDirFor } from './subagentUsage';
 import { projectPathToSlug } from './utils';
 
 export interface SessionMetadata {
@@ -133,6 +134,18 @@ export async function archiveTranscript(
     return;
   }
 
+  // Ingest subagent (sidechain) usage from the sidecar transcripts and fold it into
+  // the usage set. Centralized here so EVERY archive path (reactive watch, boot
+  // scan, re-archive) captures it: the SDK writes subagent turns to
+  // <sid>/subagents/agent-*.jsonl, absent from the main JSONL, so without this Stats
+  // undercounts a delegated session by up to ~10x
+  // (docs/ticket-stats-undercount-subagent-tokens.md). Only when the caller passed a
+  // main-thread set (usage-bearing archive) — a usage-less call stays usage-less so
+  // it can't wipe/rewrite analytics.
+  const usageEvents = opts?.usageEvents
+    ? [...opts.usageEvents, ...(await parseSubagentUsageEvents(subagentsDirFor(sessionId, project)))]
+    : undefined;
+
   // Resolve the context window before writing usage_events. The window can't be
   // recovered from the transcript, so a caller that doesn't know it (e.g. the
   // file-watch archive path, which runs without a live session) must inherit the
@@ -178,7 +191,7 @@ export async function archiveTranscript(
   ];
   // Only wipe usage_events when the caller is providing a fresh set — callers
   // that omit usageEvents (if any) must not silently clear the analytics data.
-  if (opts?.usageEvents) {
+  if (usageEvents) {
     preamble.push({ sql: 'DELETE FROM usage_events WHERE session_id = ?', args: [sessionId] });
   }
 
@@ -196,12 +209,15 @@ export async function archiveTranscript(
       args: [sessionId, i, lines[i]],
     });
   }
-  if (opts?.usageEvents) {
-    for (const u of opts.usageEvents) {
+  if (usageEvents) {
+    for (const u of usageEvents) {
       inserts.push({
-        sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read, context_window, is_sidechain)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        args: [sessionId, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead, contextWindow, u.isSidechain ? 1 : 0],
+        sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read, context_window, is_sidechain, agent_id)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        // Sidechain rows carry the parent's window as 0: a subagent runs its own
+        // context under a possibly different model, so the parent's window must not
+        // be attributed to it (Stats already excludes is_sidechain from window).
+        args: [sessionId, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead, u.isSidechain ? 0 : contextWindow, u.isSidechain ? 1 : 0, u.agentId ?? null],
       });
     }
   }
@@ -218,7 +234,7 @@ export async function archiveTranscript(
   // All batches succeeded — stamp the real hash and merge metadata atomically
   const nc = opts?.numCompactions ?? 0;
   const tot = opts?.totalOutputTokens;
-  const wroteUsage = Array.isArray(opts?.usageEvents);
+  const wroteUsage = Array.isArray(usageEvents);
   const ctxTok = opts?.contextTokens;
   const hasMeta =
     nc > 0 || typeof tot === 'number' || wroteUsage || typeof ctxTok === 'number' || contextWindow > 0;
@@ -243,7 +259,9 @@ export async function archiveTranscript(
     // aggregates, without re-summing. See lib/db.ts.
     if (wroteUsage) {
       meta.hasUsageEvents = true;
-      meta.totalTokens = opts!.usageEvents!.reduce(
+      // Includes subagent tokens (folded into usageEvents above), so the session
+      // list's total matches the Stats aggregate for delegated sessions too.
+      meta.totalTokens = usageEvents!.reduce(
         (s, u) => s + u.input + u.output + u.cacheWrite + u.cacheRead, 0);
     }
     // Current context occupancy + the window it's measured against. The session
@@ -630,7 +648,7 @@ const LISTENER_KEY = '__fury_archive_listener__';
  * Used by the reactive listener — silently skips if the file
  * doesn't exist or the content hasn't changed.
  */
-async function archiveSessionFromDisk(
+export async function archiveSessionFromDisk(
   sessionId: string,
   project: string,
   display?: string

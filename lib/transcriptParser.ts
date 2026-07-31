@@ -65,6 +65,10 @@ export interface UsageEvent {
    *  context with its own (possibly different) model, so anything reasoning
    *  about the MAIN thread's context or window must exclude it. */
   isSidechain: boolean;
+  /** The subagent id this event came from (the `agent-<id>.jsonl` sidecar), or
+   *  null/undefined for a main-thread event. Set by parseSubagentUsageEvents;
+   *  persisted to usage_events.agent_id for per-subagent cost drill-down. */
+  agentId?: string | null;
 }
 
 const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);

@@ -17,6 +17,13 @@ import { PRICING, PRICING_AS_OF } from './pricing';
 
 const GLOBAL_KEY = '__fury_db__';
 const PROMISE_KEY = '__fury_db_promise__';
+const SCHEMA_VER_KEY = '__fury_db_schema_v__';
+const REMIGRATE_KEY = '__fury_db_remigrate__';
+// Bump when adding a migration that the archiver/reader relies on, so a Next.js HMR
+// (which reuses the globalThis-cached DB client and would NOT re-run initDb) applies
+// it without a full restart — otherwise the reloaded archiver could INSERT/SELECT a
+// column the live schema still lacks. initDb is idempotent, so re-running it is safe.
+const SCHEMA_VERSION = 2; // 2: usage_events.agent_id + subagent-usage backfill
 
 function getDbPath(): string {
   const dbFile = join(homedir(), '.claude', 'fury.db');
@@ -89,6 +96,10 @@ async function initDb(client: Client): Promise<void> {
       -- context/window per event MUST exclude it or a subagent's ~3k call reads
       -- as the main thread's context.
       is_sidechain INTEGER NOT NULL DEFAULT 0,
+      -- For a sidechain row, the subagent it came from (agent-<id>.jsonl); NULL for
+      -- main-thread rows. Enables per-subagent cost drill-down. The message_id is
+      -- also namespaced "<agent_id>:<msgId>" so two subagents can't collide on the PK.
+      agent_id TEXT,
       PRIMARY KEY (session_id, message_id)
     );
     CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_events(session_id);
@@ -244,6 +255,37 @@ async function initDb(client: Client): Promise<void> {
     await client.execute('ALTER TABLE usage_events ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0');
   } catch {
     // Column already exists — expected after first migration
+  }
+
+  // Migration: per-subagent attribution for sidechain rows. NULL for main thread.
+  try {
+    await client.execute('ALTER TABLE usage_events ADD COLUMN agent_id TEXT');
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
+  // One-time backfill: ingest historical subagent (sidechain) usage. Subagent turns
+  // live in <slug>/<sid>/subagents/agent-*.jsonl, which the archiver didn't read
+  // before — so every delegated session undercounted cost (up to ~10x). Guarded by a
+  // marker so the (heavy) disk scan runs ONCE, and run in the BACKGROUND so a large
+  // scan never blocks server boot. See docs/ticket-stats-undercount-subagent-tokens.md.
+  try {
+    await client.execute('CREATE TABLE IF NOT EXISTS schema_flags (key TEXT PRIMARY KEY, ts INTEGER)');
+    const done = await client.execute({
+      sql: 'SELECT 1 FROM schema_flags WHERE key = ? LIMIT 1',
+      args: ['subagent_usage_backfill_v1'],
+    });
+    if (!done.rows.length) {
+      // Fire-and-forget: don't hold up init on a big re-archive.
+      void backfillSubagentUsage()
+        .then(() => client.execute({
+          sql: 'INSERT OR IGNORE INTO schema_flags (key, ts) VALUES (?, ?)',
+          args: ['subagent_usage_backfill_v1', Date.now()],
+        }))
+        .catch((e) => console.error('[DB] subagent usage backfill failed:', e));
+    }
+  } catch (e) {
+    console.error('[DB] subagent usage backfill setup failed:', e);
   }
 
   // Migration: backfill numCompactions metadata for existing archived sessions.
@@ -613,7 +655,19 @@ async function syncPricingLog(client: Client): Promise<void> {
  */
 export function getDb(): Promise<Client> {
   const g = globalThis as any;
-  if (g[GLOBAL_KEY]) return Promise.resolve(g[GLOBAL_KEY] as Client);
+  if (g[GLOBAL_KEY]) {
+    // Client survives HMR. If migrations were added since it was initialized,
+    // re-run initDb (idempotent, single-flight) BEFORE handing the client back, so
+    // callers never touch a column the live schema lacks.
+    if (g[SCHEMA_VER_KEY] === SCHEMA_VERSION) return Promise.resolve(g[GLOBAL_KEY] as Client);
+    if (!g[REMIGRATE_KEY]) {
+      g[REMIGRATE_KEY] = initDb(g[GLOBAL_KEY] as Client)
+        .then(() => { g[SCHEMA_VER_KEY] = SCHEMA_VERSION; })
+        .catch((err: unknown) => { console.error('[DB] re-migration failed:', err); })
+        .finally(() => { delete g[REMIGRATE_KEY]; });
+    }
+    return (g[REMIGRATE_KEY] as Promise<void>).then(() => g[GLOBAL_KEY] as Client);
+  }
   if (g[PROMISE_KEY]) return g[PROMISE_KEY] as Promise<Client>;
 
   g[PROMISE_KEY] = (async () => {
@@ -621,6 +675,7 @@ export function getDb(): Promise<Client> {
       const client = createClient({ url: getDbPath() });
       await initDb(client);
       g[GLOBAL_KEY] = client;
+      g[SCHEMA_VER_KEY] = SCHEMA_VERSION;
 
       // Kick off startup scan (fire-and-forget, don't block callers)
       scanAndArchiveAll(client).catch(err =>
@@ -671,6 +726,52 @@ async function buildHistoryMap(): Promise<Map<string, HistoryInfo>> {
     }
   } catch { /* history.jsonl may not exist */ }
   return map;
+}
+
+/**
+ * One-time backfill of historical subagent usage. Finds every session that has a
+ * `<slug>/<sid>/subagents/agent-*.jsonl` sidecar, and re-archives it through the
+ * (now sidecar-aware) archiveSessionFromDisk so its subagent tokens land in
+ * usage_events with is_sidechain=1. Idempotent — archiveTranscript wipes+reinserts
+ * usage_events per session; invalidating the hash first forces the re-archive since
+ * the MAIN JSONL is unchanged. Best-effort per session so one bad file can't abort
+ * the whole backfill. See docs/ticket-stats-undercount-subagent-tokens.md.
+ */
+async function backfillSubagentUsage(): Promise<void> {
+  const db = await getDb();
+  const projectsBase = join(homedir(), '.claude', 'projects');
+  let slugs: string[];
+  try { slugs = await readdir(projectsBase); } catch { return; }
+  const { archiveSessionFromDisk } = await import('./transcriptArchiver');
+
+  let backfilled = 0;
+  for (const slug of slugs) {
+    const slugDir = join(projectsBase, slug);
+    let entries: import('fs').Dirent[];
+    try { entries = await readdir(slugDir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const sid = e.name; // <slug>/<sid>/ holds the subagents sidecar dir
+      let hasSub = false;
+      try {
+        const subFiles = await readdir(join(slugDir, sid, 'subagents'));
+        hasSub = subFiles.some((f) => f.startsWith('agent-') && f.endsWith('.jsonl'));
+      } catch { continue; }
+      if (!hasSub) continue;
+      // Only sessions we've archived (so we have their real project path).
+      const row = await db.execute({ sql: 'SELECT project FROM sessions WHERE session_id = ? LIMIT 1', args: [sid] });
+      const project = row.rows[0]?.project as string | undefined;
+      if (!project) continue;
+      try {
+        await db.execute({ sql: 'UPDATE sessions SET jsonl_hash = NULL WHERE session_id = ?', args: [sid] });
+        await archiveSessionFromDisk(sid, project);
+        backfilled++;
+      } catch (err) {
+        console.error(`[DB] subagent backfill re-archive failed for ${sid}:`, err);
+      }
+    }
+  }
+  if (backfilled) console.log(`[DB] subagent usage backfill: re-archived ${backfilled} delegated session(s)`);
 }
 
 async function scanAndArchiveAll(client: Client): Promise<void> {
