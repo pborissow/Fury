@@ -1,6 +1,6 @@
 import { query, type Query, type SDKMessage, type SDKUserMessage, type PermissionResult, type RewindFilesResult, type ModelInfo, type SDKAssistantMessageError } from '@anthropic-ai/claude-agent-sdk';
 import { appendFile } from 'fs/promises';
-import { readdirSync, readFileSync, rmSync } from 'fs';
+import { readdirSync, readFileSync, rmSync, statSync } from 'fs';
 import { spawn, execFile, type ChildProcess, type SpawnOptions } from 'child_process';
 import { promisify } from 'util';
 import { homedir } from 'os';
@@ -141,6 +141,15 @@ interface SdkSession {
   // wedge a stale "live". Per-process — reset to empty whenever a new CLI is spawned
   // (startQuery) and on teardown (stop/kill).
   backgroundTasks: Set<string>;
+  // Whether a background_tasks_changed LEVEL signal has arrived for the CURRENT CLI
+  // process. Until it has, backgroundActive falls back to a durable scan of the
+  // session's subagent transcripts on disk — so a subagent already in flight when
+  // the code (re)loads still reads as live, instead of going dark because the new
+  // manager instance's in-memory set is empty (the reload gap). Once the level
+  // fires it's authoritative (it re-emits the FULL set, including pre-load tasks),
+  // so the disk fallback is disabled to avoid a stale-window over-report. Reset with
+  // backgroundTasks on a new process (startQuery).
+  sawBackgroundLevelSignal?: boolean;
   // The user's chosen model for this session, or undefined for the CLI default.
   // Load-bearing in TWO places, because the query object comes and goes:
   //   1. Pushed live via Query.setModel() when a query is open (no restart).
@@ -194,6 +203,15 @@ const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
 const PROCESS_STARTED_AT = Date.now() - Math.floor(process.uptime() * 1000);
 
 const execFileP = promisify(execFile);
+
+// Don't run the background-reconcile timer under vitest (it imports this module):
+// an unref'd interval would still keep re-scanning the real ~/.claude during tests.
+const IN_TEST = !!process.env.VITEST || process.env.NODE_ENV === 'test';
+
+/** A subagent transcript written within this window is treated as "still running".
+ *  Past it we fail toward NOT-live, so a crashed/stalled subagent can't pin a
+ *  session green forever (docs ticket "Additional fix required"). */
+const SUBAGENT_RUNNING_WINDOW_MS = 120_000;
 
 /** Liveness probe: signal 0 throws iff the pid is gone (or not ours to signal). */
 function pidAlive(pid: number): boolean {
@@ -281,6 +299,14 @@ class SdkSessionManager {
    *  stale-LIVE-while-idle bug). Populated in spawnClaudeCodeProcess, pruned on the
    *  child's 'exit', and carried across HMR by adoptSessionsFrom. */
   private spawnedProcs = new Map<number, string>();
+  /** Short-TTL cache for the durable subagent-transcript scan (hasRecentSubagentActivity),
+   *  so the frequent live-set recompute doesn't stat the subagents dir on every call. */
+  private subagentActivityCache = new Map<string, { at: number; active: boolean }>();
+  /** Last backgroundActive value emitted per session, so the reconcile tick only
+   *  fires a session:health event on an actual transition (not every tick). */
+  private lastBgActive = new Map<string, boolean>();
+  /** The background-reconcile heartbeat (see startReconcile). */
+  private reconcileTimer: NodeJS.Timeout | null = null;
   /** Last catalog any session reported, for sessions with no live query to ask.
    *  See listModels() for why this is served with live:false. */
   private lastKnownModels: ModelInfo[] | null = null;
@@ -1159,7 +1185,7 @@ class SdkSessionManager {
   getBackgroundActiveSessionIds(): string[] {
     const ids: string[] = [];
     for (const [id, s] of this.sessions) {
-      if (s.backgroundTasks.size > 0 && s.q) ids.push(id);
+      if (s.q && this.computeBackgroundActive(s)) ids.push(id);
     }
     return ids;
   }
@@ -1168,7 +1194,92 @@ class SdkSessionManager {
    *  and /api/health, which drive the client's background-work dots. */
   isBackgroundActive(sessionId: string): boolean {
     const s = this.sessions.get(sessionId);
-    return !!(s && s.backgroundTasks.size > 0 && s.q);
+    return !!(s && s.q && this.computeBackgroundActive(s));
+  }
+
+  /**
+   * Is the session doing background work right now? Two sources:
+   *   1. The live-observed set (background_tasks_changed) — authoritative once the
+   *      current CLI process has emitted its first level signal.
+   *   2. FALLBACK, only until that first level: a durable scan of the session's
+   *      subagent transcripts on disk. This covers a subagent already in flight when
+   *      the code (re)loaded, whose dispatch we never observed — the reload gap the
+   *      ticket's follow-up calls out. Gated on !sawBackgroundLevelSignal so the
+   *      authoritative set takes over cleanly (no post-completion over-report).
+   */
+  private computeBackgroundActive(s: SdkSession): boolean {
+    if (s.backgroundTasks.size > 0) return true;
+    if (s.sawBackgroundLevelSignal) return false;
+    return this.hasRecentSubagentActivity(s);
+  }
+
+  /**
+   * Durable liveness probe: has any of the session's subagent transcripts
+   * (`<projects>/<slug>/<sid>/subagents/agent-*.jsonl`) been written within
+   * SUBAGENT_RUNNING_WINDOW_MS? A running subagent keeps appending, so a recent
+   * mtime ⇒ still working; past the window we fail toward not-live. Cached briefly
+   * so the frequent live-set recompute doesn't stat the dir every call.
+   */
+  private hasRecentSubagentActivity(s: SdkSession): boolean {
+    const now = Date.now();
+    const cached = this.subagentActivityCache.get(s.sessionId);
+    if (cached && now - cached.at < 5_000) return cached.active;
+
+    let active = false;
+    try {
+      const dir = this.subagentsDir(s);
+      if (dir) {
+        for (const f of readdirSync(dir)) {
+          if (!f.startsWith('agent-') || !f.endsWith('.jsonl')) continue;
+          if (now - statSync(join(dir, f)).mtimeMs < SUBAGENT_RUNNING_WINDOW_MS) { active = true; break; }
+        }
+      }
+    } catch { /* no dir / unreadable ⇒ not active */ }
+    this.subagentActivityCache.set(s.sessionId, { at: now, active });
+    return active;
+  }
+
+  /** `<transcript dir>/<sid>/subagents`, or null if the project/dir isn't known. */
+  private subagentsDir(s: SdkSession): string | null {
+    if (!s.projectPath) return null;
+    const loc = findSessionJsonlDir(s.sessionId, s.projectPath);
+    return loc ? join(loc.dir, s.sessionId, 'subagents') : null;
+  }
+
+  /**
+   * Heartbeat that keeps backgroundActive correct with NO live event to hang off.
+   * The PID scanner only emits when its process set CHANGES, so a warm process that
+   * is already alive triggers no live-set recompute — meaning a background subagent
+   * that started BEFORE a code reload would never re-light the badge on its own
+   * (the ticket's follow-up gap). This tick re-evaluates each live session's
+   * backgroundActive (incl. the durable disk fallback) and, on a transition while
+   * the MAIN turn is idle, emits session:health — which drives both the Live badge
+   * (events-route recompute) and the dots (client). unref'd so it never holds the
+   * process open; not started under tests.
+   */
+  startReconcile(): void {
+    if (this.reconcileTimer || IN_TEST) return;
+    this.reconcileTimer = setInterval(() => this.reconcileBackgroundActivity(), 8_000);
+    this.reconcileTimer.unref();
+  }
+
+  /** Stop the heartbeat — called on the OLD instance during an HMR swap so timers
+   *  don't accumulate across reloads. */
+  stopReconcile(): void {
+    if (this.reconcileTimer) { clearInterval(this.reconcileTimer); this.reconcileTimer = null; }
+  }
+
+  private reconcileBackgroundActivity(): void {
+    for (const [id, s] of this.sessions) {
+      if (!s.q) { this.lastBgActive.delete(id); continue; }
+      const active = this.computeBackgroundActive(s);
+      const prev = this.lastBgActive.get(id) ?? false;
+      if (active === prev) continue;
+      this.lastBgActive.set(id, active);
+      // A processing main turn drives its own health; only nudge when idle so the
+      // reconcile never fights an in-flight turn's state.
+      if (!s.isProcessing) this.emitHealth(s, false);
+    }
   }
 
   /**
@@ -1478,6 +1589,7 @@ class SdkSessionManager {
     // let the fresh process repopulate it — otherwise a stale task from the prior
     // process would pin the session "live" until the next membership change.
     s.backgroundTasks.clear();
+    s.sawBackgroundLevelSignal = false;
 
     const cwd = s.projectPath || process.cwd();
     const existing = findSessionJsonlDir(s.sessionId, cwd) !== null;
@@ -1634,6 +1746,10 @@ class SdkSessionManager {
           s.backgroundTasks = new Set<string>(
             tasks.map((t: { task_id?: unknown }) => t?.task_id).filter((id: unknown): id is string => typeof id === 'string'),
           );
+          // The live level is now authoritative for this process; stop using the
+          // durable disk fallback (it would otherwise linger for the staleness window
+          // after the last task completes).
+          s.sawBackgroundLevelSignal = true;
           log.info('sdk.bg', 'background tasks changed', {
             sessionId: s.sessionId,
             corrId: s.sessionId,
@@ -2035,7 +2151,9 @@ class SdkSessionManager {
     // Live iff the main turn is processing OR a background task is still running.
     // The client shows the dots on either, and the events route counts this toward
     // the Live badge — closing the dark gap between the orchestrator's turns.
-    const backgroundActive = s.backgroundTasks.size > 0;
+    // computeBackgroundActive includes the durable disk fallback for tasks in flight
+    // across a code reload.
+    const backgroundActive = this.computeBackgroundActive(s);
     log.debug('sdk.health', isProcessing ? 'processing' : 'idle', {
       sessionId: s.sessionId,
       corrId: s.sessionId,
@@ -2167,15 +2285,27 @@ class SdkSessionManager {
 //     getFuryWarmSessionIds() derives the warm set from it, and computeLiveSessionIds
 //     + both live-session routes subtract it independent of the map. Without this bump
 //     the live instance keeps the old spawn body and never records spawnedProcs.
-const SINGLETON_VERSION = 26;
+// 27: reconcile background liveness ACROSS a code reload (ticket follow-up). A
+//     subagent already in flight when the module reloads left the new instance's
+//     backgroundTasks empty → dark. backgroundActive now falls back (until the CLI's
+//     first level signal this process) to a durable scan of the session's
+//     subagents/agent-*.jsonl mtimes (computeBackgroundActive/hasRecentSubagentActivity),
+//     and an unref'd reconcile heartbeat emits session:health on transitions so the
+//     badge + dots re-light without a scanner change. Fails toward not-live after
+//     SUBAGENT_RUNNING_WINDOW_MS. Without this bump the live instance keeps the old
+//     level-only emitHealth and the reload gap stays dark.
+const SINGLETON_VERSION = 27;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;
 };
 if (!globalForSdk.__sdkSessionManager || globalForSdk.__sdkSessionManagerV !== SINGLETON_VERSION) {
   const previous = globalForSdk.__sdkSessionManager;
+  // Stop the OLD instance's reconcile heartbeat so timers don't pile up across HMR.
+  try { previous?.stopReconcile(); } catch { /* older instance without the method */ }
   const replacement = new SdkSessionManager();
   if (previous) replacement.adoptSessionsFrom(previous);
+  replacement.startReconcile();
   globalForSdk.__sdkSessionManager = replacement;
   globalForSdk.__sdkSessionManagerV = SINGLETON_VERSION;
 }

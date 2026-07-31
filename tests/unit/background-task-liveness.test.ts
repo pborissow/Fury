@@ -9,7 +9,11 @@
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { randomUUID } from 'crypto';
+import { mkdirSync, writeFileSync, rmSync, utimesSync } from 'fs';
+import { homedir } from 'os';
+import { join } from 'path';
 import { sdkSessionManager } from '../../lib/sdkSessionManager';
+import { projectPathToSlug } from '../../lib/utils';
 import { eventBus, type AppEvent, type SessionHealthEvent } from '../../lib/eventBus';
 
 const mgr = sdkSessionManager as any;
@@ -129,5 +133,76 @@ describe('getFuryWarmSessionIds (stale-LIVE-while-idle safety net)', () => {
     spawnedProcs().set(deadPid, sessionId);
     expect(sdkSessionManager.getFuryWarmSessionIds()).not.toContain(sessionId);
     expect(spawnedProcs().has(deadPid), 'dead pid opportunistically pruned').toBe(false);
+  });
+});
+
+describe('background liveness reconcile across a code reload (durable subagent scan)', () => {
+  const projectsBase = join(homedir(), '.claude', 'projects');
+  const ids: string[] = [];
+  const slugDirs: string[] = [];
+
+  // Build the real on-disk shape the reconcile scans: a main transcript (so
+  // findSessionJsonlDir resolves) + a subagent transcript with a chosen mtime.
+  function seed(opts: { subagent?: 'recent' | 'stale' }): { sessionId: string; s: any } {
+    const sessionId = randomUUID();
+    ids.push(sessionId);
+    const project = join(homedir(), '.claude', `fury-reconcile-tmp-${sessionId}`);
+    const slugDir = join(projectsBase, projectPathToSlug(project));
+    slugDirs.push(slugDir);
+    mkdirSync(slugDir, { recursive: true });
+    writeFileSync(join(slugDir, `${sessionId}.jsonl`), '{}\n');
+    if (opts.subagent) {
+      const subDir = join(slugDir, sessionId, 'subagents');
+      mkdirSync(subDir, { recursive: true });
+      const f = join(subDir, 'agent-aaa111bbb222.jsonl');
+      writeFileSync(f, '{}\n');
+      if (opts.subagent === 'stale') {
+        const old = (Date.now() - 5 * 60_000) / 1000; // 5 min ago — past the window
+        utimesSync(f, old, old);
+      }
+    }
+    const s = (sdkSessionManager as any).getOrCreate(sessionId);
+    s.projectPath = project;
+    s.q = {};
+    return { sessionId, s };
+  }
+
+  afterEach(() => {
+    const sessions = (sdkSessionManager as unknown as { sessions: Map<string, unknown> }).sessions;
+    for (const id of ids.splice(0)) sessions.delete(id);
+    for (const d of slugDirs.splice(0)) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } }
+  });
+
+  it('reload fallback: a recently-written subagent transcript re-seeds backgroundActive', () => {
+    const { sessionId } = seed({ subagent: 'recent' });
+    expect(sdkSessionManager.isBackgroundActive(sessionId)).toBe(true);
+    expect(sdkSessionManager.getBackgroundActiveSessionIds()).toContain(sessionId);
+  });
+
+  it('the live level takes over: after a level signal, the disk fallback is OFF', () => {
+    const { sessionId, s } = seed({ subagent: 'recent' });
+    s.sawBackgroundLevelSignal = true; // the CLI emitted its level this process
+    expect(sdkSessionManager.isBackgroundActive(sessionId)).toBe(false);
+  });
+
+  it('fails toward not-live once the subagent transcript goes stale', () => {
+    const { sessionId } = seed({ subagent: 'stale' });
+    expect(sdkSessionManager.isBackgroundActive(sessionId)).toBe(false);
+  });
+
+  it('no subagents dir at all → not active', () => {
+    const { sessionId } = seed({});
+    expect(sdkSessionManager.isBackgroundActive(sessionId)).toBe(false);
+  });
+
+  it('reconcile tick emits session:health {backgroundActive:true} on the false→true transition', () => {
+    const { sessionId } = seed({ subagent: 'recent' });
+    const events: SessionHealthEvent[] = [];
+    const listener = (e: AppEvent) => { if (e.type === 'session:health' && e.sessionId === sessionId) events.push(e); };
+    eventBus.onApp(listener);
+    (sdkSessionManager as any).reconcileBackgroundActivity();
+    eventBus.offApp(listener);
+    expect(events.at(-1)?.backgroundActive).toBe(true);
+    expect(events.at(-1)?.isProcessing).toBe(false);
   });
 });
