@@ -283,6 +283,65 @@ export async function archiveTranscript(
 }
 
 /**
+ * Refresh ONLY a session's subagent (sidechain) usage_events from the current
+ * sidecar transcripts — WITHOUT re-reading the (possibly huge) main JSONL or
+ * rewriting messages/raw_jsonl.
+ *
+ * Captures trailing subagent tokens that finished AFTER the session's last
+ * main-thread turn — a session killed mid-background, or a detached Monitor that
+ * outlives the last turn — which no main-JSONL change would archive, since the
+ * reactive watcher and the archive hash both key on the main JSONL alone
+ * (docs/ticket-stats-undercount-subagent-tokens.md; the live-badge ticket's Note 1).
+ * The common completion path self-heals: a subagent's <task-notification> starts a
+ * new main turn, whose main-JSONL write triggers a full re-archive.
+ *
+ * Idempotent: deletes the session's is_sidechain rows and reinserts the current set
+ * (namespaced ids keep them collision-safe). No-op when the session isn't archived
+ * yet. Keeps metadata.totalTokens in sync so the sidebar total matches Stats.
+ */
+export async function refreshSubagentUsage(sessionId: string, project: string): Promise<void> {
+  const db = await getDb();
+  // Only touch sessions we've archived — usage_events FKs to sessions.
+  const sess = await db.execute({ sql: 'SELECT metadata FROM sessions WHERE session_id = ?', args: [sessionId] });
+  if (!sess.rows.length) return;
+
+  const events = await parseSubagentUsageEvents(subagentsDirFor(sessionId, project));
+
+  const ops: { sql: string; args: any[] }[] = [
+    { sql: 'DELETE FROM usage_events WHERE session_id = ? AND is_sidechain = 1', args: [sessionId] },
+  ];
+  for (const u of events) {
+    ops.push({
+      // context_window 0: a subagent runs its own context under a possibly
+      // different model, so the parent's window must not be attributed to it.
+      sql: `INSERT OR REPLACE INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read, context_window, is_sidechain, agent_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?)`,
+      args: [sessionId, u.messageId, u.model, u.timestamp, u.input, u.output, u.cacheWrite, u.cacheWrite5m, u.cacheWrite1h, u.cacheRead, u.agentId ?? null],
+    });
+  }
+
+  const CHUNK = 500; // stay within batch limits on very large sessions
+  for (let i = 0; i < ops.length; i += CHUNK) {
+    await db.batch(ops.slice(i, i + CHUNK), 'write');
+  }
+
+  // Recompute metadata.totalTokens over ALL rows (main + sidechain) so the session
+  // list total matches the Stats aggregate for delegated sessions.
+  const totRow = await db.execute({
+    sql: 'SELECT COALESCE(SUM(input + output + cache_write + cache_read), 0) AS t FROM usage_events WHERE session_id = ?',
+    args: [sessionId],
+  });
+  let meta: Record<string, unknown> = {};
+  try { if (sess.rows[0].metadata) meta = JSON.parse(sess.rows[0].metadata as string); } catch { /* keep {} */ }
+  meta.totalTokens = Number(totRow.rows[0]?.t) || 0;
+  meta.hasUsageEvents = true;
+  await db.execute({
+    sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+    args: [JSON.stringify(meta), sessionId],
+  });
+}
+
+/**
  * Persist a session's model override (the catalog id the user picked, e.g.
  * 'haiku' or 'opus[1m]'; undefined = follow the CLI default).
  *

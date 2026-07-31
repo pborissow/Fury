@@ -12,7 +12,7 @@
  * Kept out of transcriptParser.ts (which stays fs-free / client-safe) and out of
  * db.ts / transcriptArchiver.ts (avoids an import cycle) — both of those import here.
  */
-import { readFile, readdir } from 'fs/promises';
+import { readFile, readdir, stat } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { parseTranscriptJsonl, type UsageEvent } from './transcriptParser';
@@ -23,6 +23,18 @@ export function subagentsDirFor(sessionId: string, project: string): string {
   const sanitized = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
   return join(homedir(), '.claude', 'projects', projectPathToSlug(project), sanitized, 'subagents');
 }
+
+/**
+ * Cache of a subagent file's parsed usage events, keyed by absolute path and
+ * invalidated on (mtime, size) change. archiveTranscript re-parses the WHOLE
+ * sidecar set on every usage-bearing archive, so a heavily-delegated session
+ * (dozens of large agent-*.jsonl) would otherwise re-read+re-parse all of them on
+ * each main-turn completion. An append-only transcript's size grows, so size alone
+ * would catch most changes; mtime covers a same-size rewrite. Soft-capped so a
+ * long-lived server can't grow it without bound.
+ */
+const fileCache = new Map<string, { mtimeMs: number; size: number; events: UsageEvent[] }>();
+const FILE_CACHE_MAX = 10_000;
 
 /**
  * Parse a session's subagent sidecars into usage events billed to the PARENT
@@ -47,17 +59,33 @@ export async function parseSubagentUsageEvents(subagentsDir: string): Promise<Us
   const out: UsageEvent[] = [];
   for (const f of files) {
     if (!f.startsWith('agent-') || !f.endsWith('.jsonl')) continue;
+    const full = join(subagentsDir, f);
+
+    let st: Awaited<ReturnType<typeof stat>>;
+    try { st = await stat(full); } catch { continue; }
+    if (!st.isFile()) continue;
+
+    const cached = fileCache.get(full);
+    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) {
+      out.push(...cached.events);
+      continue;
+    }
+
     const agentId = f.slice('agent-'.length, -'.jsonl'.length);
     let content: string;
     try {
-      content = await readFile(join(subagentsDir, f), 'utf-8');
+      content = await readFile(full, 'utf-8');
     } catch {
       continue;
     }
-    if (!content.trim()) continue;
-    for (const u of parseTranscriptJsonl(content).usageEvents) {
-      out.push({ ...u, messageId: `${agentId}:${u.messageId}`, isSidechain: true, agentId });
-    }
+    const events: UsageEvent[] = content.trim()
+      ? parseTranscriptJsonl(content).usageEvents.map((u) => ({
+          ...u, messageId: `${agentId}:${u.messageId}`, isSidechain: true, agentId,
+        }))
+      : [];
+    if (fileCache.size >= FILE_CACHE_MAX) fileCache.clear();
+    fileCache.set(full, { mtimeMs: st.mtimeMs, size: st.size, events });
+    out.push(...events);
   }
   return out;
 }

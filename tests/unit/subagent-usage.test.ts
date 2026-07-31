@@ -7,7 +7,7 @@
  * namespaced message ids (PK-collision-safe), tagged agentId.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { parseSubagentUsageEvents } from '../../lib/subagentUsage';
@@ -57,6 +57,21 @@ describe('parseSubagentUsageEvents', () => {
   it('returns [] when there is no subagents dir', async () => {
     dir = join(tmpdir(), `fury-nope-${process.pid}`);
     expect(await parseSubagentUsageEvents(dir)).toEqual([]);
+  });
+
+  it('re-parses a grown sidecar; serves unchanged files consistently (mtime/size cache)', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'fury-subagents-'));
+    const file = join(dir, 'agent-x.jsonl');
+    writeFileSync(file, asstLine('m1', 'claude-sonnet-4-5', { input_tokens: 1, output_tokens: 1 }));
+
+    expect(await parseSubagentUsageEvents(dir)).toHaveLength(1);
+    // Unchanged (same mtime+size) → cache hit → same result.
+    expect(await parseSubagentUsageEvents(dir)).toHaveLength(1);
+    // A running subagent appends a turn → size grows → cache invalidated → re-parsed.
+    appendFileSync(file, asstLine('m2', 'claude-sonnet-4-5', { input_tokens: 2, output_tokens: 2 }));
+    const grown = await parseSubagentUsageEvents(dir);
+    expect(grown).toHaveLength(2);
+    expect(grown.map((e) => e.messageId).sort()).toEqual(['x:m1', 'x:m2']);
   });
 
   it('ignores non-agent and empty files', async () => {

@@ -25,8 +25,13 @@ const REMIGRATE_KEY = '__fury_db_remigrate__';
 // column the live schema still lacks. initDb is idempotent, so re-running it is safe.
 const SCHEMA_VERSION = 2; // 2: usage_events.agent_id + subagent-usage backfill
 
+// Under vitest, skip the startup scan (which walks the user's REAL ~/.claude and
+// re-archives sessions) so importing the DB in a test has no side effects. Tests
+// that need a DB point FURY_DB_PATH at a scratch file.
+const IN_TEST = !!process.env.VITEST || process.env.NODE_ENV === 'test';
+
 function getDbPath(): string {
-  const dbFile = join(homedir(), '.claude', 'fury.db');
+  const dbFile = process.env.FURY_DB_PATH || join(homedir(), '.claude', 'fury.db');
   // libSQL requires file:// URL with forward slashes
   return 'file:///' + dbFile.replace(/\\/g, '/');
 }
@@ -275,7 +280,7 @@ async function initDb(client: Client): Promise<void> {
       sql: 'SELECT 1 FROM schema_flags WHERE key = ? LIMIT 1',
       args: ['subagent_usage_backfill_v1'],
     });
-    if (!done.rows.length) {
+    if (!done.rows.length && !IN_TEST) {
       // Fire-and-forget: don't hold up init on a big re-archive.
       void backfillSubagentUsage()
         .then(() => client.execute({
@@ -677,10 +682,13 @@ export function getDb(): Promise<Client> {
       g[GLOBAL_KEY] = client;
       g[SCHEMA_VER_KEY] = SCHEMA_VERSION;
 
-      // Kick off startup scan (fire-and-forget, don't block callers)
-      scanAndArchiveAll(client).catch(err =>
-        console.error('[DB] Startup scan error:', err)
-      );
+      // Kick off startup scan (fire-and-forget, don't block callers). Skipped in
+      // tests so a DB import doesn't re-archive the developer's real sessions.
+      if (!IN_TEST) {
+        scanAndArchiveAll(client).catch(err =>
+          console.error('[DB] Startup scan error:', err)
+        );
+      }
 
       return client;
     } catch (err) {

@@ -13,6 +13,7 @@ import {
   loadSessionMeta,
   modelFromMeta,
   contextTokensFromMeta,
+  refreshSubagentUsage,
 } from './transcriptArchiver';
 import { eventBus } from './eventBus';
 import { log } from './logger';
@@ -1276,10 +1277,31 @@ class SdkSessionManager {
       const prev = this.lastBgActive.get(id) ?? false;
       if (active === prev) continue;
       this.lastBgActive.set(id, active);
-      // A processing main turn drives its own health; only nudge when idle so the
-      // reconcile never fights an in-flight turn's state.
-      if (!s.isProcessing) this.emitHealth(s, false);
+      // A processing main turn drives its own health AND re-archives via the file
+      // watcher, so leave it alone; only act when the main turn is idle.
+      if (s.isProcessing) continue;
+      this.emitHealth(s, false);
+      // Background work just ENDED while the main turn is idle → no main-JSONL
+      // change will archive the subagents' trailing tokens. Capture them now.
+      if (prev && !active) this.archiveTrailingSubagentUsage(s);
     }
+  }
+
+  /**
+   * Persist the just-finished subagents' usage for a session whose main turn is
+   * idle — the trailing-token case no main-JSONL re-archive would catch (killed
+   * mid-background, or a detached Monitor). Targeted refresh (sidechain rows only),
+   * fire-and-forget, best-effort. Skipped under tests (no real DB / disk).
+   */
+  private archiveTrailingSubagentUsage(s: SdkSession): void {
+    if (IN_TEST || !s.projectPath) return;
+    void refreshSubagentUsage(s.sessionId, s.projectPath).catch((err) =>
+      log.warn('sdk.bg', 'trailing subagent-usage refresh failed', {
+        sessionId: s.sessionId,
+        corrId: s.sessionId,
+        data: { error: err instanceof Error ? err.message : String(err) },
+      }),
+    );
   }
 
   /**
@@ -2294,7 +2316,13 @@ class SdkSessionManager {
 //     badge + dots re-light without a scanner change. Fails toward not-live after
 //     SUBAGENT_RUNNING_WINDOW_MS. Without this bump the live instance keeps the old
 //     level-only emitHealth and the reload gap stays dark.
-const SINGLETON_VERSION = 27;
+// 28: the reconcile heartbeat now also archives TRAILING subagent usage — when
+//     background work ends while the main turn is idle, it fires a targeted
+//     refreshSubagentUsage so the sidecar tokens land in usage_events even though no
+//     main-JSONL change (which is what the archiver keys on) will ever archive them
+//     (docs/ticket-stats-undercount-subagent-tokens.md, review Note 1). Without this
+//     bump the live instance keeps the old reconcile body and the trailing gap stays.
+const SINGLETON_VERSION = 28;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;
