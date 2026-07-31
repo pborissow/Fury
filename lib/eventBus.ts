@@ -41,6 +41,12 @@ export interface SessionHealthEvent {
    *  at/after it instead of falling back to the trailing-assistant heuristic,
    *  which over-strips when a mid-turn prompt was folded into a tool_result. */
   startedAt?: number;
+  /** True while the session has in-flight BACKGROUND work (a dispatched subagent/
+   *  Bash still running) even though its main turn is idle. The client shows the
+   *  bouncing dots on `isProcessing || backgroundActive`, and the events route
+   *  counts it toward the Live badge — so an orchestrator stays live across the
+   *  whole background window, not just its own main turns. */
+  backgroundActive?: boolean;
 }
 
 export interface SessionModelEvent {

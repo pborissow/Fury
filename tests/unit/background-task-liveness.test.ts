@@ -1,0 +1,133 @@
+/**
+ * Background-task liveness (docs/ticket-live-badge-dark-during-background-subagent.md).
+ *
+ * An orchestrator's own main turn ends while a dispatched background subagent keeps
+ * working; the session must stay live (badge + dots) across that wait. Drives the
+ * private handle() with the SDK's `system/background_tasks_changed` LEVEL signal and
+ * asserts the REPLACE semantics, the emitted health flag, and the teardown/gating
+ * safety that prevents a stale set pinning a dead session "live".
+ */
+import { describe, it, expect, afterEach } from 'vitest';
+import { randomUUID } from 'crypto';
+import { sdkSessionManager } from '../../lib/sdkSessionManager';
+import { eventBus, type AppEvent, type SessionHealthEvent } from '../../lib/eventBus';
+
+const mgr = sdkSessionManager as any;
+
+const createdIds: string[] = [];
+function newSession(id: string) {
+  createdIds.push(id);
+  const s = mgr.getOrCreate(id);
+  s.q = {}; // a truthy stub — getBackgroundActiveSessionIds gates on a live query
+  return s;
+}
+
+function captureHealth() {
+  const events: SessionHealthEvent[] = [];
+  const listener = (e: AppEvent) => { if (e.type === 'session:health') events.push(e); };
+  eventBus.onApp(listener);
+  return { events, stop: () => eventBus.offApp(listener) };
+}
+
+const bgChanged = (taskIds: string[]) => ({
+  type: 'system',
+  subtype: 'background_tasks_changed',
+  tasks: taskIds.map((id) => ({ task_id: id, task_type: 'Task', description: 'work' })),
+});
+
+afterEach(() => {
+  const sessions = (sdkSessionManager as unknown as { sessions: Map<string, unknown> }).sessions;
+  for (const id of createdIds.splice(0)) sessions.delete(id);
+});
+
+describe('background_tasks_changed → liveness', () => {
+  it('tracks the set and emits health with backgroundActive true', () => {
+    const s = newSession('bg-1');
+    const cap = captureHealth();
+    mgr.handle(s, bgChanged(['t1', 't2']));
+    cap.stop();
+
+    expect([...s.backgroundTasks].sort()).toEqual(['t1', 't2']);
+    expect(mgr.isBackgroundActive('bg-1')).toBe(true);
+    expect(mgr.getBackgroundActiveSessionIds()).toContain('bg-1');
+    const ev = cap.events.find((e) => e.sessionId === 'bg-1');
+    expect(ev?.backgroundActive).toBe(true);
+  });
+
+  it('REPLACES (not merges) the set on each payload — a level signal', () => {
+    const s = newSession('bg-2');
+    mgr.handle(s, bgChanged(['t1', 't2']));
+    mgr.handle(s, bgChanged(['t3'])); // t1/t2 done, t3 started
+    expect([...s.backgroundTasks]).toEqual(['t3']);
+  });
+
+  it('an empty payload clears liveness (last task completed)', () => {
+    const s = newSession('bg-3');
+    mgr.handle(s, bgChanged(['t1']));
+    expect(mgr.isBackgroundActive('bg-3')).toBe(true);
+    const cap = captureHealth();
+    mgr.handle(s, bgChanged([]));
+    cap.stop();
+
+    expect(s.backgroundTasks.size).toBe(0);
+    expect(mgr.isBackgroundActive('bg-3')).toBe(false);
+    expect(mgr.getBackgroundActiveSessionIds()).not.toContain('bg-3');
+    expect(cap.events.find((e) => e.sessionId === 'bg-3')?.backgroundActive).toBe(false);
+  });
+
+  it('does NOT count a session whose query/process is gone (stale set cannot pin a dead session)', () => {
+    const s = newSession('bg-4');
+    mgr.handle(s, bgChanged(['t1']));
+    expect(mgr.getBackgroundActiveSessionIds()).toContain('bg-4');
+
+    s.q = null; // the persistent query ended — background work can't still run
+    expect(mgr.getBackgroundActiveSessionIds()).not.toContain('bg-4');
+    expect(mgr.isBackgroundActive('bg-4')).toBe(false);
+  });
+
+  it('teardown (stop) clears the set', async () => {
+    const s = newSession('bg-5');
+    mgr.handle(s, bgChanged(['t1', 't2']));
+    await mgr.stop('bg-5');
+    expect(s.backgroundTasks.size).toBe(0);
+    expect(mgr.isBackgroundActive('bg-5')).toBe(false);
+  });
+
+  it('ignores malformed task entries (missing task_id)', () => {
+    const s = newSession('bg-6');
+    mgr.handle(s, {
+      type: 'system',
+      subtype: 'background_tasks_changed',
+      tasks: [{ task_type: 'Task' }, { task_id: 'good' }, { task_id: 42 }],
+    });
+    expect([...s.backgroundTasks]).toEqual(['good']);
+  });
+});
+
+describe('getFuryWarmSessionIds (stale-LIVE-while-idle safety net)', () => {
+  const spawnedProcs = () => (sdkSessionManager as unknown as { spawnedProcs: Map<number, string> }).spawnedProcs;
+  afterEach(() => spawnedProcs().clear());
+
+  it('reports a warm session even after its record is dropped from the map (the desync)', () => {
+    const sessionId = randomUUID();
+    // Simulate spawnClaudeCodeProcess recording a live warm pid (process.pid is a
+    // guaranteed-alive stand-in), then the session record being evicted.
+    spawnedProcs().set(process.pid, sessionId);
+    (sdkSessionManager as unknown as { sessions: Map<string, unknown> }).sessions.delete(sessionId);
+
+    // Precondition for the bug: the managed-subtract can no longer see it…
+    expect(sdkSessionManager.getManagedSessionIds()).not.toContain(sessionId);
+    // …but the durable warm record still does, so the badge can suppress it.
+    expect(sdkSessionManager.getFuryWarmSessionIds()).toContain(sessionId);
+  });
+
+  it('drops a warm session once its process is dead (prunes the stale pid)', () => {
+    const sessionId = randomUUID();
+    // A pid that is not alive (0 never matches a real process for signal checks here;
+    // use a very high pid unlikely to exist).
+    const deadPid = 2 ** 30;
+    spawnedProcs().set(deadPid, sessionId);
+    expect(sdkSessionManager.getFuryWarmSessionIds()).not.toContain(sessionId);
+    expect(spawnedProcs().has(deadPid), 'dead pid opportunistically pruned').toBe(false);
+  });
+});

@@ -128,6 +128,19 @@ interface SdkSession {
   // confirmed graceful takeover), never a silent SIGKILL. Populated by the
   // custom spawnClaudeCodeProcess in startQuery; pruned on the child's 'exit'.
   spawnedPids: Set<number>;
+  // Task ids of the session's in-flight BACKGROUND agents/Bash (run_in_background,
+  // Workflow, Monitor, or a foreground task backgrounded with Ctrl+B). Kept so the
+  // session reads as LIVE (badge + dots) across the whole background window, not
+  // just its own main turns — an orchestrator's main turn ends immediately while a
+  // dispatched subagent keeps working, and without this the session goes dark until
+  // the next task-notification starts a new turn (see
+  // docs/ticket-live-badge-dark-during-background-subagent.md).
+  //
+  // Driven by the SDK's `system/background_tasks_changed` LEVEL signal: REPLACE the
+  // whole set on each payload (never pair start/stop edges), so a missed edge can't
+  // wedge a stale "live". Per-process — reset to empty whenever a new CLI is spawned
+  // (startQuery) and on teardown (stop/kill).
+  backgroundTasks: Set<string>;
   // The user's chosen model for this session, or undefined for the CLI default.
   // Load-bearing in TWO places, because the query object comes and goes:
   //   1. Pushed live via Query.setModel() when a query is open (no restart).
@@ -259,6 +272,15 @@ async function parentPidOf(pid: number): Promise<number | null> {
 
 class SdkSessionManager {
   private sessions = new Map<string, SdkSession>();
+  /** pid -> sessionId for every warm CLI THIS manager spawned and hasn't seen exit.
+   *  Manager-level ON PURPOSE (not derived from the `sessions` map): it must survive
+   *  a session record being dropped from the map while its warm process is still
+   *  alive, so the Live badge can still recognize "this scanner process is Fury's
+   *  warm-but-idle one" and suppress it. Without this, a desync between the map and
+   *  the PID scanner pins an idle session green off the scanner alone (the
+   *  stale-LIVE-while-idle bug). Populated in spawnClaudeCodeProcess, pruned on the
+   *  child's 'exit', and carried across HMR by adoptSessionsFrom. */
+  private spawnedProcs = new Map<number, string>();
   /** Last catalog any session reported, for sessions with no live query to ask.
    *  See listModels() for why this is served with live:false. */
   private lastKnownModels: ModelInfo[] | null = null;
@@ -287,6 +309,7 @@ class SdkSessionManager {
         lastEmittedWindow: -1,
         lastEmittedModel: null,
         spawnedPids: new Set<number>(),
+        backgroundTasks: new Set<string>(),
       };
       this.sessions.set(sessionId, s);
     }
@@ -750,6 +773,9 @@ class SdkSessionManager {
     s.input = null;
     s.abortController = undefined;
     s.isProcessing = false;
+    // The process is being torn down, so any background work it hosted is gone —
+    // drop the set so it can't keep the session reading "live".
+    s.backgroundTasks.clear();
     this.closeBuffer(s);
     this.emitHealth(s, false);
   }
@@ -773,6 +799,7 @@ class SdkSessionManager {
       s.input = null;
       s.abortController = undefined;
       s.isProcessing = false;
+      s.backgroundTasks.clear();
     }
     // Hard-kill any CLI process registered to this session by PID. The
     // abortController only references the CURRENT query, but interrupt/rewind
@@ -797,12 +824,20 @@ class SdkSessionManager {
    * version whose fields may not match.
    */
   adoptSessionsFrom(previous: SdkSessionManager): void {
+    // Carry the manager-level warm-pid record across the HMR swap too. It's the
+    // stale-LIVE safety net and must not reset to empty (which would re-expose a
+    // warm-but-idle process to the scanner until its next turn).
+    const priorProcs = (previous as unknown as { spawnedProcs?: Map<number, string> }).spawnedProcs;
+    if (priorProcs instanceof Map) {
+      for (const [pid, sid] of priorProcs) this.spawnedProcs.set(pid, sid);
+    }
     const prior = (previous as unknown as { sessions?: Map<string, SdkSession> }).sessions;
     if (!(prior instanceof Map)) return;
     for (const [id, session] of prior) {
       // A session built by an older module version predates spawnedPids; backfill
       // so the ownership-scoped kill path never dereferences an undefined set.
       if (!(session.spawnedPids instanceof Set)) session.spawnedPids = new Set<number>();
+      if (!(session.backgroundTasks instanceof Set)) session.backgroundTasks = new Set<string>();
       if (!this.sessions.has(id)) this.sessions.set(id, session);
     }
   }
@@ -1111,6 +1146,53 @@ class SdkSessionManager {
   }
 
   /**
+   * Sessions with in-flight BACKGROUND work (a dispatched subagent/Bash still
+   * running) even though their main turn is idle. Feeds computeLiveSessionIds
+   * alongside getActiveSessionIds so an orchestrator stays live across the whole
+   * background window (docs/ticket-live-badge-dark-during-background-subagent.md).
+   *
+   * Gated on a live `s.q`: if the query/process is gone the background work can't
+   * still be running, so a stale set can never pin a dead session "live" — the
+   * primary safety, together with clearing the set on teardown/respawn and the
+   * SDK's REPLACE-semantics level signal (a completion emits a new, smaller set).
+   */
+  getBackgroundActiveSessionIds(): string[] {
+    const ids: string[] = [];
+    for (const [id, s] of this.sessions) {
+      if (s.backgroundTasks.size > 0 && s.q) ids.push(id);
+    }
+    return ids;
+  }
+
+  /** Whether this session has in-flight background work — for /api/stream-buffer
+   *  and /api/health, which drive the client's background-work dots. */
+  isBackgroundActive(sessionId: string): boolean {
+    const s = this.sessions.get(sessionId);
+    return !!(s && s.backgroundTasks.size > 0 && s.q);
+  }
+
+  /**
+   * Session ids Fury has a LIVE warm CLI process for, computed from spawnedProcs —
+   * independent of whether the session record is still in the `sessions` map.
+   *
+   * computeLiveSessionIds subtracts these (like sdkManagedIds) so a warm-but-idle
+   * Fury process is never counted as live off the PID scanner alone, EVEN IF the
+   * session was dropped from the map while its process lived. That desync is what
+   * pinned an idle session green (the stale-LIVE-while-idle bug); the manager-level
+   * record closes it. Cheap: a small map + a liveness syscall per warm pid, no OS
+   * ancestry lookup (we recorded the pids at spawn). Opportunistically prunes dead
+   * pids whose 'exit' handler never fired (e.g. externally killed).
+   */
+  getFuryWarmSessionIds(): string[] {
+    const ids = new Set<string>();
+    for (const [pid, sid] of this.spawnedProcs) {
+      if (pidAlive(pid)) ids.add(sid);
+      else this.spawnedProcs.delete(pid);
+    }
+    return [...ids];
+  }
+
+  /**
    * Every session Fury owns (tracked in the map), regardless of whether its
    * query stream object is currently live. This must NOT key on `s.q`: an
    * interrupted session transiently nulls `s.q` while its CLI process stays
@@ -1391,6 +1473,11 @@ class SdkSessionManager {
       try { s.abortController.abort(); } catch { /* best effort */ }
     }
     this.reclaimOwnLeaks(s);
+    // A new CLI process is about to spawn. background_tasks_changed is a
+    // per-process level signal that emits nothing at startup, so reset the set and
+    // let the fresh process repopulate it — otherwise a stale task from the prior
+    // process would pin the session "live" until the next membership change.
+    s.backgroundTasks.clear();
 
     const cwd = s.projectPath || process.cwd();
     const existing = findSessionJsonlDir(s.sessionId, cwd) !== null;
@@ -1436,11 +1523,17 @@ class SdkSessionManager {
           if (typeof child.pid === 'number') {
             const pid = child.pid;
             s.spawnedPids.add(pid);
+            // Also record at the MANAGER level (pid -> sessionId), which survives the
+            // session record being dropped from the map while its warm process lives.
+            // The Live badge uses this to suppress a warm-but-idle Fury process even
+            // when the managed-subtract can't (the stale-LIVE-while-idle bug).
+            this.spawnedProcs.set(pid, s.sessionId);
             log.debug('sdk.handoff', 'spawned cli', { sessionId: s.sessionId, corrId: s.sessionId, data: { pid } });
             // Prune on exit and sweep the child's own PID file once it's provably
             // gone, so no dead-pid *.json lingers after a normal turn/interrupt.
             child.once('exit', () => {
               s.spawnedPids.delete(pid);
+              this.spawnedProcs.delete(pid);
               this.removePidFileForPid(pid);
             });
           }
@@ -1528,6 +1621,42 @@ class SdkSessionManager {
               attempt: anyMsg.attempt ?? null,
               maxRetries: anyMsg.max_retries ?? null,
               delayMs: anyMsg.retry_delay_ms ?? null,
+            },
+          });
+        } else if (anyMsg.subtype === 'background_tasks_changed') {
+          // The full set of live background tasks after a membership change
+          // (start / completion / kill / a foreground task backgrounded). LEVEL
+          // signal → REPLACE the whole set; never pair edges, so a dropped
+          // start/stop can't wedge a stale "live". This keeps the session's Live
+          // badge + dots lit across the WHOLE background window, not just its main
+          // turns (docs/ticket-live-badge-dark-during-background-subagent.md).
+          const tasks = Array.isArray(anyMsg.tasks) ? anyMsg.tasks : [];
+          s.backgroundTasks = new Set<string>(
+            tasks.map((t: { task_id?: unknown }) => t?.task_id).filter((id: unknown): id is string => typeof id === 'string'),
+          );
+          log.info('sdk.bg', 'background tasks changed', {
+            sessionId: s.sessionId,
+            corrId: s.sessionId,
+            data: { count: s.backgroundTasks.size },
+          });
+          // Re-emit health so the events route recomputes the live set and the
+          // client toggles the background-work dots. Pass the real main-turn state
+          // (unchanged); emitHealth attaches the current backgroundActive flag.
+          this.emitHealth(s, s.isProcessing);
+        } else if (typeof anyMsg.subtype === 'string' && anyMsg.subtype.startsWith('task_')) {
+          // Observability for the background-task lifecycle EDGES: task_started /
+          // task_notification / task_updated / task_progress. The v24 liveness fix
+          // keys on the background_tasks_changed LEVEL signal above (confirmed to
+          // fire for real CLI subagents — tests/live-sessions/background-subagent-
+          // liveness.spec.ts); these edges are logged for diagnosis and are the
+          // fallback signal if the level ever proves unreliable. Low-noise: scoped
+          // to task_* so per-token `status`/`thinking_tokens` don't spam the log.
+          log.debug('sdk.sys', anyMsg.subtype, {
+            sessionId: s.sessionId,
+            corrId: s.sessionId,
+            data: {
+              taskId: typeof anyMsg.task_id === 'string' ? anyMsg.task_id : undefined,
+              status: typeof anyMsg.status === 'string' ? anyMsg.status : undefined,
             },
           });
         }
@@ -1903,12 +2032,16 @@ class SdkSessionManager {
     // isProcessing:true branch; harmless (and still correct) on idle, where the
     // buffer is closed-but-retained so startedAt is still present.
     const startedAt = s.streamBuffer?.startedAt;
+    // Live iff the main turn is processing OR a background task is still running.
+    // The client shows the dots on either, and the events route counts this toward
+    // the Live badge — closing the dark gap between the orchestrator's turns.
+    const backgroundActive = s.backgroundTasks.size > 0;
     log.debug('sdk.health', isProcessing ? 'processing' : 'idle', {
       sessionId: s.sessionId,
       corrId: s.sessionId,
-      data: { startedAt },
+      data: { startedAt, backgroundActive },
     });
-    eventBus.emitApp({ type: 'session:health', sessionId: s.sessionId, isProcessing, isStuck: false, startedAt });
+    eventBus.emitApp({ type: 'session:health', sessionId: s.sessionId, isProcessing, isStuck: false, startedAt, backgroundActive });
   }
 
   // NOTE (cost accounting): we emit TOKEN COUNTS only, matching the shipping
@@ -2011,7 +2144,30 @@ class SdkSessionManager {
 //     to one idle per cycle) and its always-dead parent_tool_use_id sidechain guard
 //     was removed (results carry no such field). Without this bump the live instance
 //     keeps the old submit-only dots and flips idle at the first result.
-const SINGLETON_VERSION = 23;
+// 24: background-task LIVENESS across the wait between turns
+//     (docs/ticket-live-badge-dark-during-background-subagent.md). Fix #23 keeps dots
+//     once a background turn STREAMS; this keeps the session live during the WAIT
+//     before it starts. SdkSession.backgroundTasks tracks in-flight background agents
+//     from the SDK's `system/background_tasks_changed` LEVEL signal (REPLACE each
+//     payload); getBackgroundActiveSessionIds/isBackgroundActive expose it; emitHealth
+//     carries `backgroundActive`. computeLiveSessionIds + both live-session routes add
+//     it to the Live badge, and the client shows dots on it. Set cleared on startQuery
+//     (new process) and teardown; gated on live s.q. Without this bump the live
+//     instance keeps the old emitHealth/handle bodies and the gap stays dark.
+// 25: 'sdk.sys' debug log for the background-task lifecycle EDGES (task_started/
+//     task_notification/task_updated/task_progress). Confirmed via a real subagent
+//     orchestration (tests/live-sessions/background-subagent-liveness.spec.ts) that
+//     the v24 background_tasks_changed LEVEL signal DOES fire for CLI subagents; the
+//     edges are logged for diagnosis / as a fallback signal. Observability only.
+// 26: stale-LIVE-while-idle fix. A persistent SDK session's warm CLI process lingers
+//     in the PID scanner between turns; computeLiveSessionIds removed it ONLY via map
+//     membership (sdkManagedIds), so a session that dropped out of the map while its
+//     process lived stayed pinned green. Added a manager-level spawnedProcs (pid ->
+//     sessionId) recorded at spawn / pruned on exit / carried across HMR;
+//     getFuryWarmSessionIds() derives the warm set from it, and computeLiveSessionIds
+//     + both live-session routes subtract it independent of the map. Without this bump
+//     the live instance keeps the old spawn body and never records spawnedProcs.
+const SINGLETON_VERSION = 26;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

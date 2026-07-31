@@ -32,6 +32,9 @@ export async function GET(req: NextRequest) {
   // Likewise OR in its processing state — otherwise ChatTab's poll sees
   // isProcessing:false and clears transcriptLoading (no dots, no stream).
   const isProcessing = health.isProcessing || sdkSessionManager.isSessionProcessing(sessionId);
+  // In-flight background work (a dispatched subagent) keeps the dots on even when
+  // the main turn is idle — docs/ticket-live-badge-dark-during-background-subagent.md.
+  const backgroundActive = sdkSessionManager.isBackgroundActive(sessionId);
 
   // A question the SDK session is parked on, awaiting this user. Server-held
   // state is the ONLY source of a pending question on the SDK path — the JSONL
@@ -48,6 +51,7 @@ export async function GET(req: NextRequest) {
     return Response.json({
       hasBuffer: false,
       isProcessing,
+      backgroundActive,
       pendingAsk,
     });
   }
@@ -55,6 +59,7 @@ export async function GET(req: NextRequest) {
   return Response.json({
     hasBuffer: true,
     isProcessing,
+    backgroundActive,
     userPrompt: buffer.userPrompt,
     accumulatedText: buffer.accumulatedText,
     events: buffer.events,

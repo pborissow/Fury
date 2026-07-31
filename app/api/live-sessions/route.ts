@@ -30,6 +30,8 @@ export async function GET() {
     shippingActiveIds: safe(() => sessionManager.getActiveSessionIds()),
     sdkManagedIds: safe(() => sdkSessionManager.getManagedSessionIds()),
     sdkActiveIds: safe(() => sdkSessionManager.getActiveSessionIds()),
+    backgroundActiveIds: safe(() => sdkSessionManager.getBackgroundActiveSessionIds()),
+    furyWarmIds: safe(() => sdkSessionManager.getFuryWarmSessionIds()),
   });
 
   return NextResponse.json({ liveSessionIds });

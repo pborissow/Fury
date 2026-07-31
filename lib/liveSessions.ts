@@ -25,6 +25,16 @@ export function computeLiveSessionIds(args: {
   sdkManagedIds: string[];
   /** SDK sessions currently processing (sdkSessionManager.getActiveSessionIds). */
   sdkActiveIds: string[];
+  /** SDK sessions with in-flight BACKGROUND work but an idle main turn
+   *  (sdkSessionManager.getBackgroundActiveSessionIds). Optional so older callers
+   *  keep compiling; treated as empty when absent. */
+  backgroundActiveIds?: string[];
+  /** SDK sessions Fury has a live WARM process for, from the manager-level pid
+   *  record (sdkSessionManager.getFuryWarmSessionIds) — independent of the sessions
+   *  map. Subtracted alongside sdkManagedIds so a warm-but-idle Fury process is
+   *  never counted as live off the scanner even when the session dropped out of the
+   *  map (the stale-LIVE-while-idle bug). Optional for back-compat. */
+  furyWarmIds?: string[];
 }): string[] {
   const live = new Set(args.scannerIds);
   // Persistent SDK processes appear in the scanner even at rest — drop every
@@ -32,7 +42,17 @@ export function computeLiveSessionIds(args: {
   // Net: an SDK session is live iff isProcessing. (Non-Fury SDK/CLI processes
   // are not in sdkManagedIds, so they're left untouched.)
   for (const id of args.sdkManagedIds) live.delete(id);
+  // Also drop any session Fury has a warm process for even if it's NOT in the
+  // managed map right now (a map<->scanner desync). Keyed on the manager's durable
+  // pid record, so an idle warm process can't stay green off the scanner alone.
+  for (const id of args.furyWarmIds ?? []) live.delete(id);
   for (const id of args.sdkActiveIds) live.add(id);
+  // Re-add SDK sessions whose main turn is idle but which are still driving a
+  // background subagent — otherwise the orchestrator reads as dead during the
+  // (often multi-minute) wait between its turns. A session is live iff
+  // isProcessing OR has in-flight background work. See
+  // docs/ticket-live-badge-dark-during-background-subagent.md.
+  for (const id of args.backgroundActiveIds ?? []) live.add(id);
   // Shipping sessions whose conversation id isn't what the PID file carries.
   for (const id of args.shippingActiveIds) live.add(id);
   return [...live].sort();

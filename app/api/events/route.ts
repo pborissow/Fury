@@ -72,6 +72,8 @@ export async function GET(request: NextRequest) {
           shippingActiveIds: safeIds(() => sessionManager.getActiveSessionIds()),
           sdkManagedIds: safeIds(() => sdkSessionManager.getManagedSessionIds()),
           sdkActiveIds: safeIds(() => sdkSessionManager.getActiveSessionIds()),
+          backgroundActiveIds: safeIds(() => sdkSessionManager.getBackgroundActiveSessionIds()),
+          furyWarmIds: safeIds(() => sdkSessionManager.getFuryWarmSessionIds()),
         });
         const key = ids.join(',');
         if (key === lastSentKey) return;

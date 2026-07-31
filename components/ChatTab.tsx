@@ -121,10 +121,17 @@ export default function ChatTab({
   const [transcriptOverlayMessages, setTranscriptOverlayMessages] = useState<Message[]>([]);
   const [transcriptStreaming, setTranscriptStreaming] = useState('');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
+  // Independent of transcriptLoading (which is tied to an in-flight MAIN turn and
+  // its strip/refetch machinery): true while the session is driving a BACKGROUND
+  // subagent between its own turns. Drives ONLY the bouncing dots — deliberately
+  // orthogonal so background liveness never touches the fragile in-flight-partials
+  // logic. See docs/ticket-live-badge-dark-during-background-subagent.md.
+  const [backgroundWorking, setBackgroundWorking] = useState(false);
   const [providerSource, setProviderSource] = useState<'Anthropic' | 'Bedrock' | null>(null);
   const [providerConfiguredModel, setProviderConfiguredModel] = useState<string | null>(null);
   const [currentModel, setCurrentModel] = useState<string | null>(null);
   const transcriptLoadingRef = useRef(false);
+  const backgroundWorkingRef = useRef(false);
   const transcriptStreamingRef = useRef('');
   // Consecutive `/api/health` isProcessing:false readings from the 15s fallback
   // poll. The SDK singleton swap on Next.js HMR can make a not-yet-recompiled
@@ -330,6 +337,10 @@ export default function ChatTab({
   }, [transcriptLoading]);
 
   useEffect(() => {
+    backgroundWorkingRef.current = backgroundWorking;
+  }, [backgroundWorking]);
+
+  useEffect(() => {
     transcriptStreamingRef.current = transcriptStreaming;
   }, [transcriptStreaming]);
 
@@ -487,6 +498,9 @@ export default function ChatTab({
     setStreamEvents([]);
     setSessionError(null);
     setTranscriptLoading(false);
+    // Clear background-work dots on switch; the target session's restore re-sets
+    // it from /api/stream-buffer + /api/health below.
+    setBackgroundWorking(false);
     setTranscriptPartial(false);
     setSuggestedPrompt(null);
     setIsStuck(false);
@@ -560,6 +574,9 @@ export default function ChatTab({
           // Before the isActive branch: a parked question must re-open whether
           // or not the buffer is still active.
           applyPendingAskFromBuffer(bufData, bufIssuedAt);
+          // Show the background-work dots immediately when opening a session whose
+          // main turn is idle but which is still driving a background subagent.
+          setBackgroundWorking(!!bufData.backgroundActive);
           if (bufData.hasBuffer && bufData.isActive) {
             // The JSONL contains partial assistant messages for the in-flight
             // turn that the stream buffer is handling. Strip everything this
@@ -616,6 +633,7 @@ export default function ChatTab({
             if (healthData.isProcessing) {
               setTranscriptLoading(true);
             }
+            setBackgroundWorking(!!healthData.backgroundActive);
           }
         } catch {
           // Health check is best-effort
@@ -740,6 +758,9 @@ export default function ChatTab({
           // A question could have been asked in the gap between the initial
           // restore and this connect — that emit would have had no listener.
           applyPendingAskFromBuffer(bufData, bufIssuedAt);
+
+          // Sync background-work dots on connect (SSE may have missed the change).
+          setBackgroundWorking(!!bufData.backgroundActive);
 
           if (bufData.hasBuffer) {
             // Only update if the buffer has more data than what we currently have
@@ -906,6 +927,11 @@ export default function ChatTab({
       const data = JSON.parse(e.data);
       setIsStuck(data.isStuck);
       setStuckReason(data.stuckReason);
+
+      // Background-work dots: independent of the in-flight-turn machinery below.
+      // A session driving a background subagent between its own turns keeps the
+      // dots on even though its main turn is idle (data.isProcessing false).
+      setBackgroundWorking(!!data.backgroundActive);
 
       // Authoritative liveness signal — a real reading resets the poll's
       // transient-false streak either way.
@@ -1079,14 +1105,21 @@ export default function ChatTab({
 
     // Fallback health poll: if SSE drops or a session:health event is lost,
     // the UI can get stuck showing "processing" forever. Poll every 15s while
-    // transcriptLoading is true to catch missed completion events.
-    // Also skips when tab is hidden to avoid unnecessary network requests.
+    // transcriptLoading OR background work is showing dots, to catch missed
+    // completion events. Also skips when tab is hidden to avoid unnecessary
+    // network requests.
     const healthPoll = setInterval(() => {
-      if (!shouldProcess() || !transcriptLoadingRef.current) return;
+      if (!shouldProcess() || (!transcriptLoadingRef.current && !backgroundWorkingRef.current)) return;
       fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`)
         .then(res => res.json())
         .then(data => {
           if (!shouldProcess()) return;
+          // Keep the independent background-work dots in sync even if the SSE
+          // health event that would clear them was missed (fail toward not-live).
+          setBackgroundWorking(!!data.backgroundActive);
+          // The in-flight-turn teardown below only applies while a MAIN turn is
+          // loading; a background-only poll (loading false) stops here.
+          if (!transcriptLoadingRef.current) return;
           if (data.isProcessing) {
             // Live — reset the streak so an earlier isolated false is forgotten.
             if (healthFalseStreakRef.current > 0) {
@@ -1306,6 +1339,7 @@ export default function ChatTab({
     setTranscriptStreaming('');
     setStreamEvents([]);
     setTranscriptLoading(false);
+    setBackgroundWorking(false);
     setTranscriptPartial(false);
     // Reflect the wizard's model in the status-bar label immediately, instead of
     // showing the provider default until the first turn's session:model init
@@ -1360,6 +1394,7 @@ export default function ChatTab({
     setTranscriptStreaming('');
     setStreamEvents([]);
     setTranscriptLoading(false);
+    setBackgroundWorking(false);
     setTranscriptPartial(false);
     setSuggestedPrompt(null);
     setIsStuck(false);
@@ -2008,7 +2043,7 @@ export default function ChatTab({
                             }}
                             onTtsCancel={() => ttsCleanup()}
                           />
-                          {transcriptLoading && (
+                          {(transcriptLoading || backgroundWorking) && (
                             <div className="flex justify-start">
                               {/*
                                 While parked on a question the turn IS live and
