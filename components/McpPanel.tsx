@@ -120,9 +120,18 @@ After modifying source files, ask the user before calling \`codemogger_reindex\`
 
 interface McpPanelProps {
   projectPath?: string | null;
+  /** Servers that FAILED to connect at the active session's init (B4). The
+   *  server list is otherwise config-derived and decoupled from runtime, so a
+   *  crashed server (e.g. codemogger on first use) would show a healthy badge;
+   *  this overrides matching rows with a runtime "failed" indicator. */
+  runtimeFailed?: { name: string; status: string }[];
 }
 
-export default function McpPanel({ projectPath }: McpPanelProps) {
+export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) {
+  const runtimeFailedNames = useMemo(
+    () => new Set((runtimeFailed ?? []).map(s => s.name)),
+    [runtimeFailed],
+  );
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [mcpLoading, setMcpLoading] = useState(false);
   const [mcpError, setMcpError] = useState<string | null>(null);
@@ -308,7 +317,9 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
             name: mcpForm.name,
             transport: 'stdio',
             commandOrUrl: 'codemogger',
-            args: `--db ${dbPath} mcp`,
+            // Array, not a joined string: keeps `--db <dbPath>` a single argv
+            // entry even when the home/db path contains a space (B3).
+            args: ['--db', dbPath, 'mcp'],
             envVars: '',
             scope: mcpForm.scope,
             projectPath,
@@ -518,7 +529,11 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
                   </button>
                 </div>
                 <div className="flex items-center gap-2">
-                  {server.status === 'connected' ? (
+                  {runtimeFailedNames.has(server.name) ? (
+                    <span title="Failed to connect in the active session — its tools are unavailable">
+                      <AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" />
+                    </span>
+                  ) : server.status === 'connected' ? (
                     <span title={server.statusDetail}><Check className="h-4 w-4 text-green-500 flex-shrink-0" /></span>
                   ) : server.status === 'needs_auth' ? (
                     <span title={server.statusDetail}><AlertTriangle className="h-4 w-4 text-yellow-500 flex-shrink-0" /></span>

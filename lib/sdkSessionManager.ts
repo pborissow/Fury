@@ -167,6 +167,18 @@ interface SdkSession {
   // manager). The SDK reports the model on system.init AND on every assistant
   // message; without this we'd re-emit the same value on every turn.
   lastEmittedModel: string | null;
+  // MCP status tracking (B4). `system:init` can arrive more than once over a
+  // persistent session's life, so we dedup — and deliberately on the FAILED set
+  // ALONE: a benign server transition (an un-authed claude.ai connector going
+  // pending→connected) must NOT re-fire the codemogger "failed" banner. Benign
+  // (needs-auth/pending) changes are deduped separately for their log-only line.
+  lastMcpFailedKey?: string;
+  lastMcpBenignKey?: string;
+  // The current set of FAILED MCP servers for this session — the durable,
+  // server-authoritative status the client restores on open (via
+  // /api/stream-buffer) so the "failed to connect" banner survives turn resets
+  // and navigation, and clears on recovery.
+  mcpFailed?: { name: string; status: string }[];
   // Server-side buffer of the current turn's stream, mirroring the CLI manager.
   // Load-bearing for the UI: ChatTab keys its "strip the in-flight turn's
   // partial assistant messages" logic on this (otherwise the JSONL's partials
@@ -720,6 +732,82 @@ class SdkSessionManager {
     if (model === s.lastEmittedModel) return;
     s.lastEmittedModel = model;
     eventBus.emitApp({ type: 'session:model', sessionId: s.sessionId, model });
+  }
+
+  /**
+   * Surface MCP server connection status from the `system:init` message (B4).
+   *
+   * The init payload carries an `mcp_servers: [{ name, status }]` array. Before
+   * this, init only emitted the model and dropped it on the floor: a server that
+   * crashed at launch produced no log, no UI, no stream event (the codemogger-on-
+   * first-use case B4 targets).
+   *
+   * Status handling is deliberately split, because "not connected" is not always
+   * an error:
+   *  - `failed` — the server crashed / couldn't start. A real problem the user
+   *    should see: `log.warn` under `sdk.mcp` (durable in ~/.claude/fury-logs)
+   *    AND a `session:stream` signal so the client shows "failed to connect".
+   *  - `needs-auth` / `pending` / anything else — EXPECTED, benign states for
+   *    user connectors (an un-authed claude.ai Gmail/Calendar/Drive is `pending`
+   *    on every fresh session). Surfacing these as "failed to connect" would be a
+   *    recurring false alarm, so they are LOG-ONLY (`log.info`), never a client
+   *    error line.
+   * Deduped on the full non-connected set so a re-init with the same statuses
+   * doesn't repeat itself.
+   */
+  private reportMcpServers(s: SdkSession, servers: unknown): void {
+    if (!Array.isArray(servers)) return;
+    const notConnected = servers
+      .map(v => v as { name?: unknown; status?: unknown })
+      .filter(v => typeof v?.name === 'string' && v.status !== 'connected')
+      .map(v => ({ name: String(v.name), status: typeof v.status === 'string' ? v.status : 'unknown' }));
+
+    const failed = notConnected.filter(x => x.status === 'failed');
+    const benign = notConnected.filter(x => x.status !== 'failed');
+
+    // Benign (needs-auth / pending): log for diagnosis only, deduped on its own
+    // key so it neither spams nor touches the failed-banner state.
+    const benignKey = benign.map(x => `${x.name}:${x.status}`).sort().join('|');
+    if (benign.length && benignKey !== (s.lastMcpBenignKey ?? '')) {
+      log.info('sdk.mcp', 'mcp server(s) not connected (non-fatal)', {
+        sessionId: s.sessionId,
+        corrId: s.sessionId,
+        data: { servers: benign },
+      });
+    }
+    s.lastMcpBenignKey = benignKey;
+
+    // Dedup the user-facing signal on the FAILED set ALONE — so a benign
+    // transition can't re-emit the "failed" banner (review). Emit on any change:
+    // a new/changed failure warns + signals; a failure clearing signals an empty
+    // set so the client retracts the banner (recovery).
+    const failedKey = failed.map(x => `${x.name}:${x.status}`).sort().join('|');
+    if (failedKey === (s.lastMcpFailedKey ?? '')) return; // failed set unchanged
+    const hadFailure = (s.lastMcpFailedKey ?? '') !== '';
+    s.lastMcpFailedKey = failedKey;
+    s.mcpFailed = failed;
+
+    if (failed.length) {
+      log.warn('sdk.mcp', 'mcp server(s) failed to connect', {
+        sessionId: s.sessionId,
+        corrId: s.sessionId,
+        data: { servers: failed },
+      });
+      eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, mcpServers: failed });
+    } else if (hadFailure) {
+      // Recovery: a previously-failed server now connects. Emit an empty set so
+      // the client clears the durable banner.
+      log.info('sdk.mcp', 'previously-failed mcp server(s) recovered', {
+        sessionId: s.sessionId,
+        corrId: s.sessionId,
+      });
+      eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, mcpServers: [] });
+    }
+  }
+
+  /** The current failed-MCP-server set for a session (durable across turns). */
+  getMcpFailed(sessionId: string): { name: string; status: string }[] {
+    return this.sessions.get(sessionId)?.mcpFailed ?? [];
   }
 
   /**
@@ -1740,6 +1828,7 @@ class SdkSessionManager {
       case 'system':
         if (anyMsg.subtype === 'init') {
           this.emitModelIfNew(s, anyMsg.model);
+          this.reportMcpServers(s, anyMsg.mcp_servers);
         } else if (anyMsg.subtype === 'api_retry') {
           // A transient API failure the SDK is AUTO-RETRYING (rate_limit /
           // overloaded / connection timeout arrive here, NOT as a fatal assistant
@@ -2322,7 +2411,19 @@ class SdkSessionManager {
 //     main-JSONL change (which is what the archiver keys on) will ever archive them
 //     (docs/ticket-stats-undercount-subagent-tokens.md, review Note 1). Without this
 //     bump the live instance keeps the old reconcile body and the trailing gap stays.
-const SINGLETON_VERSION = 28;
+// 29: handle() 'system:init' now reports mcp_servers status (reportMcpServers) — a
+//     failed/needs-auth MCP server logs under sdk.mcp and emits a session:stream
+//     {mcpServers} signal instead of being silently dropped
+//     (docs/ticket-local-mcp-this-project-fails-first-use.md, B4). Without this bump
+//     the live instance keeps the old handle() body and failures stay invisible.
+// 30: reportMcpServers only SURFACES status "failed" to the client (+warn); benign
+//     needs-auth/pending are log-only (log.info), so an un-authed claude.ai connector
+//     no longer raises a false "failed to connect" on every session (B4 review).
+// 31: durable failed-MCP status — reportMcpServers dedups on the FAILED set alone
+//     (a benign transition no longer re-emits the banner), tracks s.mcpFailed, and
+//     emits an empty set on recovery to clear it. getMcpFailed() exposes it so the
+//     client restores the banner on open via /api/stream-buffer (B4 review).
+const SINGLETON_VERSION = 31;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

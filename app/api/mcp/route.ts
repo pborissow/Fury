@@ -1,10 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { readFile, writeFile } from 'fs/promises';
+import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { mcpCache, projectKeyCandidates } from '@/lib/mcpCache';
+import { approveProjectServer } from '@/lib/mcpApprove';
+import { normalizeArgs, ensureDbParentDir } from '@/lib/mcpArgs';
 
 const execFileAsync = promisify(execFile);
 
@@ -26,33 +28,10 @@ function stableEnvKey(env: Record<string, string> | undefined): string {
   return JSON.stringify(keys.map(k => [k, env![k]]));
 }
 
-async function autoApproveProjectServer(projectPath: string, serverName: string): Promise<void> {
-  const cfgPath = join(homedir(), '.claude.json');
-  try {
-    const raw = await readFile(cfgPath, 'utf-8');
-    const cfg = JSON.parse(raw);
-    const key = projectPath.replace(/\\/g, '/');
-    if (!cfg.projects) cfg.projects = {};
-    if (!cfg.projects[key]) {
-      cfg.projects[key] = {
-        allowedTools: [], mcpContextUris: [], mcpServers: {},
-        enabledMcpjsonServers: [], disabledMcpjsonServers: [],
-        hasTrustDialogAccepted: false, projectOnboardingSeenCount: 0,
-        hasClaudeMdExternalIncludesApproved: false,
-        hasClaudeMdExternalIncludesWarningShown: false,
-      };
-    }
-    const enabled: string[] = cfg.projects[key].enabledMcpjsonServers || [];
-    if (!enabled.includes(serverName)) {
-      enabled.push(serverName);
-      cfg.projects[key].enabledMcpjsonServers = enabled;
-    }
-    const disabled: string[] = cfg.projects[key].disabledMcpjsonServers || [];
-    cfg.projects[key].disabledMcpjsonServers = disabled.filter((n: string) => n !== serverName);
-    await writeFile(cfgPath, JSON.stringify(cfg, null, 2));
-  } catch {
-    console.error('[MCP API] Failed to auto-approve project server:', serverName);
-  }
+// B2 lives in lib/mcpApprove.ts (atomic re-read + rename + verify-retry) so it
+// can be unit-tested against a temp config file under a competing writer.
+function autoApproveProjectServer(projectPath: string, serverName: string): Promise<boolean> {
+  return approveProjectServer(join(homedir(), '.claude.json'), projectPath, serverName);
 }
 
 export const dynamic = 'force-dynamic';
@@ -129,7 +108,7 @@ export async function POST(request: NextRequest) {
       }
 
       // Normalize the incoming args + env for comparison
-      const incomingArgs = args ? args.split(/\s+/).filter(Boolean) : [];
+      const incomingArgs = normalizeArgs(args);
       const incomingEnvKey = stableEnvKey(parseEnvLines(envVars));
       const transportKind: 'http' | 'stdio' = (transport || 'stdio') === 'http' ? 'http' : 'stdio';
 
@@ -167,12 +146,17 @@ export async function POST(request: NextRequest) {
 
     cliArgs.push(name, commandOrUrl);
 
-    // Add extra arguments after the command
-    if (args) {
-      const extraArgs = args.split(/\s+/).filter(Boolean);
-      if (extraArgs.length > 0) {
-        cliArgs.push('--', ...extraArgs);
-      }
+    // Add extra arguments after the command. Array in ⇒ array preserved, so a
+    // `--db <path with spaces>` stays a single argv entry (B3).
+    const extraArgs = normalizeArgs(args);
+    if (extraArgs.length > 0) {
+      cliArgs.push('--', ...extraArgs);
+    }
+
+    // B1: create the `--db` parent dir BEFORE the server can be launched, so
+    // codemogger doesn't crash on first open. No-op for servers without `--db`.
+    if ((transport || 'stdio') !== 'http') {
+      await ensureDbParentDir(extraArgs);
     }
 
     const execOpts: { timeout: number; encoding: 'utf-8'; env: NodeJS.ProcessEnv; cwd?: string } = {
@@ -190,11 +174,19 @@ export async function POST(request: NextRequest) {
 
     const output = (stdout || '') + (stderr || '');
     const effectiveScope: 'user' | 'project' = scope === 'project' ? 'project' : 'user';
+    let warning: string | undefined;
     if (effectiveScope === 'project' && projectPath) {
-      await autoApproveProjectServer(projectPath, name);
+      // The server IS registered (.mcp.json written) even if the trust write
+      // loses a race; surface a soft warning rather than failing the whole add,
+      // so the user knows the server may not load until manually approved.
+      const approved = await autoApproveProjectServer(projectPath, name);
+      if (!approved) {
+        warning = `Registered "${name}", but could not persist its trust approval in ~/.claude.json ` +
+          `(a concurrent writer kept clobbering it). It may not load until you enable it manually.`;
+      }
     }
     mcpCache.invalidate(projectPath || null, effectiveScope).catch(() => { /* background */ });
-    return NextResponse.json({ success: true, output: output.trim() });
+    return NextResponse.json({ success: true, output: output.trim(), ...(warning ? { warning } : {}) });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     console.error('[MCP API] Error adding MCP server:', message);

@@ -47,12 +47,19 @@ export async function GET(req: NextRequest) {
   // and a pending question must survive even when the buffer is missing/expired.
   const pendingAsk = sdkSessionManager.getPendingAsk(sessionId);
 
+  // Durable per-session MCP failures (B4). Returned on BOTH branches so the
+  // client restores the "failed to connect" banner on open / switch-back even
+  // when there's no active buffer — it survives turn resets and navigation, and
+  // an empty array clears it after a recovery.
+  const mcpFailed = sdkSessionManager.getMcpFailed(sessionId);
+
   if (!buffer) {
     return Response.json({
       hasBuffer: false,
       isProcessing,
       backgroundActive,
       pendingAsk,
+      mcpFailed,
     });
   }
 
@@ -66,5 +73,6 @@ export async function GET(req: NextRequest) {
     isActive: buffer.isActive,
     startedAt: buffer.startedAt,
     pendingAsk,
+    mcpFailed,
   });
 }

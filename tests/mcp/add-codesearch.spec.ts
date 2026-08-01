@@ -128,5 +128,25 @@ test.describe('MCP wizard — Code Search (codemogger)', () => {
     // Should use codemogger directly, not npx
     expect(detail).toContain('Command: codemogger');
     expect(detail).not.toContain('npx');
+
+    // B3: the --db path must survive intact as a single argument (the wizard now
+    // sends args as an array, so a spaced home wouldn't shatter it). The db path
+    // ends in `.codemogger/index.db` and `mcp` follows it on the same Args line.
+    const argsLine = detail.split('\n').find(l => l.includes('Args:')) || '';
+    console.log('Args line:', argsLine);
+    expect(argsLine).toContain('--db');
+    expect(argsLine).toMatch(/--db\s+\S*[/\\]\.codemogger[/\\]index\.db\s+mcp/);
+
+    // B1: registering the code-search server must ensure the --db parent dir
+    // exists so codemogger can open the DB on first use (it won't mkdir an
+    // explicit --db parent itself). We assert the dir exists post-registration.
+    // (The unit test tests/unit/mcp-args.test.ts proves it is CREATED when
+    // missing; here we can't delete the real ~/.codemogger without destroying
+    // the user's index, so this is the integration-level existence check.)
+    const { existsSync } = await import('fs');
+    const { homedir } = await import('os');
+    const { join } = await import('path');
+    const codemoggerDir = join(homedir(), '.codemogger');
+    expect(existsSync(codemoggerDir), `${codemoggerDir} should exist after registration`).toBe(true);
   });
 });

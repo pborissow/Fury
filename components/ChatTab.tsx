@@ -265,6 +265,13 @@ export default function ChatTab({
   // Cleared on the next send and on session switch.
   const [sessionError, setSessionError] = useState<string | null>(null);
 
+  // Durable per-session set of MCP servers that FAILED to connect at init (B4).
+  // Server-authoritative: set from the session-stream signal, restored from
+  // /api/stream-buffer on open, and cleared when the server reports recovery (an
+  // empty set) or on session switch. NOT stored in streamEvents, so it survives
+  // turn resets instead of vanishing with the live stream.
+  const [mcpFailedServers, setMcpFailedServers] = useState<{ name: string; status: string }[]>([]);
+
   // --- Scroll helper ---
   const scrollTranscriptToBottom = () => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -497,6 +504,10 @@ export default function ChatTab({
     setTranscriptStreaming('');
     setStreamEvents([]);
     setSessionError(null);
+    // Clear on switch; the target session's restore re-sets it from
+    // /api/stream-buffer (mcpFailed) below. NOT cleared on send — a still-failed
+    // server's banner must persist across turns.
+    setMcpFailedServers([]);
     setTranscriptLoading(false);
     // Clear background-work dots on switch; the target session's restore re-sets
     // it from /api/stream-buffer + /api/health below.
@@ -574,6 +585,8 @@ export default function ChatTab({
           // Before the isActive branch: a parked question must re-open whether
           // or not the buffer is still active.
           applyPendingAskFromBuffer(bufData, bufIssuedAt);
+          // Restore the durable failed-MCP banner for this session (B4).
+          setMcpFailedServers(Array.isArray(bufData.mcpFailed) ? bufData.mcpFailed : []);
           // Show the background-work dots immediately when opening a session whose
           // main turn is idle but which is still driving a background subagent.
           setBackgroundWorking(!!bufData.backgroundActive);
@@ -758,6 +771,8 @@ export default function ChatTab({
           // A question could have been asked in the gap between the initial
           // restore and this connect — that emit would have had no listener.
           applyPendingAskFromBuffer(bufData, bufIssuedAt);
+          // Re-sync the durable failed-MCP banner on connect (B4).
+          setMcpFailedServers(Array.isArray(bufData.mcpFailed) ? bufData.mcpFailed : []);
 
           // Sync background-work dots on connect (SSE may have missed the change).
           setBackgroundWorking(!!bufData.backgroundActive);
@@ -813,6 +828,23 @@ export default function ChatTab({
       if (!shouldProcess()) return;
 
       const data = JSON.parse(e.data);
+
+      // MCP status signal (B4) — handled BEFORE the loading guard: this is a
+      // one-shot init signal, not turn stream data. The server sends only
+      // genuinely FAILED servers (benign needs-auth/pending are log-only, so this
+      // never fires for an un-authed claude.ai connector), and an EMPTY array is
+      // a recovery/clear. We store it in durable per-session state (not
+      // streamEvents) so the banner survives turn resets and clears on recovery.
+      if (Array.isArray(data.mcpServers)) {
+        setMcpFailedServers(data.mcpServers);
+        if (data.mcpServers.length > 0) {
+          uiLog('warn', 'chat.mcp', 'mcp server(s) failed to connect', {
+            sessionId: mySessionId,
+            data: { servers: data.mcpServers },
+          });
+        }
+        return;
+      }
 
       // Ignore stream data that arrives after the user has stopped processing.
       // Without this guard, buffered events could overwrite the cleared state.
@@ -1193,6 +1225,8 @@ export default function ChatTab({
         // SSE was ignored while hidden, so a question asked in that window never
         // reached us — and Claude is still parked on it.
         applyPendingAskFromBuffer(bufData, bufIssuedAt);
+        // Re-sync the durable failed-MCP banner on visibility catch-up (B4).
+        setMcpFailedServers(Array.isArray(bufData.mcpFailed) ? bufData.mcpFailed : []);
 
         if (bufData.isProcessing || (bufData.hasBuffer && bufData.isActive)) {
           // Session is still processing — restore stream state
@@ -2090,6 +2124,20 @@ export default function ChatTab({
                               </div>
                             </div>
                           )}
+                          {mcpFailedServers.length > 0 && (
+                            <div className="flex justify-start" data-testid="mcp-failed">
+                              <div className="max-w-[80%] rounded-lg px-4 py-2 bg-destructive/10 text-foreground border border-destructive/40 text-left">
+                                <div className="text-xs text-destructive mb-1 flex items-center gap-1">
+                                  <AlertTriangle className="h-3 w-3" />
+                                  MCP {mcpFailedServers.length > 1 ? 'servers' : 'server'} failed to connect
+                                </div>
+                                <div className="text-sm">
+                                  {mcpFailedServers.map(m => m.name).join(', ')}
+                                  <span className="text-muted-foreground"> — its tools aren&apos;t available this session.</span>
+                                </div>
+                              </div>
+                            </div>
+                          )}
                           {suggestedPrompt && !transcriptLoading && promptSuggestionsEnabled && (
                             <div className="flex justify-start">
                               <button
@@ -2214,7 +2262,7 @@ export default function ChatTab({
               )}
             </div>
           )}
-          {rightPanelView === 'mcp' && <McpPanel projectPath={historyTranscriptProject} />}
+          {rightPanelView === 'mcp' && <McpPanel projectPath={historyTranscriptProject} runtimeFailed={mcpFailedServers} />}
         </div>
       </Panel>
     </PanelGroup>

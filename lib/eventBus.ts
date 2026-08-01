@@ -27,6 +27,18 @@ export interface SessionStreamEvent {
    * another tab, teardown) so open dialogs can close themselves.
    */
   askUserQuestion?: { toolUseID: string; questions: any[] } | { cleared: true };
+  /**
+   * MCP servers that FAILED to connect at session `system:init` (status
+   * "failed" — the server crashed/couldn't start). Emitted once per init so the
+   * UI can surface "codemogger failed to connect" instead of the MCP panel's
+   * config-derived healthy badge. Deliberately excludes benign non-connected
+   * states (needs-auth / pending) — those are log-only, so an un-authed claude.ai
+   * connector doesn't raise a false "failed" on every session. An explicit EMPTY
+   * array is a CLEAR signal (a previously-failed server recovered) — the client
+   * retracts its banner. The authoritative set is also on /api/stream-buffer
+   * (`mcpFailed`) for restore-on-open. (B4 in the ticket.)
+   */
+  mcpServers?: { name: string; status: string }[];
 }
 
 export interface SessionHealthEvent {
