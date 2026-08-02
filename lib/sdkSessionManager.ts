@@ -17,6 +17,8 @@ import {
 } from './transcriptArchiver';
 import { eventBus } from './eventBus';
 import { codemoggerReindexer } from './codemoggerReindex';
+import { codemoggerSdkServer } from './codemoggerServer';
+import { isCodeSearchEnabled, codeSearchDbPath } from './codeSearchConfig';
 import { log } from './logger';
 import { findSessionJsonlDir } from './sessionPaths';
 // Type-only (erased at compile time) — no runtime coupling to the CLI manager.
@@ -1724,6 +1726,15 @@ class SdkSessionManager {
         includePartialMessages: true,
         permissionMode: 'bypassPermissions',
         enableFileCheckpointing: true,
+        // In-process code search (docs/ticket-codesearch-inprocess-mcp-macos-
+        // contention.md): when this project has code search enabled, attach the
+        // codemogger SDK MCP server that runs IN Fury's process — one DB writer,
+        // no spawned codemogger process. Built synchronously (no embedder load;
+        // that happens lazily on the first search). NOT strictMcpConfig, so it
+        // merges with any real `.mcp.json` servers the CLI also loads from cwd.
+        ...(s.projectPath && isCodeSearchEnabled(s.projectPath)
+          ? { mcpServers: { codemogger: codemoggerSdkServer(s.projectPath, codeSearchDbPath(s.projectPath)) } }
+          : {}),
         // Replay the session's chosen model. Omitted entirely when unset so the
         // CLI default applies — passing model: undefined is equivalent, but
         // being explicit keeps the "we never chose" case out of the options.
@@ -2436,7 +2447,12 @@ class SdkSessionManager {
 //     single-flight) — index freshness follow-up in the local-MCP ticket. Without
 //     this bump the live instance keeps the old sendMessage and never starts the
 //     watcher.
-const SINGLETON_VERSION = 32;
+// 33: startQuery attaches the IN-PROCESS codemogger SDK MCP server via
+//     options.mcpServers when the project has code search enabled (in-process
+//     engine, docs/ticket-codesearch-inprocess-mcp-macos-contention.md). Without
+//     this bump the live instance keeps the old startQuery and code search would
+//     still rely on a spawned stdio process (the contention this ticket removes).
+const SINGLETON_VERSION = 33;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

@@ -62,10 +62,9 @@ function getEmbedder(): Promise<Embedder> {
   return embedderPromise;
 }
 
-// ── Per-project registry (one CodeIndex + one SDK server each) ──────────────────
+// ── Per-project registry (one CodeIndex each) ───────────────────────────────────
 interface Entry {
   codeIndex: CodeIndex;
-  server: McpSdkServerConfigWithInstance;
 }
 // registry holds a PROMISE per project so creation is single-flight — two concurrent
 // callers must not build two CodeIndex instances (two DB connections) for one project.
@@ -93,11 +92,24 @@ function formatResults(results: SearchResult[], includeSnippet: boolean): string
   }).join('\n\n');
 }
 
-/** Build the in-process SDK MCP server exposing codemogger's tools bound to `ci`. */
-function buildServer(key: string, ci: CodeIndex): McpSdkServerConfigWithInstance {
+/**
+ * Build the in-process SDK MCP server exposing codemogger's tools for a project.
+ *
+ * Built synchronously and cheaply — the heavy engine (`CodeIndex` + embedder) is
+ * NOT created here. Each tool handler lazily resolves it via `getOrCreate(key,
+ * dbPath)` on first invocation, so a session that never searches never pays the
+ * embedder-load cost, and attaching this server at query-open time stays sync.
+ */
+function buildServer(key: string, dbPath: string): McpSdkServerConfigWithInstance {
   return createSdkMcpServer({
     name: 'codemogger',
     version: '0.1.0',
+    // Preload these 3 tool schemas instead of deferring them behind ToolSearch: code
+    // search is only useful if the model reaches for it PROACTIVELY (the CLAUDE.md
+    // template says to prefer codemogger_search over Grep/Glob), and a deferral hop
+    // works against that. Scoped to codemogger — other MCP servers stay deferred. The
+    // cost is 3 small tool definitions in context per turn (negligible).
+    alwaysLoad: true,
     tools: [
       tool(
         'codemogger_search',
@@ -110,8 +122,9 @@ function buildServer(key: string, ci: CodeIndex): McpSdkServerConfigWithInstance
         },
         async (args) => {
           const includeSnippet = args.includeSnippet ?? true;
+          const { codeIndex } = await getOrCreate(key, dbPath);
           const results = await withLock(key, () =>
-            ci.search(args.query, { mode: args.mode ?? 'semantic', limit: args.limit ?? 10, includeSnippet }));
+            codeIndex.search(args.query, { mode: args.mode ?? 'semantic', limit: args.limit ?? 10, includeSnippet }));
           return { content: [{ type: 'text', text: formatResults(results, includeSnippet) }] };
         },
       ),
@@ -120,7 +133,8 @@ function buildServer(key: string, ci: CodeIndex): McpSdkServerConfigWithInstance
         'Index (or re-index) a directory of this project into the code-search index.',
         { directory: z.string() },
         async (args) => {
-          const r = await withLock(key, () => ci.index(args.directory));
+          const { codeIndex } = await getOrCreate(key, dbPath);
+          const r = await withLock(key, () => codeIndex.index(args.directory));
           return { content: [{ type: 'text', text: `Indexed ${r.files} files → ${r.chunks} chunks (embedded ${r.embedded}, skipped ${r.skipped}, removed ${r.removed}).` }] };
         },
       ),
@@ -129,7 +143,8 @@ function buildServer(key: string, ci: CodeIndex): McpSdkServerConfigWithInstance
         'Re-index a directory (incremental; unchanged files are skipped). Fury also auto-reindexes on file changes.',
         { directory: z.string() },
         async (args) => {
-          const r = await withLock(key, () => ci.index(args.directory));
+          const { codeIndex } = await getOrCreate(key, dbPath);
+          const r = await withLock(key, () => codeIndex.index(args.directory));
           return { content: [{ type: 'text', text: `Reindexed ${r.files} files → ${r.chunks} chunks (embedded ${r.embedded}, skipped ${r.skipped}, removed ${r.removed}).` }] };
         },
       ),
@@ -145,7 +160,7 @@ function getOrCreate(key: string, dbPath: string): Promise<Entry> {
       mkdirSync(dirname(dbPath), { recursive: true }); // CodeIndex won't mkdir an explicit db parent
       const [Ctor, embedder] = await Promise.all([loadCodeIndexCtor(), getEmbedder()]);
       const codeIndex = new Ctor({ dbPath, embedder, embeddingModel: EMBEDDING_MODEL });
-      return { codeIndex, server: buildServer(key, codeIndex) };
+      return { codeIndex };
     })().catch((err) => { registry.delete(key); throw err; }); // allow retry after a failed load
     registry.set(key, p);
   }
@@ -154,10 +169,19 @@ function getOrCreate(key: string, dbPath: string): Promise<Entry> {
 
 /**
  * The in-process codemogger SDK MCP server for a project, to pass to the SDK's
- * `options.mcpServers`. Ensures the engine exists (loads the embedder on first use).
+ * `options.mcpServers`. SYNCHRONOUS and cheap — it does NOT load the engine or the
+ * embedder; the tool handlers do that lazily on first search.
+ *
+ * A FRESH server instance is built PER CALL (per SDK session), NOT cached/shared: an
+ * in-process `createSdkMcpServer` instance backs a single client connection, and a
+ * prior session's teardown disposes it — so sharing one instance across concurrent
+ * sessions makes the second session's codemogger "fail to connect" (observed:
+ * warmup + find-turn on one project → find-turn's server failed). Every instance's
+ * tool handlers route to the ONE shared `CodeIndex` via `getOrCreate`, so there's
+ * still a single DB writer no matter how many session frontends exist.
  */
-export async function codemoggerSdkServer(projectPath: string, dbPath: string): Promise<McpSdkServerConfigWithInstance> {
-  return (await getOrCreate(norm(projectPath), dbPath)).server;
+export function codemoggerSdkServer(projectPath: string, dbPath: string): McpSdkServerConfigWithInstance {
+  return buildServer(norm(projectPath), dbPath);
 }
 
 /**

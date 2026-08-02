@@ -1,33 +1,34 @@
 /**
- * FULL end-to-end drive for the "This project" code-search auto-refresh
- * (docs/ticket-local-mcp-this-project-fails-first-use.md → Index freshness).
+ * FULL end-to-end drive for "This project" code-search auto-refresh, IN-PROCESS
+ * (docs/ticket-codesearch-inprocess-mcp-macos-contention.md → Option A).
  *
- * Exercises the whole chain through the REAL server: register codemogger for a
- * project (POST /api/mcp → B1 dir + B2 approve), start a Fury SDK session (whose
- * turn starts the server-side auto-reindex watcher via sendMessage→ensureWatching),
- * then cover BOTH kinds of change the watcher must handle:
+ * Exercises the whole chain through the REAL server with ONE process owning the DB
+ * (acceptance #1 + #3): enable code search for a project (POST /api/code-search →
+ * config + initial in-process index), start a Fury SDK session (whose turn starts the
+ * server-side auto-reindex watcher via sendMessage→ensureWatching), then cover BOTH
+ * kinds of change the watcher must handle — each observed by searching THROUGH the
+ * server (the single DB owner), never a second codemogger process:
  *   1a. CREATE a new source file  → auto-indexed; a real Claude turn finds the symbol
  *       via `mcp__codemogger__codemogger_search` (grounded answer proves it read the
- *       freshly-refreshed index).
+ *       freshly-refreshed index, served in-process).
  *   1b. DELETE that file          → dropped from the index.
- *   2a. ADD code to an EXISTING, already-indexed file (an in-place `change`, not a
- *       create) → the new symbol is auto-indexed and the file's other symbols survive.
- *   2b. REMOVE that code from the existing file → the symbol is dropped, siblings kept.
+ *   2a. ADD code to an EXISTING, already-indexed file → the new symbol is auto-indexed
+ *       and the file's other symbols survive.
+ *   2b. REMOVE that code          → the symbol is dropped, siblings kept.
  *
- * Uses a snake_case name (`compute_purple_platypus_quotient`) on purpose — see the
- * tokenization note below. The reindex assertions search a SUB-TOKEN in keyword mode
- * and the exact name in semantic mode, because codemogger's `default` FTS silently
- * drops an underscored *keyword* query longer than ~25–31 chars (Turso tokenizer),
- * so the exact snake_case name in keyword mode is an unreliable probe. Semantic mode
- * and sub-tokens are unaffected — which is also why the Claude turn asks for SEMANTIC.
+ * Uses a snake_case name on purpose (see the tokenization note): the reindex
+ * assertions search a SUB-TOKEN in keyword mode and the exact name in semantic mode,
+ * because codemogger's `default` FTS silently drops an underscored *keyword* query
+ * longer than ~25–31 chars — so the exact snake_case name in keyword mode is an
+ * unreliable probe. Semantic mode and sub-tokens are unaffected (also why the Claude
+ * turn asks for SEMANTIC).
  *
- * COST/TIME: two real Claude turns (a trivial warmup + the search) + local codemogger
- * runs. Skips on Linux (recursive fs.watch, hence auto-reindex, is macOS/Windows only).
+ * COST/TIME: one warmup turn + one search turn + in-process indexing; polling is
+ * token-free (server search endpoint). Skips on Linux (recursive fs.watch, hence
+ * auto-reindex, is macOS/Windows only).
  */
 import { test, expect } from '@playwright/test';
 import { randomUUID } from 'crypto';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import { existsSync, readFileSync, writeFileSync, rmSync, readdirSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
@@ -37,10 +38,7 @@ import {
 } from './drive-helpers';
 import { RECURSIVE_WATCH_SUPPORTED } from '../../lib/codemoggerReindex';
 
-const execFileAsync = promisify(execFile);
-const CLI = join(__dirname, '..', '..', 'node_modules', 'codemogger', 'dist', 'cli.mjs');
 const PROJECT = join(__dirname, '..', '..', '..', 'fury-e2e-mcp-refresh');
-const SERVER_NAME = 'codemogger';
 // Scenario 1 — a brand-NEW file (create/delete).
 const NEW_FILE = 'platypus.ts';
 const NEW_SYMBOL = 'compute_purple_platypus_quotient';
@@ -54,32 +52,28 @@ const BASE_ONLY = 'export function seed_baseline_function() { return 0; }\n';
 const BASE_PLUS = BASE_ONLY +
   `export function ${EXISTING_SYMBOL}(n: number): number {\n  // returns 99 times the input\n  return n * 99;\n}\n`;
 
-/** Keyword-search hit count on the scratch DB (parses codemogger JSON). */
-async function keywordHits(db: string, query: string): Promise<number> {
-  const res = await execFileAsync(process.execPath, [CLI, '--db', db, 'search', query, '--mode', 'keyword'], { timeout: 60_000 })
-    .catch(() => ({ stdout: '{"results":[]}' }));
-  try { return (JSON.parse(res.stdout).results || []).length; } catch { return 0; }
+/** Search a project's index THROUGH the dev server (the single DB owner). */
+async function serverSearch(project: string, query: string, mode: 'keyword' | 'semantic'): Promise<{ name?: string }[]> {
+  const url = `${BASE_URL}/api/code-search?projectPath=${encodeURIComponent(project)}&q=${encodeURIComponent(query)}&mode=${mode}`;
+  const res = await fetch(url).then(r => r.json()).catch(() => ({ results: [] }));
+  return Array.isArray(res.results) ? res.results : [];
+}
+async function keywordHits(project: string, query: string): Promise<number> {
+  return (await serverSearch(project, query, 'keyword')).length;
 }
 
-async function registerCodemogger(project: string, args: string[]): Promise<Response> {
-  return fetch(`${BASE_URL}/api/mcp`, {
+async function enableCodeSearch(project: string, dirs: string[]): Promise<Response> {
+  return fetch(`${BASE_URL}/api/code-search`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: SERVER_NAME, transport: 'stdio', commandOrUrl: 'codemogger', args, scope: 'project', projectPath: project }),
+    body: JSON.stringify({ projectPath: project, dirs }),
   });
 }
-
-async function removeServer(project: string): Promise<void> {
+async function disableCodeSearch(project: string): Promise<void> {
   try {
-    await fetch(`${BASE_URL}/api/mcp`, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: SERVER_NAME, projectPath: project }) });
-  } catch { /* best effort */ }
-  try {
-    const { homedir } = await import('os');
-    const cj = join(homedir(), '.claude.json');
-    if (existsSync(cj)) {
-      const cfg = JSON.parse(readFileSync(cj, 'utf8'));
-      const key = project.replace(/\\/g, '/');
-      if (cfg.projects?.[key]) { delete cfg.projects[key]; writeFileSync(cj, JSON.stringify(cfg, null, 2)); }
-    }
+    await fetch(`${BASE_URL}/api/code-search`, {
+      method: 'DELETE', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectPath: project }),
+    });
   } catch { /* best effort */ }
 }
 
@@ -137,25 +131,24 @@ async function waitTurnDone(sessionId: string, timeoutMs: number): Promise<void>
   }
 }
 
-/** Poll the scratch DB until `predicate(hits)` for `query` (keyword) holds, or time out. */
-async function waitForIndex(db: string, query: string, predicate: (hits: number) => boolean, timeoutMs: number): Promise<number> {
+/** Poll the index (through the server) until `predicate(hits)` for `query` holds. */
+async function waitForIndex(project: string, query: string, predicate: (hits: number) => boolean, timeoutMs: number): Promise<number> {
   const deadline = Date.now() + timeoutMs;
-  let hits = await keywordHits(db, query);
+  let hits = await keywordHits(project, query);
   while (Date.now() < deadline) {
     if (predicate(hits)) return hits;
     await sleep(3000);
-    hits = await keywordHits(db, query);
+    hits = await keywordHits(project, query);
   }
   return hits;
 }
 
-test.describe('This project code-search — auto-refresh (full e2e)', () => {
+test.describe('This project code-search — auto-refresh (full e2e, in-process)', () => {
   let sessionId: string | null = null;
-  const db = join(PROJECT, '.codemogger', 'index.db');
 
   test.afterAll(async () => {
     await cleanupSession(sessionId, PROJECT);
-    await removeServer(PROJECT);
+    await disableCodeSearch(PROJECT);
     try { rmSync(PROJECT, { recursive: true, force: true }); } catch { /* best effort */ }
   });
 
@@ -168,24 +161,21 @@ test.describe('This project code-search — auto-refresh (full e2e)', () => {
     await resetProjectDir(PROJECT);
     console.log(`[E2E] session=${sessionId} project=${PROJECT}`);
 
-    await test.step('setup: register codemogger, seed index, start the server watcher', async () => {
-      // Register codemogger (real route: B1 dir + B2 approve) and seed a base index
-      // from an EXISTING file that scenario 2 will later mutate in place.
+    await test.step('setup: enable code search, seed index, start the server watcher', async () => {
+      // Seed a base index from an EXISTING file that scenario 2 will later mutate in place.
       writeFileSync(join(PROJECT, EXISTING_FILE), BASE_ONLY);
-      const reg = await registerCodemogger(PROJECT, ['--db', db, 'mcp']);
-      expect(reg.ok, 'POST /api/mcp registered codemogger').toBe(true);
-      expect(existsSync(join(PROJECT, '.codemogger')), 'B1: --db parent dir created').toBe(true);
-      await execFileAsync(process.execPath, [CLI, '--db', db, 'index', PROJECT], { timeout: 120_000 });
-      expect(await keywordHits(db, NEW_SUBTOKEN), 'new-file symbol absent before it is written').toBe(0);
-      expect(await keywordHits(db, EXISTING_SUBTOKEN), 'in-file symbol absent before it is added').toBe(0);
+      const reg = await enableCodeSearch(PROJECT, [PROJECT]);
+      expect(reg.ok, 'POST /api/code-search enabled code search').toBe(true);
+      expect(existsSync(join(PROJECT, '.codemogger', 'fury-codesearch.json')), 'config written').toBe(true);
+      // Wait for the initial in-process index to settle (baseline present).
+      expect(await waitForIndex(PROJECT, BASELINE_SUBTOKEN, h => h > 0, 90_000), 'baseline indexed').toBeGreaterThan(0);
+      expect(await keywordHits(PROJECT, NEW_SUBTOKEN), 'new-file symbol absent before it is written').toBe(0);
+      expect(await keywordHits(PROJECT, EXISTING_SUBTOKEN), 'in-file symbol absent before it is added').toBe(0);
 
       // Warmup turn — starts the SERVER-SIDE watcher (sendMessage → ensureWatching).
       await driveTurn(sessionId!, PROJECT, 'Reply with exactly the word: ready.');
       await waitTurnDone(sessionId!, 90_000);
       await sleep(2000); // let ensureWatching attach
-      // The watcher log is keyed on project, not session. Informational — the reindex
-      // assertions below are the real proof. (If false, the dev server is likely on a
-      // pre-v32 singleton without ensureWatching in sendMessage — restart it.)
       const watching = furyLogsRaw().some(e => e.scope === 'codemogger.reindex' && e.msg === 'watching'
         && String(e?.data?.project || '').replace(/\\/g, '/').includes('/fury-e2e-mcp-refresh'));
       console.log('[E2E] server auto-reindex watcher attached:', watching);
@@ -195,14 +185,13 @@ test.describe('This project code-search — auto-refresh (full e2e)', () => {
     await test.step('scenario 1a — CREATE a new source file → auto-indexed', async () => {
       writeFileSync(join(PROJECT, NEW_FILE),
         `export function ${NEW_SYMBOL}(n: number): number {\n  // returns 42 times the input\n  return n * 42;\n}\n`);
-      const hits = await waitForIndex(db, NEW_SUBTOKEN, h => h > 0, 60_000);
+      const hits = await waitForIndex(PROJECT, NEW_SUBTOKEN, h => h > 0, 60_000);
       expect(hits, `auto-reindex made "${NEW_SUBTOKEN}" searchable after CREATE`).toBeGreaterThan(0);
 
-      // Tokenization note (the snake_case question), asserted live on the fresh index:
-      // exact underscored name in KEYWORD mode returns nothing (>~30 chars); SEMANTIC finds it.
-      const kwExact = await keywordHits(db, NEW_SYMBOL);
-      const semExact = await execFileAsync(process.execPath, [CLI, '--db', db, 'search', NEW_SYMBOL, '--mode', 'semantic'], { timeout: 60_000 })
-        .then(r => (JSON.parse(r.stdout).results || []).some((x: any) => x.name === NEW_SYMBOL)).catch(() => false);
+      // Tokenization note asserted live on the fresh index: exact underscored name in
+      // KEYWORD mode returns nothing (>~30 chars); SEMANTIC finds it.
+      const kwExact = await keywordHits(PROJECT, NEW_SYMBOL);
+      const semExact = (await serverSearch(PROJECT, NEW_SYMBOL, 'semantic')).some(x => x.name === NEW_SYMBOL);
       console.log(`[E2E] snake_case: keyword-exact hits=${kwExact} (expected 0 — FTS length quirk), semantic-finds-exact=${semExact}`);
       expect(semExact, 'semantic search finds the exact snake_case name').toBe(true);
     });
@@ -228,26 +217,23 @@ test.describe('This project code-search — auto-refresh (full e2e)', () => {
 
     await test.step('scenario 1b — DELETE the source file → dropped from the index', async () => {
       rmSync(join(PROJECT, NEW_FILE));
-      const hits = await waitForIndex(db, NEW_SUBTOKEN, h => h === 0, 60_000);
+      const hits = await waitForIndex(PROJECT, NEW_SUBTOKEN, h => h === 0, 60_000);
       expect(hits, `auto-reindex removed "${NEW_SUBTOKEN}" after DELETE`).toBe(0);
     });
 
     await test.step('scenario 2a — ADD code to an EXISTING indexed file → auto-indexed', async () => {
-      // Modify base.ts in place (a change event, not a create) — appends a new function.
       writeFileSync(join(PROJECT, EXISTING_FILE), BASE_PLUS);
-      const hits = await waitForIndex(db, EXISTING_SUBTOKEN, h => h > 0, 60_000);
+      const hits = await waitForIndex(PROJECT, EXISTING_SUBTOKEN, h => h > 0, 60_000);
       expect(hits, `auto-reindex indexed "${EXISTING_SUBTOKEN}" added to an existing file`).toBeGreaterThan(0);
       // The pre-existing symbol in the same file is still indexed (incremental re-chunk).
-      expect(await keywordHits(db, BASELINE_SUBTOKEN), 'the pre-existing function survived the re-index').toBeGreaterThan(0);
+      expect(await keywordHits(PROJECT, BASELINE_SUBTOKEN), 'the pre-existing function survived the re-index').toBeGreaterThan(0);
     });
 
     await test.step('scenario 2b — REMOVE code from the existing file → dropped from the index', async () => {
-      // Rewrite base.ts back to just the baseline (removes the added function).
       writeFileSync(join(PROJECT, EXISTING_FILE), BASE_ONLY);
-      const hits = await waitForIndex(db, EXISTING_SUBTOKEN, h => h === 0, 60_000);
+      const hits = await waitForIndex(PROJECT, EXISTING_SUBTOKEN, h => h === 0, 60_000);
       expect(hits, `auto-reindex dropped "${EXISTING_SUBTOKEN}" after it was removed from the file`).toBe(0);
-      // The untouched baseline function is still there.
-      expect(await keywordHits(db, BASELINE_SUBTOKEN), 'baseline function still indexed').toBeGreaterThan(0);
+      expect(await keywordHits(PROJECT, BASELINE_SUBTOKEN), 'baseline function still indexed').toBeGreaterThan(0);
     });
   });
 });

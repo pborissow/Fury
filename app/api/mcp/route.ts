@@ -4,10 +4,10 @@ import { promisify } from 'util';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
-import { mcpCache, projectKeyCandidates } from '@/lib/mcpCache';
+import { mcpCache, projectKeyCandidates, type McpServer } from '@/lib/mcpCache';
 import { approveProjectServer } from '@/lib/mcpApprove';
-import { normalizeArgs, ensureDbParentDir, dbPathFromArgs, ensureGitignoredIfRepo } from '@/lib/mcpArgs';
-import { writeIndexDirs, codemoggerReindexer } from '@/lib/codemoggerReindex';
+import { normalizeArgs, ensureDbParentDir } from '@/lib/mcpArgs';
+import { migrateStdioCodemogger, readCodeSearchConfig } from '@/lib/codeSearchConfig';
 
 const execFileAsync = promisify(execFile);
 
@@ -37,13 +37,45 @@ function autoApproveProjectServer(projectPath: string, serverName: string): Prom
 
 export const dynamic = 'force-dynamic';
 
+/** Type of the synthetic in-process code-search entry surfaced in the server list. */
+type CodeSearchServer = McpServer & { codeSearch: true; dirs: string[] };
+
+/**
+ * Prepend a synthetic "code search" entry when the project has in-process code
+ * search enabled. It's NOT a real MCP server (no stdio/http process) — the panel
+ * renders it as a distinct row and disables it via /api/code-search.
+ */
+function withCodeSearchEntry(projectPath: string | null, servers: McpServer[]): (McpServer | CodeSearchServer)[] {
+  if (!projectPath) return servers;
+  const cfg = readCodeSearchConfig(projectPath);
+  if (!cfg) return servers;
+  const dirs = cfg.dirs.length ? cfg.dirs : [projectPath];
+  const entry: CodeSearchServer = {
+    name: 'codemogger',
+    url: `in-process code search · ${dirs.length} dir${dirs.length === 1 ? '' : 's'}`,
+    status: 'connected',
+    statusDetail: 'In-process (Fury) — no separate process',
+    scope: 'project',
+    transport: 'stdio',
+    codeSearch: true,
+    dirs,
+  };
+  return [entry, ...servers];
+}
+
 export async function GET(request: NextRequest) {
   mcpCache.start();
   try {
     const { searchParams } = new URL(request.url);
     const projectPath = searchParams.get('projectPath');
+    // Auto-migrate a legacy stdio codemogger .mcp.json entry to the in-process model
+    // (docs/ticket-codesearch-inprocess-mcp-macos-contention.md). Best-effort; if it
+    // changed anything, drop the stale MCP-list cache so the removed entry disappears.
+    if (projectPath && migrateStdioCodemogger(projectPath)) {
+      mcpCache.invalidate(projectPath, 'project').catch(() => { /* background */ });
+    }
     const { servers, error } = await mcpCache.get(projectPath);
-    return NextResponse.json({ servers, ...(error ? { error } : {}) });
+    return NextResponse.json({ servers: withCodeSearchEntry(projectPath, servers), ...(error ? { error } : {}) });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     console.error('[MCP API] Error listing MCP servers:', message);
@@ -57,7 +89,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { name, transport, commandOrUrl, args, envVars, scope, projectPath, indexDirs } = body;
+    const { name, transport, commandOrUrl, args, envVars, scope, projectPath } = body;
 
     if (!name || !commandOrUrl) {
       return NextResponse.json(
@@ -186,19 +218,9 @@ export async function POST(request: NextRequest) {
           `(a concurrent writer kept clobbering it). It may not load until you enable it manually.`;
       }
     }
-    // Code search (codemogger): the wizard sends the selected directories to index.
-    // Record them in a per-project sidecar (so the watcher reindexes exactly those),
-    // keep the per-project index DB out of git, and kick off the initial index. The
-    // .mcp.json is already written (claude mcp add, above), so the reindexer can read
-    // the --db + dirs. Fire-and-forget so the wizard returns immediately.
-    if (Array.isArray(indexDirs) && projectPath) {
-      const dbPath = dbPathFromArgs(normalizeArgs(args));
-      if (dbPath) {
-        writeIndexDirs(dbPath, indexDirs as string[]);
-        await ensureGitignoredIfRepo(projectPath, '.codemogger/');
-        void codemoggerReindexer.reindexNow(projectPath).catch(() => { /* logged inside */ });
-      }
-    }
+    // NOTE: "This project" code search is no longer registered here — it's enabled
+    // in-process via POST /api/code-search (no stdio MCP server is added), so there's
+    // no codesearch branch in this generic MCP-add path anymore.
     mcpCache.invalidate(projectPath || null, effectiveScope).catch(() => { /* background */ });
     return NextResponse.json({ success: true, output: output.trim(), ...(warning ? { warning } : {}) });
   } catch (error: unknown) {

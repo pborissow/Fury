@@ -13,6 +13,11 @@ interface McpServer {
   statusDetail: string;
   scope?: 'project' | 'user' | 'unknown';
   transport?: 'stdio' | 'http' | 'unknown';
+  /** Synthetic entry for in-process "This project" code search (not a real MCP
+   *  server). Rendered in the list but disabled/removed via /api/code-search. */
+  codeSearch?: boolean;
+  /** Indexed directories, for the code-search synthetic entry. */
+  dirs?: string[];
 }
 
 interface McpForm {
@@ -170,17 +175,12 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
     });
   }, [mcpServers]);
 
-  // Code search is "already set up" for THIS project when a project-scoped stdio
-  // server's command references codemogger (the codesearch flow always registers
-  // `commandOrUrl: 'codemogger'`). Key on the command (server.url carries it for
-  // stdio), NOT the name — users can rename the server. Scoped to `project` so a
-  // user-scoped codemogger elsewhere doesn't disable the card here. When set, the
-  // Step-1 "This project" card is disabled up-front instead of round-tripping to
-  // the route's 409 (which stays as the server-side backstop).
+  // Code search is "already set up" for THIS project when the in-process code-search
+  // entry is present (the API injects a synthetic `codeSearch` server when
+  // `<project>/.codemogger/fury-codesearch.json` exists). When set, the Step-1 "This
+  // project" wizard card is disabled up-front.
   const codeSearchConfigured = useMemo(
-    () => mcpServers.some(
-      s => s.transport === 'stdio' && s.scope === 'project' && /(^|[/\\\s])codemogger\b/i.test(s.url),
-    ),
+    () => mcpServers.some(s => s.codeSearch),
     [mcpServers],
   );
 
@@ -224,11 +224,19 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
     if (!deleteTarget) return;
     setDeleteLoading(true);
     try {
-      const res = await fetch('/api/mcp', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: deleteTarget.name, projectPath }),
-      });
+      // The synthetic code-search entry isn't a real MCP server — disabling it goes
+      // through /api/code-search (removes the config + closes the in-process engine).
+      const res = deleteTarget.codeSearch
+        ? await fetch('/api/code-search', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectPath }),
+          })
+        : await fetch('/api/mcp', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: deleteTarget.name, projectPath }),
+          });
       const data = await res.json();
       if (!res.ok || data.error) {
         setMcpError(data.error || 'Failed to remove server');
@@ -317,43 +325,32 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
         });
       }
 
-      // Code search: translate to stdio with codemogger command
+      // Code search: enable the IN-PROCESS engine for this project (no MCP server
+      // is registered — docs/ticket-codesearch-inprocess-mcp-macos-contention.md).
+      // The route writes `<project>/.codemogger/fury-codesearch.json`, gitignores
+      // `.codemogger/`, strips any legacy stdio codemogger entry, and kicks off the
+      // initial in-process index. Search then runs inside Fury's process, so there's
+      // no separate codemogger process contending on the DB.
       if (mcpForm.transport === 'codesearch') {
-        // Per-PROJECT index DB, inside the project tree (codemogger's own default
-        // convention). A single shared ~/.codemogger DB made every project's search
-        // return every other project's hits — this isolates them. The server creates
-        // the dir, gitignores `.codemogger/` (only in a git repo), records the
-        // selected directories, and indexes them.
-        const base = (projectPath || '.').replace(/\\/g, '/').replace(/\/+$/, '');
-        const dbPath = `${base}/.codemogger/index.db`;
-
-        const res = await fetch('/api/mcp', {
+        const res = await fetch('/api/code-search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            name: mcpForm.name,
-            transport: 'stdio',
-            commandOrUrl: 'codemogger',
-            // Array, not a joined string: keeps `--db <dbPath>` a single argv
-            // entry even when the path contains a space (B3).
-            args: ['--db', dbPath, 'mcp'],
-            envVars: '',
-            scope: mcpForm.scope,
             projectPath,
             // The directories the user chose to index (scoped, not the whole project).
-            indexDirs: mcpForm.directories,
+            dirs: mcpForm.directories,
           }),
         });
         const data = await res.json();
         if (!res.ok || data.error) {
-          setMcpAddError(data.error || 'Failed to add server');
+          setMcpAddError(data.error || 'Failed to enable code search');
           return;
         }
 
         fetchMcpServers();
         setEditingServerName(null);
-        setAddedServers([{ name: mcpForm.name, url: `codemogger (${mcpForm.directories.length} dirs)` }]);
-        setInstructions(generateCodeSearchTemplate(mcpForm.name, mcpForm.directories));
+        setAddedServers([{ name: 'codemogger', url: `in-process code search (${mcpForm.directories.length} dirs)` }]);
+        setInstructions(generateCodeSearchTemplate('codemogger', mcpForm.directories));
         setWizardStep('instructions');
         return;
       }
@@ -532,16 +529,20 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
             {sortedMcpServers.map((server) => (
               <div key={server.name} className="group/mcp relative p-3 rounded-lg border border-border bg-muted/30">
                 <div className="absolute top-1.5 right-1.5 opacity-0 group-hover/mcp:opacity-100 transition-opacity flex items-center gap-0.5 z-10">
-                  <button
-                    className="cursor-pointer p-1 rounded hover:bg-yellow-500/20 text-muted-foreground hover:text-yellow-500"
-                    title="Edit server"
-                    onClick={() => handleEditServer(server)}
-                  >
-                    <Pencil className="h-3.5 w-3.5" />
-                  </button>
+                  {/* The in-process code-search entry has no stdio/http config to
+                      edit — only enable/disable, so hide Edit for it. */}
+                  {!server.codeSearch && (
+                    <button
+                      className="cursor-pointer p-1 rounded hover:bg-yellow-500/20 text-muted-foreground hover:text-yellow-500"
+                      title="Edit server"
+                      onClick={() => handleEditServer(server)}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                   <button
                     className="cursor-pointer p-1 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
-                    title="Remove server"
+                    title={server.codeSearch ? 'Disable code search' : 'Remove server'}
                     onClick={() => setDeleteTarget(server)}
                   >
                     <Trash2 className="h-3.5 w-3.5" />

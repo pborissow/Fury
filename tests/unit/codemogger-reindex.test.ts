@@ -1,38 +1,30 @@
 /**
- * Auto-reindex watcher (docs/ticket-local-mcp-this-project-fails-first-use.md →
- * Index freshness). Covers the pure helpers and the debounce + single-flight
- * orchestration without touching fs.watch or spawning codemogger (an injected
- * runIndex). The real watch→reindex→searchable path is a live integration drive
+ * Auto-reindex watcher (docs/ticket-codesearch-inprocess-mcp-macos-contention.md →
+ * Option A). Covers the pure helpers and the debounce + single-flight orchestration
+ * WITHOUT touching fs.watch or loading the embedder (an injected `reindex`). The real
+ * watch→in-process-reindex→searchable path is a live integration drive
  * (tests/live-sessions/codemogger-reindex-watch.spec.ts).
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
-import { tmpdir, homedir } from 'os';
+import { mkdtemp, rm } from 'fs/promises';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import {
-  isIndexableChange, readCodemoggerDbPath, CodemoggerReindexer, IGNORE_DIRS,
-  RECURSIVE_WATCH_SUPPORTED, writeIndexDirs, readIndexDirs,
+  isIndexableChange, CodemoggerReindexer, IGNORE_DIRS, RECURSIVE_WATCH_SUPPORTED,
 } from '../../lib/codemoggerReindex';
-import { mkdirSync } from 'fs';
+import { writeCodeSearchConfig, codeSearchDbPath } from '../../lib/codeSearchConfig';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const dirs: string[] = [];
 afterEach(async () => { for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true }); });
 
-async function scratchProject(mcpJson?: unknown): Promise<string> {
+/** A scratch project with code search ENABLED (the in-process config written), so
+ *  runReindex resolves a db + dirs and actually invokes the injected `reindex`. */
+async function codeSearchProject(selectedDirs?: string[]): Promise<string> {
   const base = await mkdtemp(join(tmpdir(), 'fury-reindex-'));
   dirs.push(base);
-  if (mcpJson !== undefined) await writeFile(join(base, '.mcp.json'), JSON.stringify(mcpJson, null, 2));
+  writeCodeSearchConfig(base, selectedDirs ?? []);
   return base;
-}
-
-/** A scratch project WITH a codemogger server, so runReindex resolves a db and
- *  actually invokes the injected runIndex (it re-resolves the db each run and
- *  bails if codemogger isn't configured — the real behavior). */
-async function codemoggerProject(): Promise<string> {
-  return scratchProject({
-    mcpServers: { codemogger: { command: 'codemogger', args: ['--db', '/tmp/i.db', 'mcp'] } },
-  });
 }
 
 describe('isIndexableChange', () => {
@@ -47,7 +39,6 @@ describe('isIndexableChange', () => {
   it('false under an ignored directory (node_modules, .git, dist, .codemogger, .next)', () => {
     for (const f of ['node_modules/pkg/a.ts', 'a/.git/b.js', 'dist/out.js', '.codemogger/x.ts', '.next/y.tsx'])
       expect(isIndexableChange(f), f).toBe(false);
-    // sanity: the ignore set is the source of truth
     expect(IGNORE_DIRS.has('node_modules')).toBe(true);
   });
   it('false for null/empty (fs.watch can report null filename)', () => {
@@ -57,135 +48,89 @@ describe('isIndexableChange', () => {
   });
 });
 
-describe('readCodemoggerDbPath', () => {
-  it('returns the explicit --db path from a codemogger stdio server', async () => {
-    const p = await scratchProject({
-      mcpServers: { codemogger: { command: 'codemogger', args: ['--db', 'C:/Users/x/.codemogger/index.db', 'mcp'] } },
-    });
-    expect(readCodemoggerDbPath(p)).toBe('C:/Users/x/.codemogger/index.db');
-  });
-  it('detects by command even when the server is renamed', async () => {
-    const p = await scratchProject({
-      mcpServers: { 'my-search': { command: 'codemogger', args: ['--db', '/tmp/i.db', 'mcp'] } },
-    });
-    expect(readCodemoggerDbPath(p)).toBe('/tmp/i.db');
-  });
-  it('falls back to the default db when codemogger has no --db', async () => {
-    const p = await scratchProject({ mcpServers: { codemogger: { command: 'codemogger', args: ['mcp'] } } });
-    expect(readCodemoggerDbPath(p)).toBe(join(homedir(), '.codemogger', 'index.db'));
-  });
-  it('null when no codemogger server / no .mcp.json', async () => {
-    const p1 = await scratchProject({ mcpServers: { other: { command: 'some-tool', args: [] } } });
-    expect(readCodemoggerDbPath(p1)).toBeNull();
-    const p2 = await scratchProject(); // no .mcp.json
-    expect(readCodemoggerDbPath(p2)).toBeNull();
-  });
-});
-
 describe('debounce + single-flight orchestration', () => {
   it('coalesces a burst of changes into ONE reindex', async () => {
-    const proj = await codemoggerProject();
-    const runIndex = vi.fn(async (_p: string, _db: string) => {});
-    const r = new CodemoggerReindexer({ debounceMs: 20, runIndex });
+    const proj = await codeSearchProject();
+    const reindex = vi.fn(async (_p: string, _db: string, _dirs: string[]) => {});
+    const r = new CodemoggerReindexer({ debounceMs: 20, reindex });
     r.scheduleReindex(proj);
     r.scheduleReindex(proj);
     r.scheduleReindex(proj);
     await sleep(60);
-    expect(runIndex).toHaveBeenCalledTimes(1);
+    expect(reindex).toHaveBeenCalledTimes(1);
   });
 
   it('never runs two reindexes at once; a change mid-run re-runs exactly once after', async () => {
-    const proj = await codemoggerProject();
+    const proj = await codeSearchProject();
     const resolvers: Array<() => void> = [];
-    const runIndex = vi.fn((_p: string, _db: string) => new Promise<void>(res => resolvers.push(res)));
-    const r = new CodemoggerReindexer({ debounceMs: 20, runIndex });
+    const reindex = vi.fn((_p: string, _db: string, _dirs: string[]) => new Promise<void>(res => resolvers.push(res)));
+    const r = new CodemoggerReindexer({ debounceMs: 20, reindex });
 
     r.scheduleReindex(proj);
     await sleep(40);
-    expect(runIndex, 'first run started').toHaveBeenCalledTimes(1);
+    expect(reindex, 'first run started').toHaveBeenCalledTimes(1);
 
     // A change while the first run is still in flight — must NOT start a 2nd run.
     r.scheduleReindex(proj);
     await sleep(40);
-    expect(runIndex, 'single-flight: coalesced into dirty').toHaveBeenCalledTimes(1);
+    expect(reindex, 'single-flight: coalesced into dirty').toHaveBeenCalledTimes(1);
 
     resolvers.shift()!();          // finish run 1
     await sleep(60);
-    expect(runIndex, 'dirty triggered exactly one follow-up run').toHaveBeenCalledTimes(2);
+    expect(reindex, 'dirty triggered exactly one follow-up run').toHaveBeenCalledTimes(2);
 
     resolvers.forEach(res => res()); // settle
   });
 
   it('separate projects reindex independently', async () => {
-    const a = await codemoggerProject();
-    const b = await codemoggerProject();
-    const runIndex = vi.fn(async (_p: string, _db: string) => {});
-    const r = new CodemoggerReindexer({ debounceMs: 20, runIndex });
+    const a = await codeSearchProject();
+    const b = await codeSearchProject();
+    const reindex = vi.fn(async (_p: string, _db: string, _dirs: string[]) => {});
+    const r = new CodemoggerReindexer({ debounceMs: 20, reindex });
     r.scheduleReindex(a);
     r.scheduleReindex(b);
     await sleep(60);
-    expect(runIndex).toHaveBeenCalledTimes(2);
-    expect(runIndex.mock.calls.map(c => c[0]).sort()).toEqual([a, b].sort());
+    expect(reindex).toHaveBeenCalledTimes(2);
+    expect(reindex.mock.calls.map(c => c[0]).sort()).toEqual([a, b].sort());
   });
 });
 
-describe('index-dirs sidecar (per-project selected directories)', () => {
-  // A project whose codemogger --db is IN the project tree (per-project DB), so the
-  // sidecar sits next to it — the real registration shape.
-  async function perProjectCodemogger(): Promise<{ project: string; db: string }> {
-    const project = await scratchProject();
-    const db = join(project, '.codemogger', 'index.db');
-    mkdirSync(join(project, '.codemogger'), { recursive: true });
-    await writeFile(join(project, '.mcp.json'), JSON.stringify({
-      mcpServers: { codemogger: { command: 'codemogger', args: ['--db', db, 'mcp'] } },
-    }, null, 2));
-    return { project, db };
-  }
-
-  it('writeIndexDirs → readIndexDirs round-trips the selected dirs', async () => {
-    const { project, db } = await perProjectCodemogger();
-    writeIndexDirs(db, [join(project, 'src'), join(project, 'ui')]);
-    expect(readIndexDirs(project)).toEqual([join(project, 'src'), join(project, 'ui')]);
-  });
-
-  it('falls back to the project root when there is no sidecar', async () => {
-    const { project } = await perProjectCodemogger();
-    expect(readIndexDirs(project)).toEqual([project]);
-  });
-
-  it('returns [] when the project has no codemogger server', async () => {
-    const project = await scratchProject({ mcpServers: {} });
-    expect(readIndexDirs(project)).toEqual([]);
-  });
-});
-
-describe('reindex scopes to the selected directories', () => {
-  it('indexes each selected dir (not the whole project)', async () => {
-    const project = await scratchProject();
-    const db = join(project, '.codemogger', 'index.db');
+describe('reindex targets the project DB + selected directories', () => {
+  it('passes the per-project DB and the selected dirs to the engine', async () => {
+    const project = await mkdtemp(join(tmpdir(), 'fury-reindex-'));
+    dirs.push(project);
     const src = join(project, 'src'); const ui = join(project, 'ui');
-    mkdirSync(join(project, '.codemogger'), { recursive: true });
+    const { mkdirSync } = await import('fs');
     mkdirSync(src, { recursive: true }); mkdirSync(ui, { recursive: true });
-    await writeFile(join(project, '.mcp.json'), JSON.stringify({
-      mcpServers: { codemogger: { command: 'codemogger', args: ['--db', db, 'mcp'] } },
-    }, null, 2));
-    writeIndexDirs(db, [src, ui]);
+    writeCodeSearchConfig(project, [src, ui]);
 
-    const runIndex = vi.fn(async (_dir: string, _db: string) => {});
-    const r = new CodemoggerReindexer({ debounceMs: 20, runIndex });
+    const reindex = vi.fn(async (_p: string, _db: string, _dirs: string[]) => {});
+    const r = new CodemoggerReindexer({ debounceMs: 20, reindex });
     await r.reindexNow(project);
 
-    expect(runIndex).toHaveBeenCalledTimes(2);
-    expect(runIndex.mock.calls.map(c => c[0]).sort()).toEqual([src, ui].sort());
-    // All into the one per-project DB.
-    expect(runIndex.mock.calls.every(c => c[1] === db)).toBe(true);
+    // ONE reindex call for the project, carrying the per-project DB + both dirs.
+    expect(reindex).toHaveBeenCalledTimes(1);
+    const [p, db, passedDirs] = reindex.mock.calls[0];
+    expect(p).toBe(project);
+    expect(db).toBe(codeSearchDbPath(project));
+    expect([...passedDirs].sort()).toEqual([src, ui].sort());
+  });
+
+  it('does not reindex a project without code search enabled', async () => {
+    const project = await mkdtemp(join(tmpdir(), 'fury-reindex-'));
+    dirs.push(project); // no writeCodeSearchConfig → disabled
+    const reindex = vi.fn(async () => {});
+    const r = new CodemoggerReindexer({ debounceMs: 20, reindex });
+    await r.reindexNow(project);
+    expect(reindex).not.toHaveBeenCalled();
   });
 });
 
 describe('ensureWatching', () => {
-  it('does nothing for a project without codemogger configured', async () => {
-    const p = await scratchProject({ mcpServers: {} });
-    const r = new CodemoggerReindexer({ runIndex: async () => {} });
+  it('does nothing for a project without code search enabled', async () => {
+    const p = await mkdtemp(join(tmpdir(), 'fury-reindex-'));
+    dirs.push(p);
+    const r = new CodemoggerReindexer({ reindex: async () => {} });
     r.ensureWatching(p);
     expect(r.isWatching(p)).toBe(false);
     r.stopAll();
@@ -193,11 +138,9 @@ describe('ensureWatching', () => {
 
   // Recursive fs.watch is macOS/Windows only — the "watches" assertion only holds
   // where it's supported (would fail on Linux CI where fs.watch throws).
-  it.skipIf(!RECURSIVE_WATCH_SUPPORTED)('watches a codemogger-configured project and is idempotent', async () => {
-    const p = await scratchProject({
-      mcpServers: { codemogger: { command: 'codemogger', args: ['--db', '/tmp/i.db', 'mcp'] } },
-    });
-    const r = new CodemoggerReindexer({ runIndex: async () => {} });
+  it.skipIf(!RECURSIVE_WATCH_SUPPORTED)('watches a code-search-enabled project and is idempotent', async () => {
+    const p = await codeSearchProject([]); // empty dirs → watch the project root
+    const r = new CodemoggerReindexer({ reindex: async () => {} });
     r.ensureWatching(p);
     expect(r.isWatching(p)).toBe(true);
     r.ensureWatching(p); // idempotent — no throw, still one watcher
@@ -208,10 +151,8 @@ describe('ensureWatching', () => {
   });
 
   it.skipIf(RECURSIVE_WATCH_SUPPORTED)('no-ops (does not watch) where recursive fs.watch is unavailable', async () => {
-    const p = await scratchProject({
-      mcpServers: { codemogger: { command: 'codemogger', args: ['--db', '/tmp/i.db', 'mcp'] } },
-    });
-    const r = new CodemoggerReindexer({ runIndex: async () => {} });
+    const p = await codeSearchProject([]);
+    const r = new CodemoggerReindexer({ reindex: async () => {} });
     r.ensureWatching(p);
     expect(r.isWatching(p)).toBe(false); // gated off on this platform, no throw
     r.stopAll();

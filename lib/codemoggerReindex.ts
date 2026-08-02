@@ -1,28 +1,36 @@
 import fs from 'fs';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { execFile } from 'child_process';
-import { homedir } from 'os';
-import { join, dirname, extname } from 'path';
+import { existsSync } from 'fs';
+import { extname } from 'path';
 import { log } from './logger';
+import {
+  isCodeSearchEnabled,
+  codeSearchDbPath,
+  codeSearchDirs,
+} from './codeSearchConfig';
+import { reindexProject } from './codemoggerServer';
 
 /**
- * Auto-reindex the codemogger code-search DB when a "This project" (codesearch)
+ * Auto-reindex the codemogger code-search index when a "This project" (codesearch)
  * project's SELECTED source directories change.
  *
- * codemogger serves the SQLite index as a static snapshot — it does NOT watch the
- * filesystem, and Fury never reindexes on its own, so the index drifts stale after
- * any edit until something calls `codemogger_index`/`reindex`. This closes that gap:
- * when an SDK turn runs for a codemogger-configured project we watch its indexed
- * directories and run `codemogger --db <db> index <dir>` per dir — debounced (coalesce
- * a burst of saves) and single-flight (never two indexes for one project at once).
- * Indexing is incremental + content-hashed inside codemogger, so unchanged files are
- * skipped.
+ * codemogger indexes a snapshot — it does NOT watch the filesystem — so the index
+ * drifts stale after any edit until something re-indexes. This closes that gap: when
+ * an SDK turn runs for a code-search-enabled project we watch its indexed directories
+ * and reindex on change, debounced (coalesce a burst of saves) and single-flight
+ * (never two reindexes for one project at once). Indexing is incremental +
+ * content-hashed inside codemogger, so unchanged files are skipped.
  *
- * SELECTED DIRECTORIES: the wizard lets the user choose which directories to index;
- * Fury records them in a per-project sidecar (`<db-dir>/.fury-index-dirs.json`) next
- * to the DB. We watch and reindex exactly those dirs (falling back to the project root
- * for older registrations with no sidecar). The DB itself is per-project
- * (`<project>/.codemogger/index.db`), so searches never bleed across projects.
+ * IN-PROCESS (docs/ticket-codesearch-inprocess-mcp-macos-contention.md, Option A):
+ * the reindex runs via `reindexProject()` in Fury's OWN process against the same
+ * `CodeIndex` connection the search tool uses, mutex-serialized so a reindex's FTS
+ * DDL never fights a concurrent search. There is NO spawned `codemogger index`
+ * process — one process, one DB writer, so the macOS multi-process contention is
+ * gone by construction.
+ *
+ * CONFIG: which dirs to index comes from the project's Fury code-search config
+ * (`<project>/.codemogger/fury-codesearch.json`; see lib/codeSearchConfig.ts). The
+ * DB is per-project (`<project>/.codemogger/index.db`), so searches never bleed
+ * across projects.
  *
  * Shares lib/fileWatchers.ts's scaffolding style (native fs.watch, debounce timers, a
  * globalThis-pinned singleton, stopAll() for shutdown), but recursive: each selected
@@ -30,12 +38,9 @@ import { log } from './logger';
  *
  * PLATFORM LIMITATION: recursive fs.watch is macOS/Windows only; on Linux it throws
  * ERR_FEATURE_UNAVAILABLE_ON_PLATFORM. `ensureWatching` no-ops with a single info log
- * on unsupported platforms. (A cross-platform version would walk with per-dir
- * non-recursive watchers, or add chokidar.)
+ * on unsupported platforms. (The reindex ITSELF is cross-platform — only the fs.watch
+ * *trigger* is gated; a manual/registration-time reindex works everywhere.)
  */
-
-/** Sidecar (next to the per-project DB) recording which dirs to watch + index. */
-export const INDEX_DIRS_SIDECAR = '.fury-index-dirs.json';
 
 /** Directories whose events never warrant a reindex (build output, VCS, deps). */
 export const IGNORE_DIRS = new Set([
@@ -66,90 +71,9 @@ export function isIndexableChange(filename: string | null | undefined): boolean 
   return INDEX_EXT.has(extname(filename).toLowerCase());
 }
 
-/**
- * The `--db` path of the project's codemogger stdio server from `<project>/.mcp.json`,
- * or null if the project has no codemogger server configured. Falls back to the
- * default `~/.codemogger/index.db` if a codemogger server exists without an explicit
- * `--db`. Pure (reads disk) — unit-tested against a temp .mcp.json.
- */
-export function readCodemoggerDbPath(projectPath: string): string | null {
-  const mcpPath = join(projectPath, '.mcp.json');
-  let cfg: { mcpServers?: Record<string, { command?: string; args?: unknown }> };
-  try {
-    cfg = JSON.parse(readFileSync(mcpPath, 'utf-8'));
-  } catch {
-    return null;
-  }
-  const servers = cfg?.mcpServers ?? {};
-  for (const server of Object.values(servers)) {
-    const cmd = String(server?.command ?? '');
-    // Match the command basename, not the server name (users can rename it).
-    if (!/(^|[/\\])codemogger(\.\w+)?$/i.test(cmd) && cmd.toLowerCase() !== 'codemogger') continue;
-    const args = Array.isArray(server?.args) ? server!.args.map(a => String(a)) : [];
-    const i = args.indexOf('--db');
-    if (i !== -1 && i + 1 < args.length && args[i + 1]) return args[i + 1];
-    return join(homedir(), '.codemogger', 'index.db'); // codemogger default
-  }
-  return null;
-}
-
-/** The sidecar path for a given `--db` path (sits next to the DB). */
-function sidecarPathForDb(dbPath: string): string {
-  return join(dirname(dbPath), INDEX_DIRS_SIDECAR);
-}
-
-/** Record the selected index directories in the sidecar next to `dbPath`. */
-export function writeIndexDirs(dbPath: string, dirs: string[]): void {
-  const clean = dirs.map(d => String(d)).filter(Boolean);
-  try {
-    writeFileSync(sidecarPathForDb(dbPath), JSON.stringify({ dirs: clean }, null, 2));
-  } catch (err) {
-    log.warn('codemogger.reindex', 'failed to write index-dirs sidecar', {
-      data: { dbPath, error: err instanceof Error ? err.message : String(err) },
-    });
-  }
-}
-
-/**
- * The directories to watch + index for a project: the sidecar's `dirs` if present,
- * else the project root (older registrations / no explicit selection). Empty when
- * the project has no codemogger server. Pure (reads disk).
- */
-export function readIndexDirs(projectPath: string): string[] {
-  const dbPath = readCodemoggerDbPath(projectPath);
-  if (!dbPath) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(sidecarPathForDb(dbPath), 'utf-8'));
-    const dirs = Array.isArray(parsed?.dirs) ? parsed.dirs.map((d: unknown) => String(d)).filter(Boolean) : [];
-    if (dirs.length) return dirs;
-  } catch { /* no sidecar — fall back to the project root */ }
-  return [projectPath];
-}
-
-/** Run `codemogger --db <db> index <dir>` via node against the repo's own codemogger
- *  cli.mjs (portable — the Windows `.cmd` PATH shim isn't execFile-able by bare name,
- *  and a `shell:true` fallback wouldn't quote spaced paths). If the cli isn't present,
- *  warn and skip rather than spawn something fragile. */
-function defaultRunIndex(dir: string, dbPath: string): Promise<void> {
-  return new Promise((resolve) => {
-    const cli = join(process.cwd(), 'node_modules', 'codemogger', 'dist', 'cli.mjs');
-    if (!existsSync(cli)) {
-      log.warn('codemogger.reindex', 'codemogger cli not found; skipping reindex', { data: { cli } });
-      resolve();
-      return;
-    }
-    execFile(process.execPath, [cli, '--db', dbPath, 'index', dir], { timeout: 5 * 60_000, windowsHide: true }, (err, stdout, stderr) => {
-      if (err) {
-        log.warn('codemogger.reindex', 'index failed', {
-          data: { dir, error: err.message, stderr: String(stderr || '').slice(0, 300) },
-        });
-      } else {
-        const summary = String(stdout || '').trim().split('\n').filter(Boolean).pop() || '';
-        log.info('codemogger.reindex', 'indexed', { data: { dir, summary: summary.slice(0, 200) } });
-      }
-      resolve();
-    });
-  });
+/** Default reindex: run the in-process engine over the project's selected dirs. */
+function defaultReindex(projectPath: string, dbPath: string, dirs: string[]): Promise<void> {
+  return reindexProject(projectPath, dbPath, dirs);
 }
 
 export class CodemoggerReindexer {
@@ -159,11 +83,11 @@ export class CodemoggerReindexer {
   private dirty = new Set<string>();
   private unsupportedWarned = false;
   private readonly debounceMs: number;
-  private readonly runIndex: (dir: string, dbPath: string) => Promise<void>;
+  private readonly reindex: (projectPath: string, dbPath: string, dirs: string[]) => Promise<void>;
 
-  constructor(opts: { debounceMs?: number; runIndex?: (dir: string, db: string) => Promise<void> } = {}) {
+  constructor(opts: { debounceMs?: number; reindex?: (projectPath: string, dbPath: string, dirs: string[]) => Promise<void> } = {}) {
     this.debounceMs = opts.debounceMs ?? 4000;
-    this.runIndex = opts.runIndex ?? defaultRunIndex;
+    this.reindex = opts.reindex ?? defaultReindex;
   }
 
   /** Whether any watcher is attached for `projectPath` (test/introspection). */
@@ -176,15 +100,15 @@ export class CodemoggerReindexer {
   }
 
   /**
-   * Start watching a codemogger-configured project's SELECTED directories for source
+   * Start watching a code-search-enabled project's SELECTED directories for source
    * changes. Idempotent and best-effort (never throws). Safe to call every turn — a
-   * no-op once watching or when codemogger isn't configured.
+   * no-op once watching or when code search isn't enabled.
    */
   ensureWatching(projectPath: string): void {
     if (!projectPath) return;
     const key = this.key(projectPath);
     if (this.watchers.has(key)) return;
-    if (!readCodemoggerDbPath(projectPath)) return; // no codemogger server here
+    if (!isCodeSearchEnabled(projectPath)) return; // code search not enabled here
     if (!RECURSIVE_WATCH_SUPPORTED) {
       // Log ONCE (ensureWatching runs every turn) so it's diagnosable, not a scary
       // per-turn "watch failed". Auto-reindex is simply off on this platform.
@@ -196,7 +120,7 @@ export class CodemoggerReindexer {
       }
       return;
     }
-    const dirs = readIndexDirs(projectPath).filter(d => existsSync(d));
+    const dirs = codeSearchDirs(projectPath).filter(d => existsSync(d));
     if (!dirs.length) return;
     const watchers: fs.FSWatcher[] = [];
     for (const dir of dirs) {
@@ -239,20 +163,27 @@ export class CodemoggerReindexer {
   /**
    * Run one reindex of all the project's selected dirs, single-flight per project: if
    * one is already running, mark the project dirty and re-run once it finishes (so
-   * edits during indexing aren't lost). Re-resolves the `--db` + dirs each run so a
-   * config change (or codemogger removal) is honored; if codemogger is gone, stop.
+   * edits during indexing aren't lost). Re-resolves the config each run so a change
+   * (or code-search removal) is honored; if code search is gone, stop watching.
    */
   private async runReindex(projectPath: string): Promise<void> {
     const key = this.key(projectPath);
     if (this.running.has(key)) { this.dirty.add(key); return; }
 
-    const dbPath = readCodemoggerDbPath(projectPath);
-    if (!dbPath) { this.stopWatching(projectPath); return; } // codemogger removed
-    const dirs = readIndexDirs(projectPath).filter(d => existsSync(d));
+    if (!isCodeSearchEnabled(projectPath)) { this.stopWatching(projectPath); return; } // disabled
+    const dbPath = codeSearchDbPath(projectPath);
+    const dirs = codeSearchDirs(projectPath).filter(d => existsSync(d));
+    if (!dirs.length) return;
 
     this.running.add(key);
     try {
-      for (const dir of dirs) await this.runIndex(dir, dbPath);
+      // reindexProject is itself best-effort (logs per-dir failures), but wrap here
+      // too so an embedder-load rejection can't escape into the debounce timer.
+      await this.reindex(projectPath, dbPath, dirs);
+    } catch (err) {
+      log.warn('codemogger.reindex', 'reindex failed', {
+        data: { project: projectPath, error: err instanceof Error ? err.message : String(err) },
+      });
     } finally {
       this.running.delete(key);
       if (this.dirty.delete(key)) this.scheduleReindex(projectPath); // coalesced edits
@@ -280,13 +211,15 @@ export class CodemoggerReindexer {
 
 // Singleton across Next.js HMR, VERSION-GATED. Bump SINGLETON_VERSION when this
 // class's behavior changes so a running dev server recreates the instance instead
-// of keeping stale method bodies (a plain `globalThis[key] ?? new` would keep the
-// old instance forever — e.g. missing `reindexNow`, or the pre-selected-dirs
-// `runReindex`). On recreate, tear down the previous instance's watchers first so
-// they don't leak; the next turn re-attaches via ensureWatching.
+// of keeping stale method bodies. On recreate, tear down the previous instance's
+// watchers first so they don't leak; the next turn re-attaches via ensureWatching.
 //   2: per-project DB + selected-directory scoping (sidecar), reindexNow(), per-dir
 //      watchers/indexing (ticket-local-mcp... decision #2).
-const SINGLETON_VERSION = 2;
+//   3: IN-PROCESS reindex — sources dirs/db from lib/codeSearchConfig and calls
+//      reindexProject() in Fury's process instead of spawning `codemogger index`
+//      (docs/ticket-codesearch-inprocess-mcp-macos-contention.md, Option A). Without
+//      this bump the live instance keeps the old spawn path (the competing process).
+const SINGLETON_VERSION = 3;
 const globalKey = '__fury_codemogger_reindexer__';
 const globalVerKey = '__fury_codemogger_reindexer_v__';
 const g = globalThis as any;

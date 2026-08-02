@@ -1,28 +1,23 @@
 /**
- * Live regression drives for docs/ticket-local-mcp-this-project-fails-first-use.md.
+ * Live regression drives for docs/ticket-codesearch-inprocess-mcp-macos-contention.md.
  *
- * Two costly, token-spending drives against the real SDK backend:
- *
- *  A) "codemogger connects + gets used" — register the code-search server for a
- *     scratch project (via the real POST /api/mcp, which creates the --db parent
- *     [B1] and auto-approves [B2]), index a tiny fixture, then drive a turn asking
+ *  A) "in-process codemogger is used" (token-spending) — enable code search for a
+ *     scratch project (real POST /api/code-search: writes the config, gitignores, and
+ *     kicks off the IN-PROCESS index), wait for the index, then drive a turn asking
  *     about a distinctive symbol. Assert the transcript contains a
- *     `mcp__codemogger__codemogger_search` tool_use, the answer is grounded in the
- *     hit, and NO `sdk.mcp` failure was logged (the server connected).
+ *     `mcp__codemogger__codemogger_search` tool_use served IN-PROCESS, the answer is
+ *     grounded in the hit, and NO separate codemogger process/`.mcp.json` entry exists.
  *
- *  B) "failures are surfaced" (B4) — register codemogger with a `--db` that points
- *     at a directory (codemogger crashes opening it, exit 1 — verified), so the
- *     server is `failed` at system:init. Drive a trivial turn and assert an
- *     `sdk.mcp` warning appears in ~/.claude/fury-logs/ naming the failed server.
+ *  B) "legacy stdio auto-migrates" (ZERO tokens) — a project with an old stdio
+ *     codemogger `.mcp.json` entry, hit via GET /api/mcp, must be migrated: the stdio
+ *     entry stripped (acceptance #5, no competing process) and code search surfaced as
+ *     the in-process synthetic entry.
  *
- * COST/TIME: each runs a real short Claude turn under <repo>/../fury-e2e-mcp-*
- * (wiped each run). Budget ~2 min each. Lives in tests/live-sessions (the costly
- * drive suite), not the default unit run — see tests/README.md.
+ * COST/TIME: A runs one short Claude turn under <repo>/../fury-e2e-mcp-ok (wiped each
+ * run); budget ~2 min. B is disk + one API call. Lives in tests/live-sessions.
  */
 import { test, expect } from '@playwright/test';
 import { randomUUID } from 'crypto';
-import { execFile } from 'child_process';
-import { promisify } from 'util';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import {
@@ -30,51 +25,37 @@ import {
   cleanupSession, jsonlPath,
 } from './drive-helpers';
 
-const execFileAsync = promisify(execFile);
-
-// Resolve codemogger's CLI entry and run it via `node` directly. On Windows the
-// PATH shim is `codemogger.cmd`, which execFile (no shell) can't spawn by bare
-// name — `node dist/cli.mjs` is portable and deterministic. (The MCP server the
-// Claude CLI launches uses its own resolution; this is only the test's indexing.)
-const CODEMOGGER_CLI = join(__dirname, '..', '..', 'node_modules', 'codemogger', 'dist', 'cli.mjs');
-function codemogger(args: string[]) {
-  return execFileAsync(process.execPath, [CODEMOGGER_CLI, ...args], { timeout: 60000 });
-}
-
 const PROJECT_OK = join(__dirname, '..', '..', '..', 'fury-e2e-mcp-ok');
-const PROJECT_FAIL = join(__dirname, '..', '..', '..', 'fury-e2e-mcp-fail');
-const SERVER_NAME = 'codemogger';
+const PROJECT_MIGRATE = join(__dirname, '..', '..', '..', 'fury-e2e-mcp-migrate');
 
-async function registerCodemogger(project: string, args: string[]): Promise<Response> {
-  return fetch(`${BASE_URL}/api/mcp`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      name: SERVER_NAME, transport: 'stdio', commandOrUrl: 'codemogger',
-      args, scope: 'project', projectPath: project,
-    }),
+async function enableCodeSearch(project: string, dirs: string[]): Promise<Response> {
+  return fetch(`${BASE_URL}/api/code-search`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ projectPath: project, dirs }),
   });
 }
 
-async function removeServer(project: string): Promise<void> {
+async function disableCodeSearch(project: string): Promise<void> {
   try {
-    await fetch(`${BASE_URL}/api/mcp`, {
-      method: 'DELETE',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: SERVER_NAME, projectPath: project }),
+    await fetch(`${BASE_URL}/api/code-search`, {
+      method: 'DELETE', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectPath: project }),
     });
   } catch { /* best effort */ }
-  // Purge the scratch project key from ~/.claude.json so the auto-approve residue
-  // doesn't accumulate across runs.
-  try {
-    const { homedir } = await import('os');
-    const cj = join(homedir(), '.claude.json');
-    if (existsSync(cj)) {
-      const cfg = JSON.parse(readFileSync(cj, 'utf8'));
-      const key = project.replace(/\\/g, '/');
-      if (cfg.projects?.[key]) { delete cfg.projects[key]; writeFileSync(cj, JSON.stringify(cfg, null, 2)); }
-    }
-  } catch { /* best effort */ }
+}
+
+/** Search a project's index THROUGH the dev server (the single DB owner). */
+async function serverHits(project: string, query: string): Promise<number> {
+  const url = `${BASE_URL}/api/code-search?projectPath=${encodeURIComponent(project)}&q=${encodeURIComponent(query)}&mode=keyword`;
+  const res = await fetch(url).then(r => r.json()).catch(() => ({ results: [] }));
+  return Array.isArray(res.results) ? res.results.length : 0;
+}
+
+async function waitForHits(project: string, query: string, timeoutMs: number): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let h = await serverHits(project, query);
+  while (Date.now() < deadline && h === 0) { await sleep(3000); h = await serverHits(project, query); }
+  return h;
 }
 
 /** Every assistant tool_use name found in the session JSONL. */
@@ -85,8 +66,7 @@ function toolUsesIn(sessionId: string, project: string): string[] {
   for (const line of readFileSync(p, 'utf8').split('\n')) {
     if (!line.trim()) continue;
     try {
-      const e = JSON.parse(line);
-      const content = e?.message?.content;
+      const content = JSON.parse(line)?.message?.content;
       if (Array.isArray(content)) {
         for (const b of content) if (b?.type === 'tool_use' && typeof b.name === 'string') names.push(b.name);
       }
@@ -125,18 +105,16 @@ async function waitForTurnDone(sessionId: string, deadlineMs: number): Promise<a
   return logs;
 }
 
-test.describe('MCP code-search (codemogger) — live', () => {
+test.describe('MCP code-search (codemogger) — in-process, live', () => {
   let okId: string | null = null;
-  let failId: string | null = null;
 
   test.afterAll(async () => {
     await cleanupSession(okId, PROJECT_OK);
-    await cleanupSession(failId, PROJECT_FAIL);
-    await removeServer(PROJECT_OK);
-    await removeServer(PROJECT_FAIL);
+    await disableCodeSearch(PROJECT_OK);
+    await disableCodeSearch(PROJECT_MIGRATE);
   });
 
-  test('A: codemogger connects and the model uses codemogger_search', async () => {
+  test('A: in-process codemogger connects and the model uses codemogger_search', async () => {
     test.setTimeout(4 * 60 * 1000);
     const sessionId = randomUUID();
     okId = sessionId;
@@ -151,15 +129,15 @@ test.describe('MCP code-search (codemogger) — live', () => {
       '  // Reticulates splines for the frobnicator subsystem.\n' +
       '  return splines * 42;\n}\n');
 
-    const dbPath = join(PROJECT_OK, '.codemogger', 'index.db');
-    // Register via the REAL route: creates the --db parent (B1) + auto-approves (B2).
-    const reg = await registerCodemogger(PROJECT_OK, ['--db', dbPath, 'mcp']);
-    expect(reg.ok, 'POST /api/mcp registered codemogger').toBe(true);
-    expect(existsSync(join(PROJECT_OK, '.codemogger')), 'B1: --db parent dir created').toBe(true);
-    expect(existsSync(join(PROJECT_OK, '.mcp.json')), '.mcp.json written in project').toBe(true);
+    // Enable code search (in-process): writes the config + kicks off the index.
+    const reg = await enableCodeSearch(PROJECT_OK, [PROJECT_OK]);
+    expect(reg.ok, 'POST /api/code-search enabled code search').toBe(true);
+    expect(existsSync(join(PROJECT_OK, '.codemogger', 'fury-codesearch.json')), 'config written').toBe(true);
+    // No stdio registration → no competing process (acceptance #5).
+    expect(existsSync(join(PROJECT_OK, '.mcp.json')), 'no .mcp.json codemogger entry created').toBe(false);
 
-    // Populate the DB the MCP server will read (dir now exists thanks to B1).
-    await codemogger(['--db', dbPath, 'index', PROJECT_OK]);
+    // Wait for the initial in-process index (observed through the owning process).
+    expect(await waitForHits(PROJECT_OK, 'zorptangle', 90_000), 'symbol indexed in-process').toBeGreaterThan(0);
 
     const prompt =
       'Use the codemogger_search MCP tool (keyword mode, includeSnippet=true) to find the ' +
@@ -173,7 +151,7 @@ test.describe('MCP code-search (codemogger) — live', () => {
 
     const tools = toolUsesIn(sessionId, PROJECT_OK);
     console.log('[E2E-A] tool_uses:', tools);
-    expect(tools, 'the model called the codemogger search tool')
+    expect(tools, 'the model called the in-process codemogger search tool')
       .toContain('mcp__codemogger__codemogger_search');
 
     const answer = assistantTextIn(sessionId, PROJECT_OK);
@@ -182,54 +160,36 @@ test.describe('MCP code-search (codemogger) — live', () => {
     expect(answer).toMatch(/zorptangleReticulator|widget\.ts/);
     expect(answer).toMatch(/42/);
 
-    // codemogger connected → it must NOT appear in any sdk.mcp failure warning.
-    // (We can't assert ZERO warnings: unrelated user-scoped servers — e.g. a
-    // pending claude.ai integration — legitimately warn, and B4 correctly reports
-    // every non-connected server. Scope the assertion to codemogger.)
+    // In-process code search is NOT a listed MCP server, so it can never appear in an
+    // sdk.mcp FAILURE warning — assert codemogger is absent from any such warning.
     const warnedCodemogger = logs
       .filter((e) => e.scope === 'sdk.mcp')
       .flatMap((e) => (e?.data?.servers ?? []) as { name: string; status: string }[])
-      .find((s) => s.name === SERVER_NAME);
-    expect(warnedCodemogger, 'codemogger connected (absent from sdk.mcp failure warnings)').toBeFalsy();
+      .find((s) => s.name === 'codemogger');
+    expect(warnedCodemogger, 'in-process codemogger never reported as a failed MCP server').toBeFalsy();
   });
 
-  test('B: a failed codemogger surfaces an sdk.mcp warning (B4)', async () => {
-    test.setTimeout(3 * 60 * 1000);
-    const sessionId = randomUUID();
-    failId = sessionId;
+  test('B: a legacy stdio codemogger .mcp.json auto-migrates to in-process (no tokens)', async () => {
+    test.setTimeout(60_000);
+    await disableCodeSearch(PROJECT_MIGRATE);
+    await resetProjectDir(PROJECT_MIGRATE);
 
-    reapPidFiles((e) => String(e.cwd || '').replace(/\\/g, '/').includes('/fury-e2e-mcp-fail'));
-    await resetProjectDir(PROJECT_FAIL);
+    // Seed the OLD stdio registration shape a prior Fury version would have written.
+    const db = join(PROJECT_MIGRATE, '.codemogger', 'index.db');
+    writeFileSync(join(PROJECT_MIGRATE, '.mcp.json'), JSON.stringify({
+      mcpServers: { codemogger: { command: 'codemogger', args: ['--db', db, 'mcp'] } },
+    }, null, 2));
 
-    // Point --db at a DIRECTORY (the project dir): codemogger crashes opening it
-    // (exit 1, verified), so the server is `failed` at system:init. ensureDbParentDir
-    // just mkdirs the already-existing parent — harmless.
-    const reg = await registerCodemogger(PROJECT_FAIL, ['--db', PROJECT_FAIL, 'mcp']);
-    expect(reg.ok, 'POST /api/mcp registered the (doomed) codemogger').toBe(true);
+    // Hitting the MCP list endpoint triggers the auto-migration.
+    const data = await fetch(`${BASE_URL}/api/mcp?projectPath=${encodeURIComponent(PROJECT_MIGRATE)}`)
+      .then(r => r.json());
 
-    const res = await driveTurn(sessionId, PROJECT_FAIL, 'Reply with exactly the word: ready.');
-    expect(res.ok, '/api/claude-sdk accepts the turn').toBe(true);
-
-    const logs = await waitForTurnDone(sessionId, 120_000);
-
-    const mcpWarns = logs.filter((e) => e.scope === 'sdk.mcp');
-    console.log('[E2E-B] sdk.mcp warns:', JSON.stringify(mcpWarns.map((e) => e.data), null, 2));
-    expect(mcpWarns.length, 'B4: a failed MCP server logs an sdk.mcp warning').toBeGreaterThanOrEqual(1);
-
-    // The warning names codemogger with a non-connected status.
-    const servers = mcpWarns.flatMap((e) => (e?.data?.servers ?? []) as { name: string; status: string }[]);
-    const codemogger = servers.find((s) => s.name === SERVER_NAME);
-    expect(codemogger, 'the warning names codemogger').toBeTruthy();
-    expect(codemogger!.status, 'status is not "connected"').not.toBe('connected');
-
-    // Durable restore path (B4 review): /api/stream-buffer exposes the failed set
-    // so the client restores the banner on open — even after the turn ended. This
-    // is what makes the banner survive turn resets / navigation.
-    const buf = await fetch(`${BASE_URL}/api/stream-buffer?sessionId=${encodeURIComponent(sessionId)}`)
-      .then((r) => r.json());
-    console.log('[E2E-B] stream-buffer.mcpFailed:', JSON.stringify(buf.mcpFailed));
-    const restored = (buf.mcpFailed ?? []) as { name: string; status: string }[];
-    expect(restored.some((s) => s.name === SERVER_NAME && s.status === 'failed'),
-      'stream-buffer returns codemogger as failed for restore').toBe(true);
+    // The stdio entry is stripped (no competing process — acceptance #5) and code
+    // search is now the in-process config + synthetic list entry.
+    expect(existsSync(join(PROJECT_MIGRATE, '.mcp.json')), 'stdio .mcp.json removed by migration').toBe(false);
+    expect(existsSync(join(PROJECT_MIGRATE, '.codemogger', 'fury-codesearch.json')), 'in-process config written').toBe(true);
+    const codeSearchEntry = (data.servers ?? []).find((s: { codeSearch?: boolean }) => s.codeSearch);
+    expect(codeSearchEntry, 'synthetic in-process code-search entry surfaced in the list').toBeTruthy();
+    expect(codeSearchEntry.name).toBe('codemogger');
   });
 });
