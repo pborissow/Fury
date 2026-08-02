@@ -11,6 +11,7 @@
     "lint": "eslint",
     "test": "vitest run",
     "test:unit": "vitest run",
+    "test:e2e": "node --experimental-require-module node_modules/@playwright/test/cli.js test",
     "canary:ask": "node scripts/probe-ask-user-question.mjs && node scripts/probe-ask-user-question-edges.mjs"
   },
   "dependencies": {
@@ -33,7 +34,7 @@
     "@tiptap/starter-kit": "^3.7.2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "codemogger": "^0.1.4",
+    "codemogger": "0.1.4",
     "diff": "^8.0.3",
     "drawflow": "^0.0.60",
     "echarts": "^6.1.0",
