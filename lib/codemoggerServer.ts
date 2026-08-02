@@ -71,6 +71,10 @@ interface Entry {
 const registry = new Map<string, Promise<Entry>>();
 // Per-project op chain, separate from creation, so search never overlaps a reindex.
 const locks = new Map<string, Promise<unknown>>();
+// Per-project usage for idle eviction: last-op time + in-flight op count. Eviction
+// only closes a CodeIndex when inFlight === 0, so a close can never race a live op.
+interface Usage { lastUsed: number; inFlight: number }
+const usage = new Map<string, Usage>();
 const norm = (p: string) => p.replace(/\\/g, '/');
 
 /** Serialize an op behind the project's current op (search never overlaps reindex). */
@@ -79,6 +83,28 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const run = prev.then(fn, fn);
   locks.set(key, run.then(() => {}, () => {})); // tail never rejects
   return run;
+}
+
+/**
+ * Acquire the project's engine AND run `fn` under one lock hold — the SINGLE access
+ * point for the CodeIndex. getOrCreate happens INSIDE the lock, and inFlight is bumped
+ * synchronously at call time, so the entire acquire+use is counted in-flight. That's
+ * what makes idle eviction safe: it only closes a connection when inFlight === 0, so
+ * it can never close a CodeIndex a handler is mid-way through using. If a project was
+ * evicted between calls, getOrCreate simply re-opens it here.
+ */
+function withEngine<T>(key: string, dbPath: string, fn: (ci: CodeIndex) => Promise<T>): Promise<T> {
+  let u = usage.get(key);
+  if (!u) { u = { lastUsed: Date.now(), inFlight: 0 }; usage.set(key, u); }
+  u.inFlight++; u.lastUsed = Date.now();
+  const done = () => { u!.inFlight--; u!.lastUsed = Date.now(); };
+  return withLock(key, async () => {
+    const { codeIndex } = await getOrCreate(key, dbPath);
+    return fn(codeIndex);
+  }).then(
+    (v) => { done(); return v; },
+    (e) => { done(); throw e; },
+  );
 }
 
 /** Format search hits the way codemogger's own MCP does (path:lines [kind] name). */
@@ -122,9 +148,8 @@ function buildServer(key: string, dbPath: string): McpSdkServerConfigWithInstanc
         },
         async (args) => {
           const includeSnippet = args.includeSnippet ?? true;
-          const { codeIndex } = await getOrCreate(key, dbPath);
-          const results = await withLock(key, () =>
-            codeIndex.search(args.query, { mode: args.mode ?? 'semantic', limit: args.limit ?? 10, includeSnippet }));
+          const results = await withEngine(key, dbPath, ci =>
+            ci.search(args.query, { mode: args.mode ?? 'semantic', limit: args.limit ?? 10, includeSnippet }));
           return { content: [{ type: 'text', text: formatResults(results, includeSnippet) }] };
         },
       ),
@@ -133,8 +158,7 @@ function buildServer(key: string, dbPath: string): McpSdkServerConfigWithInstanc
         'Index (or re-index) a directory of this project into the code-search index.',
         { directory: z.string() },
         async (args) => {
-          const { codeIndex } = await getOrCreate(key, dbPath);
-          const r = await withLock(key, () => codeIndex.index(args.directory));
+          const r = await withEngine(key, dbPath, ci => ci.index(args.directory));
           return { content: [{ type: 'text', text: `Indexed ${r.files} files → ${r.chunks} chunks (embedded ${r.embedded}, skipped ${r.skipped}, removed ${r.removed}).` }] };
         },
       ),
@@ -143,8 +167,7 @@ function buildServer(key: string, dbPath: string): McpSdkServerConfigWithInstanc
         'Re-index a directory (incremental; unchanged files are skipped). Fury also auto-reindexes on file changes.',
         { directory: z.string() },
         async (args) => {
-          const { codeIndex } = await getOrCreate(key, dbPath);
-          const r = await withLock(key, () => codeIndex.index(args.directory));
+          const r = await withEngine(key, dbPath, ci => ci.index(args.directory));
           return { content: [{ type: 'text', text: `Reindexed ${r.files} files → ${r.chunks} chunks (embedded ${r.embedded}, skipped ${r.skipped}, removed ${r.removed}).` }] };
         },
       ),
@@ -191,10 +214,9 @@ export function codemoggerSdkServer(projectPath: string, dbPath: string): McpSdk
  */
 export async function reindexProject(projectPath: string, dbPath: string, dirs: string[]): Promise<void> {
   const key = norm(projectPath);
-  const { codeIndex } = await getOrCreate(key, dbPath);
   for (const dir of dirs) {
     try {
-      const r = await withLock(key, () => codeIndex.index(dir));
+      const r = await withEngine(key, dbPath, ci => ci.index(dir));
       log.info('codemogger.reindex', 'indexed', {
         data: { dir, summary: `Indexed ${r.files} files → ${r.chunks} chunks, skipped ${r.skipped}, removed ${r.removed}` },
       });
@@ -216,8 +238,7 @@ export async function searchProject(
   opts: { mode?: 'semantic' | 'keyword'; limit?: number; includeSnippet?: boolean } = {},
 ): Promise<SearchResult[]> {
   const key = norm(projectPath);
-  const { codeIndex } = await getOrCreate(key, dbPath);
-  return withLock(key, () => codeIndex.search(query, {
+  return withEngine(key, dbPath, ci => ci.search(query, {
     mode: opts.mode ?? 'semantic', limit: opts.limit ?? 10, includeSnippet: opts.includeSnippet ?? true,
   }));
 }
@@ -229,5 +250,46 @@ export async function dropProject(projectPath: string): Promise<void> {
   const p = registry.get(key);
   registry.delete(key);
   locks.delete(key);
+  usage.delete(key);
   if (p) { try { (await p).codeIndex.close(); } catch { /* already closed / never opened */ } }
+}
+
+// ── Idle eviction ───────────────────────────────────────────────────────────────
+// A long-lived server that code-searches many projects would otherwise accumulate
+// open Turso connections (one CodeIndex per project, closed only on disable/shutdown).
+// Close a project's connection once it's been idle a while; getOrCreate re-opens it on
+// the next access. Safe because we only evict when inFlight === 0 (no op mid-use).
+const IDLE_TTL_MS = 15 * 60_000;   // evict a project's index after this much idle time
+const SWEEP_INTERVAL_MS = 5 * 60_000;
+
+/** Close every project whose index has been idle ≥ ttlMs and has no op in flight.
+ *  Returns the number evicted. Exported (with a ttl arg) so tests can force a sweep. */
+export function evictIdle(ttlMs: number = IDLE_TTL_MS): number {
+  const now = Date.now();
+  let evicted = 0;
+  for (const [key, u] of usage) {
+    if (u.inFlight !== 0 || now - u.lastUsed < ttlMs) continue;
+    const p = registry.get(key);
+    registry.delete(key);
+    locks.delete(key);
+    usage.delete(key);
+    if (p) p.then(e => { try { e.codeIndex.close(); } catch { /* already closed */ } }, () => {});
+    evicted++;
+    log.info('codemogger.evict', 'closed idle project index', { data: { key, idleMs: now - u.lastUsed } });
+  }
+  return evicted;
+}
+
+/** Whether a project currently holds an open engine (introspection for tests). */
+export function hasOpenEngine(projectPath: string): boolean {
+  return registry.has(norm(projectPath));
+}
+
+// One sweep timer across HMR re-evals (unref'd so it never keeps the process alive).
+{
+  const g = globalThis as unknown as { __fury_codemogger_sweep__?: ReturnType<typeof setInterval> };
+  if (g.__fury_codemogger_sweep__) clearInterval(g.__fury_codemogger_sweep__);
+  const t = setInterval(() => evictIdle(), SWEEP_INTERVAL_MS);
+  if (typeof t.unref === 'function') t.unref();
+  g.__fury_codemogger_sweep__ = t;
 }

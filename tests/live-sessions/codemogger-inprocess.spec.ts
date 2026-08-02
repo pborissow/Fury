@@ -11,7 +11,7 @@ import { test, expect } from '@playwright/test';
 import { mkdtempSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { reindexProject, searchProject, dropProject } from '../../lib/codemoggerServer';
+import { reindexProject, searchProject, dropProject, evictIdle, hasOpenEngine } from '../../lib/codemoggerServer';
 
 test('single-process engine: index + search + concurrent reindex are serialized', async () => {
   test.setTimeout(3 * 60 * 1000);
@@ -39,6 +39,15 @@ test('single-process engine: index + search + concurrent reindex are serialized'
 
     const afterBeta = await searchProject(project, db, 'inprocBetaSymbol', { mode: 'keyword' });
     expect(afterBeta.some(r => r.name === 'inprocBetaSymbol'), 'incremental reindex added the new symbol').toBe(true);
+
+    // Idle eviction: after the ops settle the engine is open; a forced sweep (ttl 0)
+    // closes its Turso connection, and a later search transparently re-opens it.
+    expect(hasOpenEngine(project), 'engine open after use').toBe(true);
+    expect(evictIdle(0), 'forced sweep evicts the idle project').toBeGreaterThanOrEqual(1);
+    expect(hasOpenEngine(project), 'engine closed by eviction').toBe(false);
+    const afterEvict = await searchProject(project, db, 'inprocBetaSymbol', { mode: 'keyword' });
+    expect(afterEvict.some(r => r.name === 'inprocBetaSymbol'), 're-opened engine still searches the index').toBe(true);
+    expect(hasOpenEngine(project), 're-opened by the search').toBe(true);
   } finally {
     await dropProject(project); // closes the DB connection before cleanup
     try { rmSync(project, { recursive: true, force: true }); } catch { /* best effort */ }
