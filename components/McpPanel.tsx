@@ -439,7 +439,7 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
     type: 'Add MCP Server',
     details: editingServerName
       ? `Edit: ${editingServerName}`
-      : mcpForm.transport === 'codesearch' ? 'Code Search'
+      : mcpForm.transport === 'codesearch' ? 'Project MCP'
         : mcpForm.transport === 'stdio' ? 'Local Process' : 'Remote Server',
     instructions: 'Usage Instructions',
   }[wizardStep];
@@ -462,7 +462,7 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
         const isBatch = isHttp && httpServers.length > 1;
         const addableCount = isBatch ? newHttpServers.length : (isHttp ? httpServers.length : 1);
         const isValid = isCodeSearch
-          ? !!mcpForm.name && mcpForm.directories.length > 0
+          ? mcpForm.directories.length > 0
           : isHttp
             ? isBatch ? addableCount > 0 : (httpServers.length > 0 && !!mcpForm.name)
             : !!mcpForm.name && !!mcpForm.commandOrUrl;
@@ -665,16 +665,6 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
         {/* Step 2: Code Search details */}
         {wizardStep === 'details' && mcpForm.transport === 'codesearch' && (
           <div className="space-y-4">
-            <div>
-              <label className="text-sm font-medium text-foreground block mb-1">Name</label>
-              <input
-                type="text"
-                value={mcpForm.name}
-                onChange={(e) => setMcpForm(f => ({ ...f, name: e.target.value }))}
-                placeholder="my-project"
-                className={inputClass}
-              />
-            </div>
             <div>
               <label className="text-sm font-medium text-foreground block mb-1">Directories to index</label>
               <div className="space-y-1.5">

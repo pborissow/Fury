@@ -64,10 +64,10 @@ test.describe('MCP wizard — Code Search (in-process)', () => {
     await expect(page.locator('button', { hasText: 'Local process' })).toBeVisible();
     await expect(page.locator('button', { hasText: 'Remote server' })).toBeVisible();
 
-    // Select "This project" → Step 2: Code Search form.
+    // Select "This project" → Step 2: Project MCP form.
     await page.locator('button', { hasText: 'This project' }).click();
     await expect(page.locator('text=Step 2 of 3')).toBeVisible();
-    await expect(page.locator('[class*="font-semibold"]', { hasText: 'Code Search' })).toBeVisible();
+    await expect(page.locator('[class*="font-semibold"]', { hasText: 'Project MCP' })).toBeVisible();
 
     // Should have a pre-populated directory (the current project) + "Add directory".
     await expect(page.locator('button', { hasText: 'Add directory' })).toBeVisible();

@@ -51,7 +51,7 @@ function withCodeSearchEntry(projectPath: string | null, servers: McpServer[]): 
   if (!cfg) return servers;
   const dirs = cfg.dirs.length ? cfg.dirs : [projectPath];
   const entry: CodeSearchServer = {
-    name: 'codemogger',
+    name: 'This Project (Local MCP)',
     url: `in-process code search · ${dirs.length} dir${dirs.length === 1 ? '' : 's'}`,
     status: 'connected',
     statusDetail: 'In-process (Fury) — no separate process',
