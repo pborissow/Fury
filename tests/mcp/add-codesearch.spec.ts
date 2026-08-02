@@ -141,17 +141,17 @@ test.describe('MCP wizard — Code Search (codemogger)', () => {
     expect(argsLine).toContain('--db');
     expect(argsLine).toMatch(/--db\s+\S*[/\\]\.codemogger[/\\]index\.db\s+mcp/);
 
-    // B1: registering the code-search server must ensure the --db parent dir
-    // exists so codemogger can open the DB on first use (it won't mkdir an
-    // explicit --db parent itself). We assert the dir exists post-registration.
-    // (The unit test tests/unit/mcp-args.test.ts proves it is CREATED when
-    // missing; here we can't delete the real ~/.codemogger without destroying
-    // the user's index, so this is the integration-level existence check.)
+    // B1 + per-project DB: the `--db` is now inside the PROJECT
+    // (`<project>/.codemogger/index.db`, not the shared `~/.codemogger`), and the
+    // registration must ensure that parent dir exists (codemogger won't mkdir an
+    // explicit `--db` parent). Parse the db path from the Args line and assert its
+    // parent exists. (The unit tests prove the mkdir + gitignore behavior directly.)
     const { existsSync } = await import('fs');
-    const { homedir } = await import('os');
-    const { join } = await import('path');
-    const codemoggerDir = join(homedir(), '.codemogger');
-    expect(existsSync(codemoggerDir), `${codemoggerDir} should exist after registration`).toBe(true);
+    const { dirname } = await import('path');
+    const dbMatch = argsLine.match(/--db\s+(\S+[/\\]\.codemogger[/\\]index\.db)\s+mcp/);
+    expect(dbMatch, 'db path parseable from the Args line').toBeTruthy();
+    const dbDir = dirname(dbMatch![1]);
+    expect(existsSync(dbDir), `per-project ${dbDir} should exist after registration`).toBe(true);
 
     // Enhancement: now that codemogger is configured for this project, reopening
     // the wizard must show the "This project" card DISABLED up-front (detected by

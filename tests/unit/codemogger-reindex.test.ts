@@ -11,8 +11,9 @@ import { tmpdir, homedir } from 'os';
 import { join } from 'path';
 import {
   isIndexableChange, readCodemoggerDbPath, CodemoggerReindexer, IGNORE_DIRS,
-  RECURSIVE_WATCH_SUPPORTED,
+  RECURSIVE_WATCH_SUPPORTED, writeIndexDirs, readIndexDirs,
 } from '../../lib/codemoggerReindex';
+import { mkdirSync } from 'fs';
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const dirs: string[] = [];
@@ -125,6 +126,59 @@ describe('debounce + single-flight orchestration', () => {
     await sleep(60);
     expect(runIndex).toHaveBeenCalledTimes(2);
     expect(runIndex.mock.calls.map(c => c[0]).sort()).toEqual([a, b].sort());
+  });
+});
+
+describe('index-dirs sidecar (per-project selected directories)', () => {
+  // A project whose codemogger --db is IN the project tree (per-project DB), so the
+  // sidecar sits next to it — the real registration shape.
+  async function perProjectCodemogger(): Promise<{ project: string; db: string }> {
+    const project = await scratchProject();
+    const db = join(project, '.codemogger', 'index.db');
+    mkdirSync(join(project, '.codemogger'), { recursive: true });
+    await writeFile(join(project, '.mcp.json'), JSON.stringify({
+      mcpServers: { codemogger: { command: 'codemogger', args: ['--db', db, 'mcp'] } },
+    }, null, 2));
+    return { project, db };
+  }
+
+  it('writeIndexDirs → readIndexDirs round-trips the selected dirs', async () => {
+    const { project, db } = await perProjectCodemogger();
+    writeIndexDirs(db, [join(project, 'src'), join(project, 'ui')]);
+    expect(readIndexDirs(project)).toEqual([join(project, 'src'), join(project, 'ui')]);
+  });
+
+  it('falls back to the project root when there is no sidecar', async () => {
+    const { project } = await perProjectCodemogger();
+    expect(readIndexDirs(project)).toEqual([project]);
+  });
+
+  it('returns [] when the project has no codemogger server', async () => {
+    const project = await scratchProject({ mcpServers: {} });
+    expect(readIndexDirs(project)).toEqual([]);
+  });
+});
+
+describe('reindex scopes to the selected directories', () => {
+  it('indexes each selected dir (not the whole project)', async () => {
+    const project = await scratchProject();
+    const db = join(project, '.codemogger', 'index.db');
+    const src = join(project, 'src'); const ui = join(project, 'ui');
+    mkdirSync(join(project, '.codemogger'), { recursive: true });
+    mkdirSync(src, { recursive: true }); mkdirSync(ui, { recursive: true });
+    await writeFile(join(project, '.mcp.json'), JSON.stringify({
+      mcpServers: { codemogger: { command: 'codemogger', args: ['--db', db, 'mcp'] } },
+    }, null, 2));
+    writeIndexDirs(db, [src, ui]);
+
+    const runIndex = vi.fn(async (_dir: string, _db: string) => {});
+    const r = new CodemoggerReindexer({ debounceMs: 20, runIndex });
+    await r.reindexNow(project);
+
+    expect(runIndex).toHaveBeenCalledTimes(2);
+    expect(runIndex.mock.calls.map(c => c[0]).sort()).toEqual([src, ui].sort());
+    // All into the one per-project DB.
+    expect(runIndex.mock.calls.every(c => c[1] === db)).toBe(true);
   });
 });
 

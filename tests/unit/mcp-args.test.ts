@@ -6,10 +6,11 @@
  *    codemogger doesn't crash opening a DB under a non-existent ~/.codemogger.
  */
 import { describe, it, expect, afterEach } from 'vitest';
-import { mkdtemp, rm, stat } from 'fs/promises';
+import { mkdtemp, rm, stat, mkdir, writeFile, readFile } from 'fs/promises';
+import { existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { normalizeArgs, dbPathFromArgs, ensureDbParentDir } from '../../lib/mcpArgs';
+import { normalizeArgs, dbPathFromArgs, ensureDbParentDir, ensureGitignoredIfRepo } from '../../lib/mcpArgs';
 
 const madeDirs: string[] = [];
 afterEach(async () => {
@@ -64,5 +65,57 @@ describe('ensureDbParentDir (B1)', () => {
   it('is a no-op when there is no --db arg', async () => {
     expect(await ensureDbParentDir(['mcp'])).toBeNull();
     expect(await ensureDbParentDir([])).toBeNull();
+  });
+});
+
+describe('ensureGitignoredIfRepo (per-project DB, git-aware)', () => {
+  async function scratch(): Promise<string> {
+    const base = await mkdtemp(join(tmpdir(), 'fury-gi-'));
+    madeDirs.push(base);
+    return base;
+  }
+  const gi = (base: string) => join(base, '.gitignore');
+
+  it('does NOTHING in a non-git project — no .gitignore is created', async () => {
+    const base = await scratch();
+    const added = await ensureGitignoredIfRepo(base, '.codemogger/');
+    expect(added).toBe(false);
+    expect(existsSync(gi(base))).toBe(false);
+  });
+
+  it('creates .gitignore with the entry in a git repo that has none', async () => {
+    const base = await scratch();
+    await mkdir(join(base, '.git'), { recursive: true }); // .git dir ⇒ git repo
+    const added = await ensureGitignoredIfRepo(base, '.codemogger/');
+    expect(added).toBe(true);
+    expect(await readFile(gi(base), 'utf-8')).toMatch(/^\.codemogger\/$/m);
+  });
+
+  it('appends to an existing .gitignore without clobbering it', async () => {
+    const base = await scratch();
+    await mkdir(join(base, '.git'), { recursive: true });
+    await writeFile(gi(base), 'node_modules/\ndist/\n');
+    await ensureGitignoredIfRepo(base, '.codemogger/');
+    const text = await readFile(gi(base), 'utf-8');
+    expect(text).toMatch(/node_modules\//);
+    expect(text).toMatch(/dist\//);
+    expect(text).toMatch(/^\.codemogger\/$/m);
+  });
+
+  it('is idempotent — does not duplicate an existing entry', async () => {
+    const base = await scratch();
+    await mkdir(join(base, '.git'), { recursive: true });
+    await writeFile(gi(base), '.codemogger/\n');
+    await ensureGitignoredIfRepo(base, '.codemogger/');
+    const count = (await readFile(gi(base), 'utf-8')).split('\n').filter(l => l.trim() === '.codemogger/').length;
+    expect(count).toBe(1);
+  });
+
+  it('treats a .git FILE (worktree/submodule) as a repo', async () => {
+    const base = await scratch();
+    await writeFile(join(base, '.git'), 'gitdir: /somewhere/else\n'); // .git FILE
+    const added = await ensureGitignoredIfRepo(base, '.codemogger/');
+    expect(added).toBe(true);
+    expect(existsSync(gi(base))).toBe(true);
   });
 });

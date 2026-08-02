@@ -1,40 +1,41 @@
 import fs from 'fs';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { execFile } from 'child_process';
 import { homedir } from 'os';
-import { join, extname } from 'path';
+import { join, dirname, extname } from 'path';
 import { log } from './logger';
 
 /**
  * Auto-reindex the codemogger code-search DB when a "This project" (codesearch)
- * project's source files change.
+ * project's SELECTED source directories change.
  *
  * codemogger serves the SQLite index as a static snapshot — it does NOT watch the
  * filesystem, and Fury never reindexes on its own, so the index drifts stale after
- * any edit until something calls `codemogger_index`/`reindex` (which rides on the
- * model choosing to). This module closes that gap: when an SDK turn runs for a
- * project that has a codemogger stdio server configured, we watch the project's
- * source tree and run `codemogger --db <db> index <project>` — debounced (coalesce
+ * any edit until something calls `codemogger_index`/`reindex`. This closes that gap:
+ * when an SDK turn runs for a codemogger-configured project we watch its indexed
+ * directories and run `codemogger --db <db> index <dir>` per dir — debounced (coalesce
  * a burst of saves) and single-flight (never two indexes for one project at once).
- * Indexing is incremental + content-hashed inside codemogger, so a no-op edit is
- * cheap and unchanged files are skipped.
+ * Indexing is incremental + content-hashed inside codemogger, so unchanged files are
+ * skipped.
  *
- * Shares lib/fileWatchers.ts's scaffolding style (native fs.watch, debounce timers,
- * a globalThis-pinned singleton, stopAll() for shutdown) but — unlike fileWatchers,
- * which watches single files / one directory non-recursively — this needs the whole
- * source tree, so it uses ONE `fs.watch(project, { recursive: true })`.
+ * SELECTED DIRECTORIES: the wizard lets the user choose which directories to index;
+ * Fury records them in a per-project sidecar (`<db-dir>/.fury-index-dirs.json`) next
+ * to the DB. We watch and reindex exactly those dirs (falling back to the project root
+ * for older registrations with no sidecar). The DB itself is per-project
+ * (`<project>/.codemogger/index.db`), so searches never bleed across projects.
  *
- * PLATFORM LIMITATION: recursive fs.watch is supported only on macOS and Windows;
- * on Linux it throws ERR_FEATURE_UNAVAILABLE_ON_PLATFORM. Auto-reindex is therefore
- * a Windows/macOS feature (Fury's dev target). `ensureWatching` no-ops with a single
- * info log on unsupported platforms rather than failing. A cross-platform version
- * would walk the tree with per-directory non-recursive watchers (or add chokidar).
+ * Shares lib/fileWatchers.ts's scaffolding style (native fs.watch, debounce timers, a
+ * globalThis-pinned singleton, stopAll() for shutdown), but recursive: each selected
+ * dir gets one `fs.watch(dir, { recursive: true })`.
  *
- * PERF: the recursive watch root is the whole project, so the OS also delivers
- * events for `node_modules`/`.git`/build output. `isIndexableChange` filters those
- * at the callback (no spurious reindex), but the native event volume is wasted work
- * on a large repo — a future optimization is to watch a narrower source-dir set.
+ * PLATFORM LIMITATION: recursive fs.watch is macOS/Windows only; on Linux it throws
+ * ERR_FEATURE_UNAVAILABLE_ON_PLATFORM. `ensureWatching` no-ops with a single info log
+ * on unsupported platforms. (A cross-platform version would walk with per-dir
+ * non-recursive watchers, or add chokidar.)
  */
+
+/** Sidecar (next to the per-project DB) recording which dirs to watch + index. */
+export const INDEX_DIRS_SIDECAR = '.fury-index-dirs.json';
 
 /** Directories whose events never warrant a reindex (build output, VCS, deps). */
 export const IGNORE_DIRS = new Set([
@@ -92,11 +93,44 @@ export function readCodemoggerDbPath(projectPath: string): string | null {
   return null;
 }
 
-/** Run `codemogger --db <db> index <project>` via node against the repo's own
- *  codemogger cli.mjs (portable — the Windows `.cmd` PATH shim isn't execFile-able
- *  by bare name, and a `shell:true` fallback wouldn't quote spaced paths). If the
- *  cli isn't present, warn and skip rather than spawn something fragile. */
-function defaultRunIndex(projectPath: string, dbPath: string): Promise<void> {
+/** The sidecar path for a given `--db` path (sits next to the DB). */
+function sidecarPathForDb(dbPath: string): string {
+  return join(dirname(dbPath), INDEX_DIRS_SIDECAR);
+}
+
+/** Record the selected index directories in the sidecar next to `dbPath`. */
+export function writeIndexDirs(dbPath: string, dirs: string[]): void {
+  const clean = dirs.map(d => String(d)).filter(Boolean);
+  try {
+    writeFileSync(sidecarPathForDb(dbPath), JSON.stringify({ dirs: clean }, null, 2));
+  } catch (err) {
+    log.warn('codemogger.reindex', 'failed to write index-dirs sidecar', {
+      data: { dbPath, error: err instanceof Error ? err.message : String(err) },
+    });
+  }
+}
+
+/**
+ * The directories to watch + index for a project: the sidecar's `dirs` if present,
+ * else the project root (older registrations / no explicit selection). Empty when
+ * the project has no codemogger server. Pure (reads disk).
+ */
+export function readIndexDirs(projectPath: string): string[] {
+  const dbPath = readCodemoggerDbPath(projectPath);
+  if (!dbPath) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(sidecarPathForDb(dbPath), 'utf-8'));
+    const dirs = Array.isArray(parsed?.dirs) ? parsed.dirs.map((d: unknown) => String(d)).filter(Boolean) : [];
+    if (dirs.length) return dirs;
+  } catch { /* no sidecar — fall back to the project root */ }
+  return [projectPath];
+}
+
+/** Run `codemogger --db <db> index <dir>` via node against the repo's own codemogger
+ *  cli.mjs (portable — the Windows `.cmd` PATH shim isn't execFile-able by bare name,
+ *  and a `shell:true` fallback wouldn't quote spaced paths). If the cli isn't present,
+ *  warn and skip rather than spawn something fragile. */
+function defaultRunIndex(dir: string, dbPath: string): Promise<void> {
   return new Promise((resolve) => {
     const cli = join(process.cwd(), 'node_modules', 'codemogger', 'dist', 'cli.mjs');
     if (!existsSync(cli)) {
@@ -104,17 +138,14 @@ function defaultRunIndex(projectPath: string, dbPath: string): Promise<void> {
       resolve();
       return;
     }
-    execFile(process.execPath, [cli, '--db', dbPath, 'index', projectPath], { timeout: 5 * 60_000, windowsHide: true }, (err, stdout, stderr) => {
+    execFile(process.execPath, [cli, '--db', dbPath, 'index', dir], { timeout: 5 * 60_000, windowsHide: true }, (err, stdout, stderr) => {
       if (err) {
         log.warn('codemogger.reindex', 'index failed', {
-          data: { project: projectPath, error: err.message, stderr: String(stderr || '').slice(0, 300) },
+          data: { dir, error: err.message, stderr: String(stderr || '').slice(0, 300) },
         });
       } else {
-        // codemogger prints e.g. "Indexed N files → M chunks, embedded …".
         const summary = String(stdout || '').trim().split('\n').filter(Boolean).pop() || '';
-        log.info('codemogger.reindex', 'indexed', {
-          data: { project: projectPath, summary: summary.slice(0, 200) },
-        });
+        log.info('codemogger.reindex', 'indexed', { data: { dir, summary: summary.slice(0, 200) } });
       }
       resolve();
     });
@@ -122,22 +153,22 @@ function defaultRunIndex(projectPath: string, dbPath: string): Promise<void> {
 }
 
 export class CodemoggerReindexer {
-  private watchers = new Map<string, fs.FSWatcher>();
+  private watchers = new Map<string, fs.FSWatcher[]>();
   private debounces = new Map<string, NodeJS.Timeout>();
   private running = new Set<string>();
   private dirty = new Set<string>();
   private unsupportedWarned = false;
   private readonly debounceMs: number;
-  private readonly runIndex: (projectPath: string, dbPath: string) => Promise<void>;
+  private readonly runIndex: (dir: string, dbPath: string) => Promise<void>;
 
-  constructor(opts: { debounceMs?: number; runIndex?: (p: string, db: string) => Promise<void> } = {}) {
+  constructor(opts: { debounceMs?: number; runIndex?: (dir: string, db: string) => Promise<void> } = {}) {
     this.debounceMs = opts.debounceMs ?? 4000;
     this.runIndex = opts.runIndex ?? defaultRunIndex;
   }
 
-  /** Whether a watcher is currently attached for `projectPath` (test/introspection). */
+  /** Whether any watcher is attached for `projectPath` (test/introspection). */
   isWatching(projectPath: string): boolean {
-    return this.watchers.has(this.key(projectPath));
+    return (this.watchers.get(this.key(projectPath))?.length ?? 0) > 0;
   }
 
   private key(projectPath: string): string {
@@ -145,9 +176,9 @@ export class CodemoggerReindexer {
   }
 
   /**
-   * Start watching `projectPath` for source changes iff it has a codemogger server
-   * configured. Idempotent and best-effort (never throws to the caller). Safe to
-   * call on every turn — a no-op once watching or when codemogger isn't configured.
+   * Start watching a codemogger-configured project's SELECTED directories for source
+   * changes. Idempotent and best-effort (never throws). Safe to call every turn — a
+   * no-op once watching or when codemogger isn't configured.
    */
   ensureWatching(projectPath: string): void {
     if (!projectPath) return;
@@ -165,22 +196,25 @@ export class CodemoggerReindexer {
       }
       return;
     }
-    if (!existsSync(projectPath)) return;
-    try {
-      const watcher = fs.watch(projectPath, { recursive: true }, (_evt, filename) => {
-        if (isIndexableChange(filename == null ? null : String(filename))) this.scheduleReindex(projectPath);
-      });
-      watcher.on('error', () => {
-        watcher.close();
-        this.watchers.delete(key);
-      });
-      this.watchers.set(key, watcher);
-      log.info('codemogger.reindex', 'watching', { data: { project: projectPath } });
-    } catch (err) {
-      log.warn('codemogger.reindex', 'watch failed', {
-        data: { project: projectPath, error: err instanceof Error ? err.message : String(err) },
-      });
+    const dirs = readIndexDirs(projectPath).filter(d => existsSync(d));
+    if (!dirs.length) return;
+    const watchers: fs.FSWatcher[] = [];
+    for (const dir of dirs) {
+      try {
+        const w = fs.watch(dir, { recursive: true }, (_evt, filename) => {
+          if (isIndexableChange(filename == null ? null : String(filename))) this.scheduleReindex(projectPath);
+        });
+        w.on('error', () => { try { w.close(); } catch { /* ignore */ } });
+        watchers.push(w);
+      } catch (err) {
+        log.warn('codemogger.reindex', 'watch failed', {
+          data: { dir, error: err instanceof Error ? err.message : String(err) },
+        });
+      }
     }
+    if (!watchers.length) return;
+    this.watchers.set(key, watchers);
+    log.info('codemogger.reindex', 'watching', { data: { project: projectPath, dirs } });
   }
 
   /** Debounce a reindex for a project — coalesces a burst of saves into one run. */
@@ -195,10 +229,18 @@ export class CodemoggerReindexer {
   }
 
   /**
-   * Run one reindex, single-flight per project: if one is already running, mark the
-   * project dirty and re-run once it finishes (so edits during indexing aren't lost).
-   * Re-resolves the `--db` each run so a config change (or codemogger removal) is
-   * honored; if codemogger is gone, stop watching.
+   * Reindex NOW (bypassing the debounce) — for the registration-time initial index.
+   * Still single-flight per project (a concurrent run coalesces via the dirty flag).
+   */
+  async reindexNow(projectPath: string): Promise<void> {
+    await this.runReindex(projectPath);
+  }
+
+  /**
+   * Run one reindex of all the project's selected dirs, single-flight per project: if
+   * one is already running, mark the project dirty and re-run once it finishes (so
+   * edits during indexing aren't lost). Re-resolves the `--db` + dirs each run so a
+   * config change (or codemogger removal) is honored; if codemogger is gone, stop.
    */
   private async runReindex(projectPath: string): Promise<void> {
     const key = this.key(projectPath);
@@ -206,10 +248,11 @@ export class CodemoggerReindexer {
 
     const dbPath = readCodemoggerDbPath(projectPath);
     if (!dbPath) { this.stopWatching(projectPath); return; } // codemogger removed
+    const dirs = readIndexDirs(projectPath).filter(d => existsSync(d));
 
     this.running.add(key);
     try {
-      await this.runIndex(projectPath, dbPath);
+      for (const dir of dirs) await this.runIndex(dir, dbPath);
     } finally {
       this.running.delete(key);
       if (this.dirty.delete(key)) this.scheduleReindex(projectPath); // coalesced edits
@@ -218,8 +261,8 @@ export class CodemoggerReindexer {
 
   stopWatching(projectPath: string): void {
     const key = this.key(projectPath);
-    const w = this.watchers.get(key);
-    if (w) { w.close(); this.watchers.delete(key); }
+    for (const w of this.watchers.get(key) ?? []) { try { w.close(); } catch { /* ignore */ } }
+    this.watchers.delete(key);
     const d = this.debounces.get(key);
     if (d) { clearTimeout(d); this.debounces.delete(key); }
     this.dirty.delete(key);
@@ -227,7 +270,7 @@ export class CodemoggerReindexer {
 
   /** Tear down every watcher + pending debounce. Call on server shutdown. */
   stopAll(): void {
-    for (const [, w] of this.watchers) { try { w.close(); } catch { /* ignore */ } }
+    for (const [, ws] of this.watchers) for (const w of ws) { try { w.close(); } catch { /* ignore */ } }
     this.watchers.clear();
     for (const [, d] of this.debounces) clearTimeout(d);
     this.debounces.clear();
@@ -235,8 +278,21 @@ export class CodemoggerReindexer {
   }
 }
 
-// Singleton with globalThis protection for Next.js HMR (mirrors fileWatchers).
+// Singleton across Next.js HMR, VERSION-GATED. Bump SINGLETON_VERSION when this
+// class's behavior changes so a running dev server recreates the instance instead
+// of keeping stale method bodies (a plain `globalThis[key] ?? new` would keep the
+// old instance forever — e.g. missing `reindexNow`, or the pre-selected-dirs
+// `runReindex`). On recreate, tear down the previous instance's watchers first so
+// they don't leak; the next turn re-attaches via ensureWatching.
+//   2: per-project DB + selected-directory scoping (sidecar), reindexNow(), per-dir
+//      watchers/indexing (ticket-local-mcp... decision #2).
+const SINGLETON_VERSION = 2;
 const globalKey = '__fury_codemogger_reindexer__';
-export const codemoggerReindexer: CodemoggerReindexer =
-  (globalThis as any)[globalKey] ??
-  ((globalThis as any)[globalKey] = new CodemoggerReindexer());
+const globalVerKey = '__fury_codemogger_reindexer_v__';
+const g = globalThis as any;
+if (!g[globalKey] || g[globalVerKey] !== SINGLETON_VERSION) {
+  try { g[globalKey]?.stopAll?.(); } catch { /* ignore */ }
+  g[globalKey] = new CodemoggerReindexer();
+  g[globalVerKey] = SINGLETON_VERSION;
+}
+export const codemoggerReindexer: CodemoggerReindexer = g[globalKey];

@@ -110,11 +110,16 @@ ${dirList}
 Call \`codemogger_index\` for each directory above if not yet indexed.
 
 **Search modes:**
-- \`keyword\` — for identifiers, class names, method names
-- \`semantic\` — for conceptual queries
+- \`keyword\` — for short identifiers, class names, method names.
+- \`semantic\` — for conceptual queries AND for long or \`snake_case\` names.
 
-Use \`includeSnippet=true\` to get full source in results.
-After modifying source files, ask the user before calling \`codemogger_reindex\`.
+Tip: a long \`snake_case\` name searched literally in \`keyword\` mode can return
+nothing (the index drops long underscored queries). For those, use \`semantic\`
+mode, or search a distinctive sub-word — e.g. \`platypus\` to find
+\`compute_purple_platypus_quotient\`.
+
+Use \`includeSnippet=true\` to get full source in results. The index auto-refreshes
+when project files change, so a manual \`codemogger_reindex\` is rarely needed.
 `;
 }
 
@@ -314,15 +319,13 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
 
       // Code search: translate to stdio with codemogger command
       if (mcpForm.transport === 'codesearch') {
-        // Fetch homeDir to compute shared DB path
-        let homeDir = '';
-        try {
-          const dirRes = await fetch('/api/directories');
-          const dirData = await dirRes.json();
-          homeDir = dirData.homeDir || '';
-        } catch { /* fall through */ }
-
-        const dbPath = homeDir ? `${homeDir}/.codemogger/index.db` : '.codemogger/index.db';
+        // Per-PROJECT index DB, inside the project tree (codemogger's own default
+        // convention). A single shared ~/.codemogger DB made every project's search
+        // return every other project's hits — this isolates them. The server creates
+        // the dir, gitignores `.codemogger/` (only in a git repo), records the
+        // selected directories, and indexes them.
+        const base = (projectPath || '.').replace(/\\/g, '/').replace(/\/+$/, '');
+        const dbPath = `${base}/.codemogger/index.db`;
 
         const res = await fetch('/api/mcp', {
           method: 'POST',
@@ -332,11 +335,13 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
             transport: 'stdio',
             commandOrUrl: 'codemogger',
             // Array, not a joined string: keeps `--db <dbPath>` a single argv
-            // entry even when the home/db path contains a space (B3).
+            // entry even when the path contains a space (B3).
             args: ['--db', dbPath, 'mcp'],
             envVars: '',
             scope: mcpForm.scope,
             projectPath,
+            // The directories the user chose to index (scoped, not the whole project).
+            indexDirs: mcpForm.directories,
           }),
         });
         const data = await res.json();

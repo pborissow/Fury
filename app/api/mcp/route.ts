@@ -6,7 +6,8 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { mcpCache, projectKeyCandidates } from '@/lib/mcpCache';
 import { approveProjectServer } from '@/lib/mcpApprove';
-import { normalizeArgs, ensureDbParentDir } from '@/lib/mcpArgs';
+import { normalizeArgs, ensureDbParentDir, dbPathFromArgs, ensureGitignoredIfRepo } from '@/lib/mcpArgs';
+import { writeIndexDirs, codemoggerReindexer } from '@/lib/codemoggerReindex';
 
 const execFileAsync = promisify(execFile);
 
@@ -56,7 +57,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { name, transport, commandOrUrl, args, envVars, scope, projectPath } = body;
+    const { name, transport, commandOrUrl, args, envVars, scope, projectPath, indexDirs } = body;
 
     if (!name || !commandOrUrl) {
       return NextResponse.json(
@@ -183,6 +184,19 @@ export async function POST(request: NextRequest) {
       if (!approved) {
         warning = `Registered "${name}", but could not persist its trust approval in ~/.claude.json ` +
           `(a concurrent writer kept clobbering it). It may not load until you enable it manually.`;
+      }
+    }
+    // Code search (codemogger): the wizard sends the selected directories to index.
+    // Record them in a per-project sidecar (so the watcher reindexes exactly those),
+    // keep the per-project index DB out of git, and kick off the initial index. The
+    // .mcp.json is already written (claude mcp add, above), so the reindexer can read
+    // the --db + dirs. Fire-and-forget so the wizard returns immediately.
+    if (Array.isArray(indexDirs) && projectPath) {
+      const dbPath = dbPathFromArgs(normalizeArgs(args));
+      if (dbPath) {
+        writeIndexDirs(dbPath, indexDirs as string[]);
+        await ensureGitignoredIfRepo(projectPath, '.codemogger/');
+        void codemoggerReindexer.reindexNow(projectPath).catch(() => { /* logged inside */ });
       }
     }
     mcpCache.invalidate(projectPath || null, effectiveScope).catch(() => { /* background */ });

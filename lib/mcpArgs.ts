@@ -1,5 +1,6 @@
-import { mkdir } from 'fs/promises';
-import { dirname } from 'path';
+import { mkdir, readFile, writeFile } from 'fs/promises';
+import { existsSync } from 'fs';
+import { dirname, join } from 'path';
 
 /**
  * Normalize an incoming `args` value to an argv array.
@@ -45,5 +46,38 @@ export async function ensureDbParentDir(argv: string[]): Promise<string | null> 
   } catch (err) {
     console.error('[mcpArgs] Failed to create --db parent dir for', dbPath, err);
     return null;
+  }
+}
+
+/**
+ * If `projectPath` is a git repo, ensure `entry` (e.g. `.codemogger/`) is in its
+ * `.gitignore` so the per-project index DB isn't accidentally committed.
+ *
+ * "Is a git repo" = `<projectPath>/.git` exists as a dir OR a file — worktrees and
+ * submodules use a `.git` FILE, not a dir. **Never creates `.gitignore` in a
+ * non-git project** — we don't assume a user who hasn't `git init`-ed wants git.
+ * Idempotent (skips if already ignored) and best-effort (never throws).
+ *
+ * Returns true if the entry is present in .gitignore afterward (added or already
+ * there), false if skipped (not a repo) or on write failure.
+ */
+export async function ensureGitignoredIfRepo(projectPath: string, entry: string): Promise<boolean> {
+  if (!existsSync(join(projectPath, '.git'))) return false; // not git-initialized
+  const giPath = join(projectPath, '.gitignore');
+  let current = '';
+  try { current = await readFile(giPath, 'utf-8'); } catch { /* missing — safe to create IN a git repo */ }
+  const normalized = entry.replace(/\/+$/, '');
+  const already = current.split(/\r?\n/).some(l => {
+    const t = l.trim();
+    return t === entry || t === normalized || t === `${normalized}/`;
+  });
+  if (already) return true;
+  const prefix = current && !current.endsWith('\n') ? '\n' : '';
+  try {
+    await writeFile(giPath, `${current}${prefix}\n# Codemogger index (Fury code search)\n${entry}\n`);
+    return true;
+  } catch (err) {
+    console.error('[mcpArgs] Failed to update .gitignore for', projectPath, err);
+    return false;
   }
 }
