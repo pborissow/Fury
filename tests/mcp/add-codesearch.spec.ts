@@ -31,6 +31,10 @@ test.describe('MCP wizard — Code Search (codemogger)', () => {
 
   test.beforeEach(async () => {
     await removeServer(TEST_SERVER_NAME);
+    // Clean slate: the "This project" card is now disabled when ANY project-scoped
+    // codemogger server exists (keyed on command, not name), so remove a
+    // pre-existing `codemogger` too — otherwise the add-flow card starts disabled.
+    await removeServer('codemogger');
   });
 
   test.afterEach(async () => {
@@ -148,5 +152,16 @@ test.describe('MCP wizard — Code Search (codemogger)', () => {
     const { join } = await import('path');
     const codemoggerDir = join(homedir(), '.codemogger');
     expect(existsSync(codemoggerDir), `${codemoggerDir} should exist after registration`).toBe(true);
+
+    // Enhancement: now that codemogger is configured for this project, reopening
+    // the wizard must show the "This project" card DISABLED up-front (detected by
+    // command, not name), instead of round-tripping to the route's 409.
+    await addButton.click();
+    await expect(page.locator('text=Step 1 of 3')).toBeVisible();
+    const codesearchCard = page.getByTestId('wizard-codesearch');
+    await expect(codesearchCard, 'card is disabled once code search exists').toBeDisabled({ timeout: 10000 });
+    await expect(codesearchCard).toHaveAttribute('title', 'Code search is already set up for this project');
+    // The other two cards stay enabled.
+    await expect(page.locator('button', { hasText: 'Local process' })).toBeEnabled();
   });
 });

@@ -165,6 +165,20 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
     });
   }, [mcpServers]);
 
+  // Code search is "already set up" for THIS project when a project-scoped stdio
+  // server's command references codemogger (the codesearch flow always registers
+  // `commandOrUrl: 'codemogger'`). Key on the command (server.url carries it for
+  // stdio), NOT the name — users can rename the server. Scoped to `project` so a
+  // user-scoped codemogger elsewhere doesn't disable the card here. When set, the
+  // Step-1 "This project" card is disabled up-front instead of round-tripping to
+  // the route's 409 (which stays as the server-side backstop).
+  const codeSearchConfigured = useMemo(
+    () => mcpServers.some(
+      s => s.transport === 'stdio' && s.scope === 'project' && /(^|[/\\\s])codemogger\b/i.test(s.url),
+    ),
+    [mcpServers],
+  );
+
   // Live updates: refetch when the backend cache changes for our projectPath
   useEffect(() => {
     const es = new EventSource('/api/events');
@@ -588,17 +602,30 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
           <div className="space-y-3">
             <p className="text-sm text-muted-foreground">What type of MCP server do you want to add?</p>
             <button
-              onClick={() => handleSelectType('codesearch')}
-              className="w-full flex items-center gap-3 p-4 rounded-lg border border-border bg-muted/30 hover:bg-muted/60 hover:border-foreground/20 transition-colors text-left group"
+              data-testid="wizard-codesearch"
+              disabled={codeSearchConfigured}
+              title={codeSearchConfigured ? 'Code search is already set up for this project' : undefined}
+              onClick={() => { if (!codeSearchConfigured) handleSelectType('codesearch'); }}
+              className={`w-full flex items-center gap-3 p-4 rounded-lg border border-border bg-muted/30 transition-colors text-left group ${
+                codeSearchConfigured
+                  ? 'opacity-50 cursor-not-allowed'
+                  : 'hover:bg-muted/60 hover:border-foreground/20'
+              }`}
             >
               <div className="h-10 w-10 rounded-lg bg-orange-500/10 flex items-center justify-center flex-shrink-0">
                 <Search className="h-5 w-5 text-orange-400" />
               </div>
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-foreground">This project</div>
-                <div className="text-xs text-muted-foreground mt-0.5">Index and search your project code locally</div>
+                <div className="text-xs text-muted-foreground mt-0.5">
+                  {codeSearchConfigured
+                    ? 'Code search is already set up for this project'
+                    : 'Index and search your project code locally'}
+                </div>
               </div>
-              <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors flex-shrink-0" />
+              {!codeSearchConfigured && (
+                <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors flex-shrink-0" />
+              )}
             </button>
             <button
               onClick={() => handleSelectType('stdio')}

@@ -97,6 +97,8 @@ app.prepare().then(() => {
       const { sdkSessionManager } = await import('./lib/sdkSessionManager');
       const killed = await sdkSessionManager.killAll();
       if (killed > 0) console.log(`[server] ${signal}: killed ${killed} SDK session process(es)`);
+      const { codemoggerReindexer } = await import('./lib/codemoggerReindex');
+      codemoggerReindexer.stopAll();
     } catch (err) {
       console.error('[server] Shutdown cleanup failed:', err);
     }

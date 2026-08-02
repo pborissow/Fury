@@ -16,6 +16,7 @@ import {
   refreshSubagentUsage,
 } from './transcriptArchiver';
 import { eventBus } from './eventBus';
+import { codemoggerReindexer } from './codemoggerReindex';
 import { log } from './logger';
 import { findSessionJsonlDir } from './sessionPaths';
 // Type-only (erased at compile time) — no runtime coupling to the CLI manager.
@@ -368,6 +369,13 @@ class SdkSessionManager {
   ): Promise<void> {
     const s = this.getOrCreate(sessionId);
     if (projectPath) s.projectPath = projectPath;
+
+    // Keep the codemogger code-search index fresh: if this project has a
+    // codesearch server configured, watch its source tree and debounce-reindex on
+    // changes. Idempotent + best-effort (never throws), so calling it every turn is
+    // free once watching / when codemogger isn't configured
+    // (docs/ticket-local-mcp-this-project-fails-first-use.md → Index freshness).
+    if (s.projectPath) codemoggerReindexer.ensureWatching(s.projectPath);
 
     // A parked question blocks the turn mid-tool. Pushing a prompt into the
     // input stream now would NOT answer it (the tool result is the only thing
@@ -2423,7 +2431,12 @@ class SdkSessionManager {
 //     (a benign transition no longer re-emits the banner), tracks s.mcpFailed, and
 //     emits an empty set on recovery to clear it. getMcpFailed() exposes it so the
 //     client restores the banner on open via /api/stream-buffer (B4 review).
-const SINGLETON_VERSION = 31;
+// 32: sendMessage now calls codemoggerReindexer.ensureWatching(projectPath) so a
+//     code-search-configured project auto-reindexes on source changes (debounced,
+//     single-flight) — index freshness follow-up in the local-MCP ticket. Without
+//     this bump the live instance keeps the old sendMessage and never starts the
+//     watcher.
+const SINGLETON_VERSION = 32;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;
