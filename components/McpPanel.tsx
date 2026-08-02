@@ -570,7 +570,12 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
                   {server.url}
                 </div>
                 <div className="mt-1 ml-6 flex items-center gap-2 text-xs text-muted-foreground">
-                  {server.transport && server.transport !== 'unknown' && (
+                  {server.codeSearch ? (
+                    <span className="flex items-center gap-1" title="In-process code search (runs inside Fury, no separate process)">
+                      <FolderOpen className="h-3 w-3" />
+                      local
+                    </span>
+                  ) : server.transport && server.transport !== 'unknown' && (
                     <span className="flex items-center gap-1" title={server.transport === 'http' ? 'Remote server (HTTP)' : 'Local process (stdio)'}>
                       {server.transport === 'http'
                         ? <Globe className="h-3 w-3" />

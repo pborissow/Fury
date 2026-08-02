@@ -18,7 +18,7 @@ import {
 import { eventBus } from './eventBus';
 import { codemoggerReindexer } from './codemoggerReindex';
 import { codemoggerSdkServer } from './codemoggerServer';
-import { isCodeSearchEnabled, codeSearchDbPath } from './codeSearchConfig';
+import { isCodeSearchEnabled, codeSearchDbPath, stripStdioCodemogger } from './codeSearchConfig';
 import { log } from './logger';
 import { findSessionJsonlDir } from './sessionPaths';
 // Type-only (erased at compile time) — no runtime coupling to the CLI manager.
@@ -1718,6 +1718,20 @@ class SdkSessionManager {
     const abortController = new AbortController();
     s.abortController = abortController;
 
+    // In-process code search (docs/ticket-codesearch-inprocess-mcp-macos-
+    // contention.md): does this project have it enabled?
+    const codeSearchOn = !!s.projectPath && isCodeSearchEnabled(s.projectPath);
+    // SINGLE-WRITER GUARD (enforced here, not just at enable/migrate time): if code
+    // search is on, strip any stdio codemogger entry from .mcp.json BEFORE the CLI
+    // spawns — the CLI loads .mcp.json from cwd, so a surviving entry (a best-effort
+    // strip that failed at enable, or one re-added externally) would spawn a SECOND
+    // codemogger process over the same DB → two writers → the macOS contention this
+    // design removes. Sync, idempotent, best-effort (no-op when nothing to strip);
+    // matches by COMMAND so a renamed entry is caught too.
+    if (codeSearchOn) {
+      try { stripStdioCodemogger(s.projectPath!); } catch { /* best effort */ }
+    }
+
     s.q = query({
       prompt: input.stream,
       options: {
@@ -1726,14 +1740,13 @@ class SdkSessionManager {
         includePartialMessages: true,
         permissionMode: 'bypassPermissions',
         enableFileCheckpointing: true,
-        // In-process code search (docs/ticket-codesearch-inprocess-mcp-macos-
-        // contention.md): when this project has code search enabled, attach the
-        // codemogger SDK MCP server that runs IN Fury's process — one DB writer,
-        // no spawned codemogger process. Built synchronously (no embedder load;
-        // that happens lazily on the first search). NOT strictMcpConfig, so it
-        // merges with any real `.mcp.json` servers the CLI also loads from cwd.
-        ...(s.projectPath && isCodeSearchEnabled(s.projectPath)
-          ? { mcpServers: { codemogger: codemoggerSdkServer(s.projectPath, codeSearchDbPath(s.projectPath)) } }
+        // When code search is enabled, attach the codemogger SDK MCP server that runs
+        // IN Fury's process — one DB writer, no spawned codemogger process. Built
+        // synchronously (no embedder load; that happens lazily on the first search).
+        // NOT strictMcpConfig, so it merges with any real `.mcp.json` servers the CLI
+        // also loads from cwd (the stdio codemogger entry, if any, was stripped above).
+        ...(codeSearchOn
+          ? { mcpServers: { codemogger: codemoggerSdkServer(s.projectPath!, codeSearchDbPath(s.projectPath!)) } }
           : {}),
         // Replay the session's chosen model. Omitted entirely when unset so the
         // CLI default applies — passing model: undefined is equivalent, but
@@ -2452,7 +2465,11 @@ class SdkSessionManager {
 //     engine, docs/ticket-codesearch-inprocess-mcp-macos-contention.md). Without
 //     this bump the live instance keeps the old startQuery and code search would
 //     still rely on a spawned stdio process (the contention this ticket removes).
-const SINGLETON_VERSION = 33;
+// 34: startQuery now also stripStdioCodemogger()s at session start when code search
+//     is on — the single-writer invariant is enforced where the CLI would spawn,
+//     not only at enable/migrate time (review follow-up). Without this bump a stale
+//     instance could let a surviving stdio entry spawn a 2nd DB writer.
+const SINGLETON_VERSION = 34;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

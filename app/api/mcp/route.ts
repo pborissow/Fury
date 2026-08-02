@@ -56,7 +56,10 @@ function withCodeSearchEntry(projectPath: string | null, servers: McpServer[]): 
     status: 'connected',
     statusDetail: 'In-process (Fury) — no separate process',
     scope: 'project',
-    transport: 'stdio',
+    // NOT a real stdio/http server — it runs in-process. 'unknown' keeps the panel
+    // from showing a (false) transport chip; the entry is identified by `codeSearch`,
+    // never by `transport`, so nothing that branches on transport misclassifies it.
+    transport: 'unknown',
     codeSearch: true,
     dirs,
   };
