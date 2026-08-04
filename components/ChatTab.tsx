@@ -171,6 +171,10 @@ export default function ChatTab({
 
   /** When a question last PARKED, via SSE. Guards the stale-close race below. */
   const lastAskEventAtRef = useRef(0);
+  /** The last question the user ANSWERED and when. Guards the stale-RE-OPEN race
+   *  (P18): a reconnect/visibility buffer fetch issued before the answer landed can
+   *  still return the question as pending and flash the just-answered dialog back on. */
+  const answeredAskRef = useRef<{ toolUseID: string; at: number } | null>(null);
 
   /**
    * Re-open (or close) the dialog from a /api/stream-buffer response.
@@ -201,6 +205,14 @@ export default function ChatTab({
     if (!sdkSessionsEnabled) return;
     const pending = bufData?.pendingAsk;
     if (pending?.toolUseID && Array.isArray(pending.questions)) {
+      // P18: don't re-open a dialog the user already answered. In the small window
+      // before the server resolves the answer, a stale buffer snapshot (issued
+      // BEFORE the answer) can still carry this toolUseID as pending. If we answered
+      // it at/after the snapshot was issued, that snapshot predates the answer —
+      // ignore it. A fetch issued AFTER the answer that STILL shows pending is
+      // genuinely unresolved (e.g. the answer POST failed), so let it re-open.
+      const answered = answeredAskRef.current;
+      if (answered && answered.toolUseID === pending.toolUseID && answered.at >= issuedAt) return;
       lastAskEventAtRef.current = Date.now();
       setAskUserQuestion({
         toolUseID: pending.toolUseID,
@@ -514,6 +526,12 @@ export default function ChatTab({
     setBackgroundWorking(false);
     setTranscriptPartial(false);
     setSuggestedPrompt(null);
+    // Clear any parked question on switch, UNCONDITIONALLY (P17). The SDK path
+    // self-heals (its restore returns pendingAsk:null), but the CLI path never
+    // clears a stale dialog — so answering a question carried over from session A
+    // while viewing B would post the answer as a new turn against B (wrong session).
+    // The target session's own restore below re-sets it from /api/stream-buffer.
+    setAskUserQuestion(null);
     setIsStuck(false);
     setStuckReason(undefined);
     setCurrentModel(null);
@@ -984,8 +1002,16 @@ export default function ChatTab({
         setTranscriptLoading(true);
       }
 
-      // If processing just ended, refresh transcript from JSONL.
-      if (!data.isProcessing && transcriptLoadingRef.current) {
+      // If processing just ended, refresh transcript from JSONL — BUT NOT while
+      // background work is still in flight (P1). A background task (Monitor / Bash /
+      // subagent) posting a <task-notification> drives a NEW main turn moments after
+      // this idle edge; committing the on-disk partials now, then having the imminent
+      // reassert flip processing back on, paints a raw intermediary assistant bubble
+      // for one frame before the reactive `latch-break re-strip` above removes it —
+      // the visible flash. `backgroundActive` is precisely "a background turn is
+      // imminent", so keep the partials stripped and the dots on until a REAL terminal
+      // idle (background inactive) arrives; the next such idle commits the clean state.
+      if (!data.isProcessing && !data.backgroundActive && transcriptLoadingRef.current) {
         setTranscriptLoading(false);
         setTranscriptStreaming('');
         // Stamp the turn-completion time so the sidebar's freshness leaf
@@ -1205,7 +1231,11 @@ export default function ChatTab({
         sessionEsRef.current = null;
       }
     };
-  }, [viewingTranscriptId, historyTranscriptProject]);
+    // sdkSessionsEnabled is read inside the handlers here (applyPendingAskFromBuffer,
+    // the AskUserQuestion routing guard); include it (P19) so toggling the setting at
+    // runtime rebinds the handlers instead of leaving them capturing the stale value
+    // until the next session switch.
+  }, [viewingTranscriptId, historyTranscriptProject, sdkSessionsEnabled]);
 
   // --- Catch-up when tab becomes visible again ---
   // SSE events were skipped while hidden; re-fetch stream buffer + transcript
@@ -1789,6 +1819,9 @@ export default function ChatTab({
     const mySessionId = viewingTranscriptId;
     setAskUserQuestion(null);
     if (!toolUseID || !mySessionId) return;
+    // Record the answer so a stale still-pending buffer read can't re-open this
+    // dialog before the server resolves it (P18).
+    answeredAskRef.current = { toolUseID, at: Date.now() };
 
     // Only restore if nothing newer took the slot and we're still on the same
     // session — a plain set would clobber a question that parked while we waited.
@@ -2124,20 +2157,12 @@ export default function ChatTab({
                               </div>
                             </div>
                           )}
-                          {mcpFailedServers.length > 0 && (
-                            <div className="flex justify-start" data-testid="mcp-failed">
-                              <div className="max-w-[80%] rounded-lg px-4 py-2 bg-destructive/10 text-foreground border border-destructive/40 text-left">
-                                <div className="text-xs text-destructive mb-1 flex items-center gap-1">
-                                  <AlertTriangle className="h-3 w-3" />
-                                  MCP {mcpFailedServers.length > 1 ? 'servers' : 'server'} failed to connect
-                                </div>
-                                <div className="text-sm">
-                                  {mcpFailedServers.map(m => m.name).join(', ')}
-                                  <span className="text-muted-foreground"> — its tools aren&apos;t available this session.</span>
-                                </div>
-                              </div>
-                            </div>
-                          )}
+                          {/* MCP connection failures are intentionally NOT surfaced in the
+                              main chat panel — they read as a chat message about the user's
+                              work. The MCP panel is the home for server status: `mcpFailedServers`
+                              still flows to <McpPanel runtimeFailed=… /> below, which flags the
+                              failed row there. (Removed the in-transcript banner per product
+                              direction; the state is retained purely to drive the panel.) */}
                           {suggestedPrompt && !transcriptLoading && promptSuggestionsEnabled && (
                             <div className="flex justify-start">
                               <button

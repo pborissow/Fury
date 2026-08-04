@@ -35,6 +35,10 @@ const MODELS_URL = 'https://api.anthropic.com/v1/models';
 const DAY_MS = 86_400_000;
 const FETCH_TIMEOUT_MS = 15_000;
 const MIN_DELAY_MS = 5_000; // don't run instantly at boot; let startup settle
+// After a FAILED check, retry on this short backoff instead of deferring the next
+// attempt by a full poll interval (up to 7 days). A transient failure (expired
+// OAuth, network blip) then recovers automatically within the hour (P13).
+const FAILURE_BACKOFF_MS = 30 * 60 * 1000;
 const STATE_KEY = '__fury_model_catalog_poller__';
 const MAX_PAGES = 10; // safety bound; the catalog is ~10 models today
 
@@ -360,9 +364,29 @@ async function scheduleNext(): Promise<void> {
   const intervalMs = Math.max(1, settings.modelCatalogPollIntervalDays) * DAY_MS;
 
   const db = await getDb();
-  const row = await db.execute('SELECT MAX(checked_at) AS m FROM model_checks');
-  const lastAt = Number(row.rows[0]?.m) || 0;
-  const nextAt = lastAt ? lastAt + intervalMs : Date.now(); // never checked → check now
+  // Anchor the cadence on the last SUCCESSFUL check, not the last check of any kind
+  // (P13). Every attempt — ok OR failed — writes a model_checks row, so keying off
+  // MAX(checked_at) let a single transient failure push the next auto-attempt a full
+  // interval (≤7d) into the future. It also kept the scheduling clock (all attempts)
+  // out of step with the "Index updated" label (successes only). Now: schedule from
+  // the last success normally, and from a SHORT backoff when the most recent attempt
+  // failed, so a transient failure recovers within the hour.
+  const okRow = await db.execute("SELECT MAX(checked_at) AS m FROM model_checks WHERE status = 'ok'");
+  const lastOkAt = Number(okRow.rows[0]?.m) || 0;
+  const lastRow = await db.execute('SELECT checked_at, status FROM model_checks ORDER BY checked_at DESC LIMIT 1');
+  const lastAt = Number(lastRow.rows[0]?.checked_at) || 0;
+  const lastFailed = lastAt > 0 && lastRow.rows[0]?.status !== 'ok';
+
+  let nextAt: number;
+  if (!lastAt) {
+    nextAt = Date.now(); // never checked → check now
+  } else if (lastFailed) {
+    // Retry soon on the failure backoff, but never later than the normal cadence
+    // would already fire (so an already-overdue catalog still checks now).
+    nextAt = Math.min(lastAt + FAILURE_BACKOFF_MS, (lastOkAt || Date.now()) + intervalMs);
+  } else {
+    nextAt = lastOkAt + intervalMs;
+  }
   const overdue = nextAt <= Date.now();
   const delay = Math.max(MIN_DELAY_MS, nextAt - Date.now());
 
@@ -374,7 +398,9 @@ async function scheduleNext(): Promise<void> {
 
   console.log(
     `[ModelCatalog] next refresh in ~${Math.round(delay / 1000)}s ` +
-    `(interval ${settings.modelCatalogPollIntervalDays}d, last check ${lastAt ? new Date(lastAt).toISOString() : 'never'})`,
+    `(interval ${settings.modelCatalogPollIntervalDays}d, last ok ` +
+    `${lastOkAt ? new Date(lastOkAt).toISOString() : 'never'}` +
+    `${lastFailed ? ', last attempt FAILED → backoff' : ''})`,
   );
 }
 

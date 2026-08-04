@@ -55,8 +55,9 @@ export default function ModelPickerDialog({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         // The default-resolved version means "follow the default" (clear the
-        // override); anything else pins that exact version.
-        body: JSON.stringify({ sessionId, model: selection.isDefault ? null : selection.id }),
+        // override); anything else pins that exact version. An EMPTY selection (no
+        // catalog) also means "follow the default", not a literal empty-string pin (P12).
+        body: JSON.stringify({ sessionId, model: selection.isDefault || !selection.id ? null : selection.id }),
       });
       const data = await res.json();
       if (!res.ok || data.error) { setError(data.error || 'Failed to switch model'); return; }
@@ -83,7 +84,9 @@ export default function ModelPickerDialog({
           {
             label: applying ? 'Switching...' : 'Select',
             onClick: () => setConfirming(true),
-            disabled: applying || loading || unchanged,
+            // Also disabled when there's no real selection (empty catalog): there's
+            // nothing to pin, and proceeding would post an empty-string model (P12).
+            disabled: applying || loading || unchanged || !selection.id,
           },
         ]}
       >

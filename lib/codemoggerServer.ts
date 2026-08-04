@@ -8,6 +8,7 @@ import type { CodeIndex, SearchResult } from 'codemogger';
 import { mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { log } from './logger';
+import { CODESEARCH_MCP_SERVER_NAME } from './mcpRuntimeStatus';
 
 /**
  * IN-PROCESS codemogger code-search engine (docs/ticket-local-mcp-this-project-
@@ -128,7 +129,9 @@ function formatResults(results: SearchResult[], includeSnippet: boolean): string
  */
 function buildServer(key: string, dbPath: string): McpSdkServerConfigWithInstance {
   return createSdkMcpServer({
-    name: 'codemogger',
+    // The runtime identity: this is the name the SDK reports connect failures
+    // under, and what the MCP panel's code-search row matches against (P16).
+    name: CODESEARCH_MCP_SERVER_NAME,
     version: '0.1.0',
     // Preload these 3 tool schemas instead of deferring them behind ToolSearch: code
     // search is only useful if the model reaches for it PROACTIVELY (the CLAUDE.md
@@ -244,14 +247,37 @@ export async function searchProject(
 }
 
 /** Drop a project's engine and CLOSE its DB connection (e.g. when code search is
- *  disabled, or in test teardown). Best-effort. */
+ *  disabled, or in test teardown). Best-effort.
+ *
+ *  Routed through the SAME per-project lock as search/reindex (P4). The previous
+ *  version synchronously deleted registry/locks/usage and closed the connection with
+ *  NO inFlight check and OUTSIDE the lock — so disabling code search mid-search (or
+ *  mid-reindex DDL) closed the DB out from under the running op AND reset the lock
+ *  chain, letting the next op start un-serialized behind the still-running one. Now
+ *  it mirrors evictIdle's discipline: the close runs as an op in the chain (so all
+ *  prior ops have finished and decremented inFlight), and it only closes when no
+ *  NEWER op is queued behind it. */
 export async function dropProject(projectPath: string): Promise<void> {
   const key = norm(projectPath);
-  const p = registry.get(key);
-  registry.delete(key);
-  locks.delete(key);
-  usage.delete(key);
-  if (p) { try { (await p).codeIndex.close(); } catch { /* already closed / never opened */ } }
+  await withLock(key, async () => {
+    // By the time this runs, every op queued before it has completed and
+    // decremented inFlight. A residual inFlight > 0 means a NEWER op enqueued
+    // behind us — closing would race it, so defer (the idle sweeper or a later
+    // drop finalizes the close once the project is truly idle).
+    const u = usage.get(key);
+    if (u && u.inFlight > 0) {
+      log.info('codemogger.drop', 'deferred close (op in flight)', { data: { key, inFlight: u.inFlight } });
+      return;
+    }
+    const p = registry.get(key);
+    registry.delete(key);
+    usage.delete(key);
+    if (p) { try { (await p).codeIndex.close(); } catch { /* already closed / never opened */ } }
+  });
+  // Deliberately DO NOT locks.delete(key) here: deleting the chain while an op may
+  // still reference it is exactly the reset that de-serialized the next op (P4).
+  // Leaving the resolved lock promise keeps future ops chained; it's a bounded,
+  // tiny per-project entry (reused by withLock, cleared by evictIdle when idle).
 }
 
 // ── Idle eviction ───────────────────────────────────────────────────────────────

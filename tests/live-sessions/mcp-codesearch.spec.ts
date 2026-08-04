@@ -24,6 +24,7 @@ import {
   BASE_URL, sleep, reapPidFiles, furyLogLinesFor, resetProjectDir, driveTurn,
   cleanupSession, jsonlPath,
 } from './drive-helpers';
+import { CODESEARCH_MCP_SERVER_NAME, CODESEARCH_DISPLAY_NAME } from '../../lib/mcpRuntimeStatus';
 
 const PROJECT_OK = join(__dirname, '..', '..', '..', 'fury-e2e-mcp-ok');
 const PROJECT_MIGRATE = join(__dirname, '..', '..', '..', 'fury-e2e-mcp-migrate');
@@ -188,8 +189,14 @@ test.describe('MCP code-search (codemogger) — in-process, live', () => {
     // search is now the in-process config + synthetic list entry.
     expect(existsSync(join(PROJECT_MIGRATE, '.mcp.json')), 'stdio .mcp.json removed by migration').toBe(false);
     expect(existsSync(join(PROJECT_MIGRATE, '.codemogger', 'fury-codesearch.json')), 'in-process config written').toBe(true);
-    const codeSearchEntry = (data.servers ?? []).find((s: { codeSearch?: boolean }) => s.codeSearch);
+    const codeSearchEntry = (data.servers ?? [])
+      .find((s: { codeSearch?: boolean }) => s.codeSearch) as
+        { name: string; runtimeName?: string } | undefined;
     expect(codeSearchEntry, 'synthetic in-process code-search entry surfaced in the list').toBeTruthy();
-    expect(codeSearchEntry.name).toBe('codemogger');
+    // The row carries BOTH identities: a friendly display label, and the name the
+    // in-process engine reports runtime failures under. The panel resolves health
+    // against the latter — asserting it here is what keeps P16 fixed.
+    expect(codeSearchEntry!.name).toBe(CODESEARCH_DISPLAY_NAME);
+    expect(codeSearchEntry!.runtimeName).toBe(CODESEARCH_MCP_SERVER_NAME);
   });
 });

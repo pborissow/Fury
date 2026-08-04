@@ -5,9 +5,13 @@ import { Plus, RotateCcw, Check, AlertTriangle, Terminal, Globe, ChevronRight, F
 import { Button } from '@/components/ui/button';
 import Dialog, { ConfirmDialog } from '@/components/Dialog';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
+import { isServerRuntimeFailed } from '@/lib/mcpRuntimeStatus';
 
 interface McpServer {
   name: string;
+  /** Identity the runtime reports failures under, when it differs from `name`
+   *  (the code-search row: displayed as "This Project…", runs as `codemogger`). */
+  runtimeName?: string;
   url: string;
   status: string;
   statusDetail: string;
@@ -142,6 +146,13 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
     () => new Set((runtimeFailed ?? []).map(s => s.name)),
     [runtimeFailed],
   );
+  // Whether a panel row failed to connect in the active session. Matched on the
+  // row's RUNTIME identity, not its display label — the synthetic code-search row
+  // is shown as "This Project (Local MCP)" but reports failures as `codemogger`
+  // (lib/mcpRuntimeStatus.ts). Matching by display name kept an embedder/onnx init
+  // failure showing a green "connected" check (P16).
+  const isServerFailed = (server: McpServer): boolean =>
+    isServerRuntimeFailed(server, runtimeFailedNames);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [mcpLoading, setMcpLoading] = useState(false);
   const [mcpError, setMcpError] = useState<string | null>(null);
@@ -549,7 +560,7 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
                   </button>
                 </div>
                 <div className="flex items-center gap-2">
-                  {runtimeFailedNames.has(server.name) ? (
+                  {isServerFailed(server) ? (
                     <span title="Failed to connect in the active session — its tools are unavailable">
                       <AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" />
                     </span>

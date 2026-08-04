@@ -79,6 +79,41 @@ describe('background_tasks_changed → liveness', () => {
     expect(cap.events.find((e) => e.sessionId === 'bg-3')?.backgroundActive).toBe(false);
   });
 
+  it('self-heals a WEDGED set: idle main turn + stale + no activity clears it (lost clearing signal)', () => {
+    const s = newSession('bg-wedge');
+    mgr.handle(s, bgChanged(['t1'])); // set populated, lastBgActivityAt = now
+    expect(mgr.isBackgroundActive('bg-wedge')).toBe(true);
+
+    // The terminal `background_tasks_changed []` never arrives (dropped stream /
+    // crash mid-task): the set stays non-empty, the main turn is idle, no further
+    // signal comes. Without the heal this pins backgroundActive true forever and
+    // strands the dots (the Camera2 report).
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now() - 4 * 60_000; // older than WEDGED_BG_GRACE_MS (3 min)
+
+    expect(mgr.isBackgroundActive('bg-wedge')).toBe(false); // healed
+    expect(s.backgroundTasks.size).toBe(0); // wedged set dropped
+  });
+
+  it('does NOT over-clear while signals are still fresh (a genuinely live task stays live)', () => {
+    const s = newSession('bg-fresh');
+    mgr.handle(s, bgChanged(['t1']));
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now() - 10_000; // 10s ago — well within grace
+    expect(mgr.isBackgroundActive('bg-fresh')).toBe(true);
+    expect(s.backgroundTasks.size).toBe(1);
+  });
+
+  it('a task_* EDGE refreshes the liveness clock so an emitting task survives past the grace', () => {
+    const s = newSession('bg-edge');
+    mgr.handle(s, bgChanged(['t1']));
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now() - 4 * 60_000; // would be stale…
+    mgr.handle(s, { type: 'system', subtype: 'task_progress', task_id: 't1' }); // …but progress arrives
+    expect(mgr.isBackgroundActive('bg-edge')).toBe(true);
+    expect(s.backgroundTasks.size).toBe(1);
+  });
+
   it('does NOT count a session whose query/process is gone (stale set cannot pin a dead session)', () => {
     const s = newSession('bg-4');
     mgr.handle(s, bgChanged(['t1']));

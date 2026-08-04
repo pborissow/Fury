@@ -93,6 +93,14 @@ export const PRICING: Record<string, RatePeriod[]> = {
   'claude-opus-4-1': [period('', 15, 75)],
   'claude-opus-4-0': [period('', 15, 75)],
   // Sonnet tier — $3 / $15
+  // P9: Sonnet-5 has a published introductory rate ($2/$10 through 2026-08-31) below
+  // this sticker ($3/$15). It is INTENTIONALLY left at sticker here and NOT hardcoded
+  // as an intro period: the pricing poller (lib/pricingPoller.ts) owns runtime rate
+  // updates, and it deliberately treats the intro-vs-standard rows as *ambiguous* and
+  // skips them rather than guess which applies to this account (parsePricingMarkdown).
+  // So this git-versioned constant stays the reviewed source of truth; if an account
+  // is billed at intro, a human reconciles a dated override into this list. Do not
+  // re-flag without confirming the account's actual billed rate.
   'claude-sonnet-5': [period('', 3, 15)],
   'claude-sonnet-4-6': [period('', 3, 15)],
   'claude-sonnet-4-5': [period('', 3, 15)],

@@ -462,6 +462,17 @@ async function initDb(client: Client): Promise<void> {
   // data), so they're left at 0 = unknown and the UI omits the fill % for them.
   // Going forward the exact value comes from the SDK at runtime; this only
   // rescues history.
+  //
+  // P5: this contextTokens backfill and the is_sidechain backfill below are each an
+  // N+1 re-parse of raw_jsonl over the ENTIRE archive. Awaited inline they gated
+  // server readiness — getDb() awaits initDb() and every API route awaits getDb() —
+  // so the first boot after upgrade stalled ALL data endpoints (history, stats,
+  // sessions) until the whole re-parse finished. Run them fire-and-forget AFTER
+  // init returns instead (mirrors the subagent backfill above). Kept CHAINED inside
+  // ONE async IIFE — never concurrent — so their two per-session metadata
+  // read-modify-writes can't clobber each other's key. Both are marker-guarded and
+  // per-session, so a partial run resumes cleanly on the next boot.
+  void (async () => {
   try {
     const targets = await client.execute(`
       SELECT session_id FROM sessions
@@ -505,21 +516,25 @@ async function initDb(client: Client): Promise<void> {
       if (existing.rows[0]?.metadata) {
         try { meta = JSON.parse(existing.rows[0].metadata as string); } catch {}
       }
-      meta.contextTokens = parsed?.contextTokens ?? 0;
       // Never downgrade a window the runtime already captured exactly.
       const known = typeof meta.contextWindow === 'number' ? meta.contextWindow as number : 0;
+      const patch: Record<string, unknown> = { contextTokens: parsed?.contextTokens ?? 0 };
       if (!known && inferredWindow > 0) {
-        meta.contextWindow = inferredWindow;
+        patch.contextWindow = inferredWindow;
         windowsRecovered++;
         await client.execute({
           sql: 'UPDATE usage_events SET context_window = ? WHERE session_id = ? AND context_window = 0',
           args: [inferredWindow, sid],
         });
       }
-      await client.execute({
-        sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
-        args: [JSON.stringify(meta), sid],
-      });
+      // R1: route the metadata write through the LOCKED writer. P5 moved this
+      // backfill to fire-and-forget, so it now overlaps live traffic; a raw
+      // whole-blob UPDATE here would clobber a concurrent persistSessionModel /
+      // persistSessionContextWindow (dropping a just-picked model — the exact
+      // symptom P3's lock exists to prevent). updateSessionMetadata merges under
+      // the per-session lock, preserving keys it doesn't touch.
+      const { updateSessionMetadata } = await import('./transcriptArchiver');
+      await updateSessionMetadata(sid, patch);
       updated++;
     }
     if (updated > 0) {
@@ -582,19 +597,12 @@ async function initDb(client: Client): Promise<void> {
 
       // Always stamp the flag — including for raw-less/unparseable sessions and
       // ones with no sidechains — so this can never re-select them next boot.
-      const existing = await client.execute({
-        sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
-        args: [sid],
-      });
-      let meta: Record<string, unknown> = {};
-      if (existing.rows[0]?.metadata) {
-        try { meta = JSON.parse(existing.rows[0].metadata as string); } catch {}
-      }
-      meta.hasSidechainFlag = true;
-      await client.execute({
-        sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
-        args: [JSON.stringify(meta), sid],
-      });
+      // Route through the LOCKED metadata writer (R1): P5 made this backfill run
+      // concurrently with live traffic, so a raw whole-blob write here could clobber
+      // a concurrent persistSessionModel/ContextWindow. updateSessionMetadata merges
+      // hasSidechainFlag under the per-session lock, preserving other keys.
+      const { updateSessionMetadata } = await import('./transcriptArchiver');
+      await updateSessionMetadata(sid, { hasSidechainFlag: true });
       updated++;
     }
     if (updated > 0) {
@@ -603,6 +611,7 @@ async function initDb(client: Client): Promise<void> {
   } catch (err) {
     console.error('[DB] is_sidechain backfill error:', err);
   }
+  })().catch((e) => console.error('[DB] history backfill failed:', e));
 
   await syncPricingLog(client);
 }

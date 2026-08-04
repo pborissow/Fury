@@ -19,6 +19,34 @@ export interface SessionMetadata {
 }
 
 /**
+ * Per-session serialization for `sessions.metadata` read-modify-writes (P3).
+ *
+ * Every metadata write here is an unguarded SELECT metadata → JSON.parse → set
+ * one key → UPDATE the whole blob. Two of them fire back-to-back and unawaited on
+ * a single `result` (persistSessionModel + persistSessionContextWindow), and the
+ * archive / subagent-refresh paths can overlap with them too. Without a lock both
+ * SELECTs can read the same pre-update blob and the second UPDATE clobbers the key
+ * the first one wrote — dropping a user's model override or the context window.
+ *
+ * Same shape as lib/mcpApprove.ts's withLock: a per-key promise chain so all
+ * metadata RMWs for one sessionId run strictly sequentially. Different sessions
+ * never contend. The tail is swallowed so one failure can't reject the next op.
+ */
+const metaChains = new Map<string, Promise<unknown>>();
+function withSessionMetaLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = metaChains.get(sessionId) ?? Promise.resolve();
+  const run = prev.then(fn, fn); // run regardless of the previous op's outcome
+  // Prune the map entry once this op is the tail, so it can't grow unbounded
+  // across the process life (one entry per distinct session otherwise).
+  const tail = run.then(() => {}, () => {});
+  metaChains.set(sessionId, tail);
+  void tail.then(() => {
+    if (metaChains.get(sessionId) === tail) metaChains.delete(sessionId);
+  });
+  return run;
+}
+
+/**
  * Session lifecycle status. 'archived' is a soft delete — the row and all its
  * child data survive intact; only the sidebar hides it. See setSessionStatus.
  */
@@ -212,7 +240,14 @@ export async function archiveTranscript(
   if (usageEvents) {
     for (const u of usageEvents) {
       inserts.push({
-        sql: `INSERT INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read, context_window, is_sidechain, agent_id)
+        // INSERT OR REPLACE, not a plain INSERT (P8): the DELETE usage_events above
+        // rides in the first batch, but usage rows spill into later, separately-
+        // committed chunks. A concurrent re-archive of the same session (e.g.
+        // backfillSubagentUsage nulling the hash while scanAndArchiveAll runs) can
+        // interleave and hit the (session_id, message_id) UNIQUE PK — a plain INSERT
+        // would throw and abort the archive, leaving jsonl_hash NULL. OR REPLACE
+        // makes the re-insert idempotent (mirrors refreshSubagentUsage).
+        sql: `INSERT OR REPLACE INTO usage_events (session_id, message_id, model, ts, input, output, cache_write, cache_write_5m, cache_write_1h, cache_read, context_window, is_sidechain, agent_id)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         // Sidechain rows carry the parent's window as 0: a subagent runs its own
         // context under a possibly different model, so the parent's window must not
@@ -239,6 +274,10 @@ export async function archiveTranscript(
   const hasMeta =
     nc > 0 || typeof tot === 'number' || wroteUsage || typeof ctxTok === 'number' || contextWindow > 0;
   if (hasMeta) {
+    // Serialize the metadata RMW against the live persisters (P3): a concurrent
+    // persistSessionModel/ContextWindow must not read a pre-merge blob and clobber
+    // the derived keys written here (or have its own key clobbered by this write).
+    await withSessionMetaLock(sessionId, async () => {
     // Read existing metadata, merge in derived fields, write back with hash
     const metaRow = await db.execute({
       sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
@@ -273,6 +312,7 @@ export async function archiveTranscript(
     await db.execute({
       sql: 'UPDATE sessions SET jsonl_hash = ?, metadata = ? WHERE session_id = ?',
       args: [hash, JSON.stringify(meta), sessionId],
+    });
     });
   } else {
     await db.execute({
@@ -326,18 +366,25 @@ export async function refreshSubagentUsage(sessionId: string, project: string): 
   }
 
   // Recompute metadata.totalTokens over ALL rows (main + sidechain) so the session
-  // list total matches the Stats aggregate for delegated sessions.
-  const totRow = await db.execute({
-    sql: 'SELECT COALESCE(SUM(input + output + cache_write + cache_read), 0) AS t FROM usage_events WHERE session_id = ?',
-    args: [sessionId],
-  });
-  let meta: Record<string, unknown> = {};
-  try { if (sess.rows[0].metadata) meta = JSON.parse(sess.rows[0].metadata as string); } catch { /* keep {} */ }
-  meta.totalTokens = Number(totRow.rows[0]?.t) || 0;
-  meta.hasUsageEvents = true;
-  await db.execute({
-    sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
-    args: [JSON.stringify(meta), sessionId],
+  // list total matches the Stats aggregate for delegated sessions. Serialize the
+  // RMW and RE-READ metadata inside the lock (P3): the `sess` read above happened
+  // before the batch writes, so a concurrent persister could have updated the blob
+  // since — reusing that stale copy would drop its key.
+  await withSessionMetaLock(sessionId, async () => {
+    const totRow = await db.execute({
+      sql: 'SELECT COALESCE(SUM(input + output + cache_write + cache_read), 0) AS t FROM usage_events WHERE session_id = ?',
+      args: [sessionId],
+    });
+    const fresh = await db.execute({ sql: 'SELECT metadata FROM sessions WHERE session_id = ?', args: [sessionId] });
+    if (!fresh.rows.length) return; // session vanished mid-refresh
+    let meta: Record<string, unknown> = {};
+    try { if (fresh.rows[0].metadata) meta = JSON.parse(fresh.rows[0].metadata as string); } catch { /* keep {} */ }
+    meta.totalTokens = Number(totRow.rows[0]?.t) || 0;
+    meta.hasUsageEvents = true;
+    await db.execute({
+      sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+      args: [JSON.stringify(meta), sessionId],
+    });
   });
 }
 
@@ -360,28 +407,30 @@ export async function persistSessionModel(
   model: string | undefined
 ): Promise<void> {
   try {
-    const db = await getDb();
-    const row = await db.execute({
-      sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
-      args: [sessionId],
-    });
-    // Same as persistSessionContextWindow: the row may not exist yet on the
-    // first turn (the archiver creates it), so callers re-persist on later
-    // results rather than gating on change alone.
-    if (row.rows.length === 0) return;
-    let meta: Record<string, unknown> = {};
-    if (row.rows[0]?.metadata) {
-      try { meta = JSON.parse(row.rows[0].metadata as string); } catch {}
-    }
-    const stored = typeof meta.model === 'string' ? meta.model : undefined;
-    if (stored === model) return;
-    // Delete rather than store null: "no override" and "key absent" mean the
-    // same thing, and loadSessionModel only trusts a string.
-    if (model === undefined) delete meta.model;
-    else meta.model = model;
-    await db.execute({
-      sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
-      args: [JSON.stringify(meta), sessionId],
+    await withSessionMetaLock(sessionId, async () => {
+      const db = await getDb();
+      const row = await db.execute({
+        sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+        args: [sessionId],
+      });
+      // Same as persistSessionContextWindow: the row may not exist yet on the
+      // first turn (the archiver creates it), so callers re-persist on later
+      // results rather than gating on change alone.
+      if (row.rows.length === 0) return;
+      let meta: Record<string, unknown> = {};
+      if (row.rows[0]?.metadata) {
+        try { meta = JSON.parse(row.rows[0].metadata as string); } catch {}
+      }
+      const stored = typeof meta.model === 'string' ? meta.model : undefined;
+      if (stored === model) return;
+      // Delete rather than store null: "no override" and "key absent" mean the
+      // same thing, and loadSessionModel only trusts a string.
+      if (model === undefined) delete meta.model;
+      else meta.model = model;
+      await db.execute({
+        sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+        args: [JSON.stringify(meta), sessionId],
+      });
     });
   } catch (err) {
     console.warn(`[persistSessionModel] failed for ${sessionId}:`, err);
@@ -447,23 +496,25 @@ export async function persistSessionContextWindow(
 ): Promise<void> {
   if (!(contextWindow > 0)) return;
   try {
-    const db = await getDb();
-    const row = await db.execute({
-      sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
-      args: [sessionId],
-    });
-    // The row may not exist yet on a session's first turn; the archiver creates
-    // it and the next result persists the window.
-    if (row.rows.length === 0) return;
-    let meta: Record<string, unknown> = {};
-    if (row.rows[0]?.metadata) {
-      try { meta = JSON.parse(row.rows[0].metadata as string); } catch {}
-    }
-    if (meta.contextWindow === contextWindow) return;
-    meta.contextWindow = contextWindow;
-    await db.execute({
-      sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
-      args: [JSON.stringify(meta), sessionId],
+    await withSessionMetaLock(sessionId, async () => {
+      const db = await getDb();
+      const row = await db.execute({
+        sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+        args: [sessionId],
+      });
+      // The row may not exist yet on a session's first turn; the archiver creates
+      // it and the next result persists the window.
+      if (row.rows.length === 0) return;
+      let meta: Record<string, unknown> = {};
+      if (row.rows[0]?.metadata) {
+        try { meta = JSON.parse(row.rows[0].metadata as string); } catch {}
+      }
+      if (meta.contextWindow === contextWindow) return;
+      meta.contextWindow = contextWindow;
+      await db.execute({
+        sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+        args: [JSON.stringify(meta), sessionId],
+      });
     });
   } catch (err) {
     console.warn(`[persistSessionContextWindow] failed for ${sessionId}:`, err);
@@ -627,25 +678,29 @@ export async function loadArchivedSessionIds(): Promise<Set<string>> {
  * Update the metadata JSON for a session (merges with existing metadata).
  */
 export async function updateSessionMetadata(sessionId: string, patch: Partial<SessionMetadata>): Promise<void> {
-  const db = await getDb();
-  // Read existing metadata, merge, and write back
-  const existing = await db.execute({
-    sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
-    args: [sessionId],
-  });
-  let current: SessionMetadata = {};
-  if (existing.rows.length > 0 && existing.rows[0].metadata) {
-    try { current = JSON.parse(existing.rows[0].metadata as string); } catch { /* ignore */ }
-  }
-  const merged = { ...current, ...patch };
-  // Remove keys set to null/undefined
-  for (const key of Object.keys(merged)) {
-    if (merged[key] == null) delete merged[key];
-  }
-  const json = Object.keys(merged).length > 0 ? JSON.stringify(merged) : null;
-  await db.execute({
-    sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
-    args: [json, sessionId],
+  // Serialize against the other metadata writers (P3) so a concurrent
+  // persist/archive can't clobber the key this patch sets, or vice versa.
+  await withSessionMetaLock(sessionId, async () => {
+    const db = await getDb();
+    // Read existing metadata, merge, and write back
+    const existing = await db.execute({
+      sql: 'SELECT metadata FROM sessions WHERE session_id = ?',
+      args: [sessionId],
+    });
+    let current: SessionMetadata = {};
+    if (existing.rows.length > 0 && existing.rows[0].metadata) {
+      try { current = JSON.parse(existing.rows[0].metadata as string); } catch { /* ignore */ }
+    }
+    const merged = { ...current, ...patch };
+    // Remove keys set to null/undefined
+    for (const key of Object.keys(merged)) {
+      if (merged[key] == null) delete merged[key];
+    }
+    const json = Object.keys(merged).length > 0 ? JSON.stringify(merged) : null;
+    await db.execute({
+      sql: 'UPDATE sessions SET metadata = ? WHERE session_id = ?',
+      args: [json, sessionId],
+    });
   });
 }
 

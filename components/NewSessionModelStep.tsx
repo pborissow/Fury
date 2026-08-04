@@ -47,7 +47,12 @@ export default function NewSessionModelStep({
     // Picking the default row means "follow the default" (model=null), but still
     // surface the concrete wire id as the label so the status bar names the real
     // model until the first turn's session:model init event lands.
-    onCreate(selection.isDefault ? null : selection.id, selection.id || null);
+    //
+    // Coerce an EMPTY selection to null too (P12): with an empty catalog there is no
+    // selectedGroup, so selection.id === '' and selection.isDefault === false —
+    // without this we'd pin an empty-string model instead of following the default.
+    const pinned = selection.isDefault || !selection.id ? null : selection.id;
+    onCreate(pinned, selection.id || null);
     onOpenChange(false);
   }, [selection.isDefault, selection.id, onCreate, onOpenChange]);
 

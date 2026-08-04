@@ -1,6 +1,31 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { log } from './logger';
+
+/**
+ * Atomic write (P20): write to a temp file in the same directory, then rename over
+ * the target. `.mcp.json` is read by other Claude processes and rewritten from two
+ * near-simultaneous callers (GET /api/mcp and GET /api/code-search both fire the
+ * legacy migration), so a bare writeFileSync can expose a torn/partial file. A
+ * rename is atomic on POSIX and replaces atomically on Windows (MoveFileEx). The
+ * EPERM/EACCES retry covers a Windows reader transiently holding the destination.
+ */
+let atomicTmpCounter = 0;
+function atomicWriteFileSync(path: string, data: string): void {
+  const tmp = `${path}.fury-${process.pid}-${atomicTmpCounter++}.tmp`;
+  writeFileSync(tmp, data);
+  for (let i = 0; ; i++) {
+    try {
+      renameSync(tmp, path);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if ((code === 'EPERM' || code === 'EACCES') && i < 10) continue;
+      try { rmSync(tmp, { force: true }); } catch { /* ignore */ }
+      throw err;
+    }
+  }
+}
 
 /**
  * "This project" code-search configuration — the IN-PROCESS replacement for the
@@ -84,7 +109,7 @@ export function writeCodeSearchConfig(projectPath: string, dirs: string[]): void
   const clean = dirs.map(d => String(d)).filter(Boolean);
   const p = codeSearchConfigPath(projectPath);
   mkdirSync(dirname(p), { recursive: true });
-  writeFileSync(p, JSON.stringify({ dirs: clean }, null, 2) + '\n');
+  atomicWriteFileSync(p, JSON.stringify({ dirs: clean }, null, 2) + '\n');
 }
 
 /** Disable code search: remove the config file (leaves the DB for a quick re-enable). */
@@ -129,7 +154,7 @@ export function stripStdioCodemogger(projectPath: string): string[] {
       rmSync(mcpPath, { force: true });
     } else {
       cfg.mcpServers = servers;
-      writeFileSync(mcpPath, JSON.stringify(cfg, null, 2) + '\n');
+      atomicWriteFileSync(mcpPath, JSON.stringify(cfg, null, 2) + '\n');
     }
   } catch (err) {
     log.warn('codesearch.migrate', 'failed to strip stdio codemogger entry', {

@@ -8,6 +8,7 @@ import { mcpCache, projectKeyCandidates, type McpServer } from '@/lib/mcpCache';
 import { approveProjectServer } from '@/lib/mcpApprove';
 import { normalizeArgs, ensureDbParentDir } from '@/lib/mcpArgs';
 import { migrateStdioCodemogger, readCodeSearchConfig } from '@/lib/codeSearchConfig';
+import { CODESEARCH_MCP_SERVER_NAME, CODESEARCH_DISPLAY_NAME } from '@/lib/mcpRuntimeStatus';
 
 const execFileAsync = promisify(execFile);
 
@@ -38,7 +39,7 @@ function autoApproveProjectServer(projectPath: string, serverName: string): Prom
 export const dynamic = 'force-dynamic';
 
 /** Type of the synthetic in-process code-search entry surfaced in the server list. */
-type CodeSearchServer = McpServer & { codeSearch: true; dirs: string[] };
+type CodeSearchServer = McpServer & { codeSearch: true; dirs: string[]; runtimeName: string };
 
 /**
  * Prepend a synthetic "code search" entry when the project has in-process code
@@ -51,8 +52,14 @@ function withCodeSearchEntry(projectPath: string | null, servers: McpServer[]): 
   if (!cfg) return servers;
   const dirs = cfg.dirs.length ? cfg.dirs : [projectPath];
   const entry: CodeSearchServer = {
-    name: 'This Project (Local MCP)',
+    name: CODESEARCH_DISPLAY_NAME,
+    // `name` is a friendly display label, but the engine behind this row reports
+    // runtime failures to the SDK as `codemogger`. Carrying the runtime identity
+    // explicitly is what lets the panel resolve this row's real health instead of
+    // always showing the hardcoded `connected` below (P16).
+    runtimeName: CODESEARCH_MCP_SERVER_NAME,
     url: `in-process code search · ${dirs.length} dir${dirs.length === 1 ? '' : 's'}`,
+    // Config-derived optimistic default; overridden by runtime health in the panel.
     status: 'connected',
     statusDetail: 'In-process (Fury) — no separate process',
     scope: 'project',

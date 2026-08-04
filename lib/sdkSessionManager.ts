@@ -103,6 +103,26 @@ interface SdkSession {
   // message AND then a non-success result; without this flag we'd emit the same
   // failure twice. Reset at every turn start alongside ttftEmitted.
   turnErrorEmitted?: boolean;
+  // Monotonic turn identity. Incremented at every turn START (sendMessage and
+  // reassertProcessing). `interrupt()` deliberately leaves the query alive, so a
+  // stopped turn's trailing `result` can still reach handle() AFTER a fresh turn
+  // has begun; without a turn-identity guard that stale result would tear down
+  // the new turn (P2). Pairs with `streamedEpoch` below.
+  turnEpoch: number;
+  // The epoch of the turn that has actually produced main-thread output
+  // (stream_event / assistant / tool_result). A `result` only ends the current
+  // turn when `streamedEpoch === turnEpoch`; a result arriving while the current
+  // epoch has not yet streamed belongs to a superseded (e.g. interrupted-then-
+  // resent) turn and is ignored. See the 'result' case in handle().
+  streamedEpoch: number;
+  // Armed by interrupt() when a running turn is stopped: a trailing `result` for
+  // that turn may still arrive (interrupt keeps the query alive). ONLY while this
+  // is set does the epoch guard treat an output-less `result` as stale — so a
+  // FRESH turn that errors before producing any main-thread output is never
+  // mistaken for a superseded turn and swallowed (which would hang it). Cleared as
+  // soon as the guard fires once, the current turn produces output, or any result
+  // is processed.
+  expectStaleResult?: boolean;
   // Live billed-token tally, deduped by assistant message id (mirrors the
   // shipping manager's session:usage accounting).
   usageByMsg: Map<string, number>;
@@ -154,6 +174,14 @@ interface SdkSession {
   // so the disk fallback is disabled to avoid a stale-window over-report. Reset with
   // backgroundTasks on a new process (startQuery).
   sawBackgroundLevelSignal?: boolean;
+  // Wall-clock of the last background-task SIGNAL (a `background_tasks_changed`
+  // LEVEL payload or any `task_*` EDGE). Used to self-heal a wedged set: the set
+  // is only ever emptied by a clearing LEVEL signal, so if that terminal signal
+  // is lost (a dropped stream, a crash/restart mid-task) a non-empty set pins
+  // backgroundActive TRUE forever and the dots never stop. computeBackgroundActive
+  // treats a non-empty set with an idle main turn, no subagent activity, and no
+  // signal within WEDGED_BG_GRACE_MS as stale and drops it.
+  lastBgActivityAt?: number;
   // The user's chosen model for this session, or undefined for the CLI default.
   // Load-bearing in TWO places, because the query object comes and goes:
   //   1. Pushed live via Query.setModel() when a query is open (no restart).
@@ -228,6 +256,19 @@ const IN_TEST = !!process.env.VITEST || process.env.NODE_ENV === 'test';
  *  Past it we fail toward NOT-live, so a crashed/stalled subagent can't pin a
  *  session green forever (docs ticket "Additional fix required"). */
 const SUBAGENT_RUNNING_WINDOW_MS = 120_000;
+
+/** How long a non-empty `backgroundTasks` set survives with NO background signal
+ *  (level or edge), an idle main turn, and no subagent activity before it's
+ *  treated as wedged (a lost clearing signal) and dropped. Generous so a genuine
+ *  background task that emits periodic task_progress/status keeps the dots lit;
+ *  only a truly silent, idle set self-heals. Known limitation: a fully silent
+ *  non-subagent background task (e.g. a long background Bash that emits no
+ *  progress) running past this while the main turn is idle has its dots cleared
+ *  early — it re-lights on the next signal. Far better than dots stuck forever.
+ *  Aligned with SUBAGENT_RUNNING_WINDOW_MS: genuine background work refreshes the
+ *  clock via task_* edges / subagent writes well inside this, so only a truly
+ *  silent (wedged) set reaches it. */
+const WEDGED_BG_GRACE_MS = SUBAGENT_RUNNING_WINDOW_MS;
 
 /** Liveness probe: signal 0 throws iff the pid is gone (or not ours to signal). */
 function pidAlive(pid: number): boolean {
@@ -321,6 +362,15 @@ class SdkSessionManager {
   /** Last backgroundActive value emitted per session, so the reconcile tick only
    *  fires a session:health event on an actual transition (not every tick). */
   private lastBgActive = new Map<string, boolean>();
+  /** Last isStuck value emitted per session, so the reconcile tick fires a
+   *  session:health event only when the stuck state actually flips (P7). */
+  private lastStuck = new Map<string, boolean>();
+  /** A warm turn is considered STUCK when it has been processing this long with no
+   *  SDK message AND no background work — the CLI (process alive, emitting nothing,
+   *  never ending) has hung. Deliberately generous so a legitimately long tool call
+   *  (a slow Bash/subagent that still streams) is never mislabeled; the point is to
+   *  surface the existing "kill stuck session" affordance, not to police latency. */
+  private readonly STUCK_AFTER_MS = 3 * 60 * 1000;
   /** The background-reconcile heartbeat (see startReconcile). */
   private reconcileTimer: NodeJS.Timeout | null = null;
   /** Last catalog any session reported, for sessions with no live query to ask.
@@ -343,6 +393,8 @@ class SdkSessionManager {
         isProcessing: false,
         lastActivity: Date.now(),
         ttftEmitted: false,
+        turnEpoch: 0,
+        streamedEpoch: 0,
         usageByMsg: new Map(),
         contextTokens: 0,
         contextWindow: 0,
@@ -435,6 +487,10 @@ class SdkSessionManager {
     s.turnStartedAt = Date.now();
     s.ttftEmitted = false;
     s.turnErrorEmitted = false;
+    // Stamp this turn with a fresh epoch (P2). A prior turn stopped via
+    // interrupt() can still deliver a trailing `result`; the epoch lets the
+    // result handler tell that stale result apart from this turn's own.
+    s.turnEpoch++;
     log.info('sdk.turn', 'start', {
       sessionId: s.sessionId,
       corrId: s.sessionId,
@@ -634,6 +690,22 @@ class SdkSessionManager {
    * to the subprocess is open for the life of the query.
    */
   async setModel(sessionId: string, model?: string): Promise<{ applied: 'live' | 'pending' }> {
+    // Record the choice on the IN-MEMORY session, synchronously, and let it be
+    // authoritative for the imminent first send. This is load-bearing for the
+    // pick-before-first-send flow: the mid-session picker POSTs setModel for a
+    // session that may not be in the map yet (an archived session just reopened, or
+    // a brand-new one with no DB row). A DB-only persist is NOT reliable enough on
+    // its own here — the sessions row may not exist yet (persistSessionModel no-ops),
+    // and even when it does, a fire-and-forget write can lose the race against the
+    // user's send or be dropped after the route responds — which silently reverted
+    // the session to the default model (regression from the earlier P21 attempt to
+    // avoid growing the map). getOrCreate makes s.model win immediately; startQuery
+    // replays it, and persistSessionModel below covers restart survival.
+    //
+    // P21 (map growth for never-run UUIDs) is intentionally accepted as the lesser
+    // evil: the entry is tiny and bounded in practice by the picker being a user
+    // action on real sessions. If it ever matters, evict entries that never open a
+    // query — do NOT drop the synchronous in-memory record the pick depends on.
     const s = this.getOrCreate(sessionId);
     const prev = s.model;
     s.model = model;
@@ -870,7 +942,19 @@ class SdkSessionManager {
       }
     }
     if (s) {
+      const wasProcessing = s.isProcessing;
       s.isProcessing = false;
+      // The user stopped this turn on purpose. Its trailing `result` may come back
+      // as a NON-success subtype; marking the turn's error as already-handled keeps
+      // the result branch from emitting a spurious "Turn ended with error" bubble
+      // for a turn the user intentionally stopped (P6). Reset at the next turn
+      // start, so it never suppresses a real error on the following turn.
+      s.turnErrorEmitted = true;
+      // Arm the stale-result guard ONLY when a turn was actually running: interrupt
+      // keeps the query alive, so that turn's trailing result may still arrive and,
+      // if the user resends first, must be ignored (P2). Gating on this flag is what
+      // stops the guard from swallowing a fresh turn's own output-less error (R2).
+      if (wasProcessing) s.expectStaleResult = true;
       this.closeBuffer(s);
       this.emitHealth(s, false);
     }
@@ -932,6 +1016,14 @@ class SdkSessionManager {
     // all so delete never leaks a process.
     this.killProcessesForSession(sessionId);
     this.sessions.delete(sessionId);
+    // Prune the manager-level side maps keyed by this session id so a destroyed
+    // session leaves nothing behind (P14). subagentActivityCache is never pruned
+    // anywhere else, and lastBgActive is only cleared inside the reconcile loop
+    // (which no longer sees this session once it's out of the map) — so without
+    // this, both leak one entry per distinct killed session for the process life.
+    this.subagentActivityCache.delete(sessionId);
+    this.lastBgActive.delete(sessionId);
+    this.lastStuck.delete(sessionId);
     if (s) this.emitHealth(s, false);
   }
 
@@ -1307,7 +1399,25 @@ class SdkSessionManager {
    *      authoritative set takes over cleanly (no post-completion over-report).
    */
   private computeBackgroundActive(s: SdkSession): boolean {
-    if (s.backgroundTasks.size > 0) return true;
+    if (s.backgroundTasks.size > 0) {
+      // A non-empty set is authoritative WHILE the main turn is processing, while
+      // a subagent is still writing its transcript, or while background signals
+      // are still arriving (any task_* edge / level payload refreshes
+      // lastBgActivityAt). Beyond that — idle main turn, no subagent activity, no
+      // signal for WEDGED_BG_GRACE_MS — the terminal clearing `background_tasks_
+      // changed` was lost (dropped stream / crash mid-task) and the set would
+      // otherwise wedge the dots on forever. Drop it so it self-heals.
+      const staleForMs = Date.now() - (s.lastBgActivityAt ?? 0);
+      if (s.isProcessing || this.hasRecentSubagentActivity(s) || staleForMs < WEDGED_BG_GRACE_MS) {
+        return true;
+      }
+      log.info('sdk.bg', 'cleared wedged background tasks (idle, no activity)', {
+        sessionId: s.sessionId,
+        corrId: s.sessionId,
+        data: { count: s.backgroundTasks.size, staleForMs },
+      });
+      s.backgroundTasks.clear();
+    }
     if (s.sawBackgroundLevelSignal) return false;
     return this.hasRecentSubagentActivity(s);
   }
@@ -1370,8 +1480,18 @@ class SdkSessionManager {
 
   private reconcileBackgroundActivity(): void {
     for (const [id, s] of this.sessions) {
-      if (!s.q) { this.lastBgActive.delete(id); continue; }
+      if (!s.q) { this.lastBgActive.delete(id); this.lastStuck.delete(id); continue; }
       const active = this.computeBackgroundActive(s);
+
+      // Hang watchdog (P7): a processing turn that has gone silent past the
+      // threshold (no SDK message, no background work) is stuck. The message-driven
+      // emitHealth can't discover this on its own — a hung turn emits nothing — so
+      // the heartbeat is the only place it surfaces. Emit on the transition so the
+      // client lights up the existing "session is stuck / kill" affordance.
+      const { isStuck } = this.computeStuck(s, s.isProcessing, active);
+      const prevStuck = this.lastStuck.get(id) ?? false;
+      if (isStuck !== prevStuck) this.emitHealth(s, s.isProcessing);
+
       const prev = this.lastBgActive.get(id) ?? false;
       if (active === prev) continue;
       this.lastBgActive.set(id, active);
@@ -1591,6 +1711,13 @@ class SdkSessionManager {
         const settle = (r: PermissionResult) => {
           if (settled) return;
           settled = true;
+          // Tear down the abort listener on EVERY resolution path (answer, skip,
+          // abort). A `once` listener is only auto-cleared by firing, so the normal
+          // answer/skip path would otherwise leave one dangling on the long-lived
+          // per-query AbortSignal for every question asked — a genuine per-question
+          // leak (and a MaxListenersExceeded warning) since the signal outlives the
+          // turn (P11).
+          signal.removeEventListener('abort', onAbort);
           if (s.pendingAsk?.toolUseID === toolUseID) s.pendingAsk = undefined;
           resolve(r);
         };
@@ -1598,22 +1725,19 @@ class SdkSessionManager {
         // TRAP #2: stop() and killSession() abort the controller. Without this
         // listener the held promise NEVER settles — the callback leaks and
         // teardown hangs behind a dialog nobody is looking at.
+        const onAbort = () => {
+          settle({ behavior: 'deny', message: 'Session interrupted.' });
+          eventBus.emitApp({
+            type: 'session:stream',
+            sessionId: s.sessionId,
+            askUserQuestion: { cleared: true },
+          });
+        };
         if (signal.aborted) {
           settle({ behavior: 'deny', message: 'Session interrupted.' });
           return;
         }
-        signal.addEventListener(
-          'abort',
-          () => {
-            settle({ behavior: 'deny', message: 'Session interrupted.' });
-            eventBus.emitApp({
-              type: 'session:stream',
-              sessionId: s.sessionId,
-              askUserQuestion: { cleared: true },
-            });
-          },
-          { once: true },
-        );
+        signal.addEventListener('abort', onAbort, { once: true });
 
         s.pendingAsk = { toolUseID, questions, input, resolve: settle };
 
@@ -1684,6 +1808,12 @@ class SdkSessionManager {
   }
 
   private startQuery(s: SdkSession): void {
+    // Coalesce concurrent first-sends onto a single query (P15). The caller guards
+    // with `if (!s.q)`, but should two near-simultaneous first sends both reach
+    // here before either assigns s.q, a second query()/CLI process would spawn for
+    // one session — two writers on one JSONL. This idempotency check makes the
+    // second call a no-op; s.input/s.q from the first are already in place for it.
+    if (s.q) return;
     // Reclaim any CLI process still running for this session before spawning a
     // replacement. consume() nulls s.q when the message stream ends (e.g. after
     // an interrupt) WITHOUT terminating the process, so the next sendMessage
@@ -1893,6 +2023,8 @@ class SdkSessionManager {
           // durable disk fallback (it would otherwise linger for the staleness window
           // after the last task completes).
           s.sawBackgroundLevelSignal = true;
+          s.lastBgActivityAt = Date.now(); // refresh the wedge-heal clock
+
           log.info('sdk.bg', 'background tasks changed', {
             sessionId: s.sessionId,
             corrId: s.sessionId,
@@ -1910,6 +2042,11 @@ class SdkSessionManager {
           // liveness.spec.ts); these edges are logged for diagnosis and are the
           // fallback signal if the level ever proves unreliable. Low-noise: scoped
           // to task_* so per-token `status`/`thinking_tokens` don't spam the log.
+          //
+          // Also a liveness heartbeat for the wedge-heal: an active background task
+          // emits these edges, so refreshing the clock here keeps a genuinely-live
+          // task's dots lit even if a membership-level signal is sparse.
+          s.lastBgActivityAt = Date.now();
           log.debug('sdk.sys', anyMsg.subtype, {
             sessionId: s.sessionId,
             corrId: s.sessionId,
@@ -1940,6 +2077,14 @@ class SdkSessionManager {
           (ev.type === 'message_start' || ev.type === 'content_block_delta')
         ) {
           this.reassertProcessing(s);
+          // The current turn has now produced main-thread output — record its
+          // epoch so its own `result` is recognized as current (P2). MUST run
+          // after reassertProcessing, which bumps turnEpoch for a background turn.
+          s.streamedEpoch = s.turnEpoch;
+          // The current turn is streaming its own output, so any interrupted turn's
+          // trailing result (which would have preceded this) is no longer pending —
+          // disarm the stale-result guard (R2).
+          s.expectStaleResult = false;
         }
         if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') {
           if (!s.ttftEmitted) {
@@ -1989,6 +2134,11 @@ class SdkSessionManager {
       }
 
       case 'assistant': {
+        // Main-thread output marks the current turn as having streamed, even when
+        // it arrives as a COMPLETE assistant message with no stream_event deltas
+        // (e.g. an auth failure) — so its `result` is recognized as current and
+        // not mistaken for a superseded turn's trailing result (P2).
+        if (anyMsg.parent_tool_use_id == null) s.streamedEpoch = s.turnEpoch;
         // Report the model that actually served this turn (parity with the CLI
         // manager, which emits here too). init alone isn't enough once the model
         // can change: a setModel() switch, or a fallbackModel demotion under
@@ -2104,6 +2254,32 @@ class SdkSessionManager {
         // turn's stream activity (above) is what keeps a burst of background-task
         // turns live. If a real subagent-result discriminator ever appears in the
         // SDK, key on THAT — don't resurrect the parent_tool_use_id check.
+        //
+        // TURN-IDENTITY GUARD (P2): interrupt() intentionally leaves the query
+        // alive, so a stopped turn's trailing `result` can still arrive here AFTER
+        // the user has re-sent and a fresh turn is already streaming. Such a result
+        // belongs to a superseded turn: the current epoch has not produced its own
+        // main-thread output yet (streamedEpoch still trails turnEpoch). Ignore it
+        // so it can't clear isProcessing, close the fresh turn's buffer, or surface
+        // a spurious error (P6) for the new turn.
+        //
+        // Gated on `expectStaleResult` (armed by interrupt()) so this ONLY suppresses
+        // a genuinely superseded turn (R2). Without that gate, a FRESH turn that ends
+        // in an error `result` before emitting any main-thread output (streamedEpoch
+        // still trailing) would be mis-read as stale and swallowed — leaving the turn
+        // processing forever until the P7 watchdog, with the error never surfaced.
+        if (s.expectStaleResult && s.streamedEpoch !== s.turnEpoch) {
+          s.expectStaleResult = false; // consume: only the one trailing result is stale
+          log.info('sdk.turn', 'stale result ignored', {
+            sessionId: s.sessionId,
+            corrId: s.sessionId,
+            data: { resultEpoch: s.streamedEpoch, currentEpoch: s.turnEpoch, subtype: anyMsg.subtype ?? null },
+          });
+          break;
+        }
+        // A result is being processed for the current turn — disarm the guard so a
+        // later output-less turn can't be mistaken for this interrupt's stale result.
+        s.expectStaleResult = false;
         const wasProcessing = s.isProcessing;
         s.isProcessing = false;
         this.closeBuffer(s);
@@ -2215,6 +2391,9 @@ class SdkSessionManager {
     s.turnStartedAt = now;
     s.ttftEmitted = false;
     s.turnErrorEmitted = false;
+    // A background/auto-continue turn is a new turn — bump the epoch so its
+    // trailing result is distinguishable from any earlier turn's (P2).
+    s.turnEpoch++;
     // A background turn has no user-typed prompt; the client strips its partials
     // by the startedAt anchor, not userPrompt, so an empty prompt is correct here.
     s.streamBuffer = {
@@ -2281,6 +2460,29 @@ class SdkSessionManager {
     }
   }
 
+  /**
+   * Whether a warm turn has hung (P7). Stuck iff the main turn is processing, no
+   * background work is in flight, and no SDK message has landed for STUCK_AFTER_MS
+   * — i.e. consume()'s loop is blocked on a process that will never emit again, so
+   * isProcessing would otherwise stay true forever with no "kill" affordance. A
+   * turn making progress (any message) keeps resetting lastActivity, and a live
+   * background task counts as activity, so neither trips this.
+   */
+  private computeStuck(s: SdkSession, isProcessing: boolean, backgroundActive: boolean): {
+    isStuck: boolean;
+    stuckReason?: string;
+  } {
+    if (!isProcessing || backgroundActive) return { isStuck: false };
+    const idleMs = Date.now() - s.lastActivity;
+    if (idleMs > this.STUCK_AFTER_MS) {
+      return {
+        isStuck: true,
+        stuckReason: `No response from Claude for ${Math.round(idleMs / 1000)}s — the session may be stuck.`,
+      };
+    }
+    return { isStuck: false };
+  }
+
   private emitHealth(s: SdkSession, isProcessing: boolean): void {
     // Carry the turn's start so the client's latch-break can anchor its re-strip
     // on the SAME timestamp the initial restore uses (/api/stream-buffer returns
@@ -2297,12 +2499,16 @@ class SdkSessionManager {
     // computeBackgroundActive includes the durable disk fallback for tasks in flight
     // across a code reload.
     const backgroundActive = this.computeBackgroundActive(s);
+    const { isStuck, stuckReason } = this.computeStuck(s, isProcessing, backgroundActive);
+    // Keep the reconcile tick's transition tracking in step with what we emit, so
+    // it only re-emits on a real stuck-state flip (P7).
+    this.lastStuck.set(s.sessionId, isStuck);
     log.debug('sdk.health', isProcessing ? 'processing' : 'idle', {
       sessionId: s.sessionId,
       corrId: s.sessionId,
-      data: { startedAt, backgroundActive },
+      data: { startedAt, backgroundActive, isStuck },
     });
-    eventBus.emitApp({ type: 'session:health', sessionId: s.sessionId, isProcessing, isStuck: false, startedAt, backgroundActive });
+    eventBus.emitApp({ type: 'session:health', sessionId: s.sessionId, isProcessing, isStuck, stuckReason, startedAt, backgroundActive });
   }
 
   // NOTE (cost accounting): we emit TOKEN COUNTS only, matching the shipping

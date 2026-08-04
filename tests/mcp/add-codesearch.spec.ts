@@ -42,11 +42,14 @@ test.describe('MCP wizard — Code Search (in-process)', () => {
     });
     await page.route(/\/api\/mcp(\?|$)/, async (route) => {
       if (route.request().method() !== 'GET') return route.fallback();
+      // Mirrors the real shape from app/api/mcp/route.ts: a friendly display
+      // `name` plus the `runtimeName` the in-process engine reports health under.
       const servers = enabled
         ? [{
-            name: 'codemogger', url: 'in-process code search · 1 dir', status: 'connected',
+            name: 'This Project (Local MCP)', runtimeName: 'codemogger',
+            url: 'in-process code search · 1 dir', status: 'connected',
             statusDetail: 'In-process (Fury) — no separate process', scope: 'project',
-            transport: 'stdio', codeSearch: true, dirs: ['/tmp/proj'],
+            transport: 'unknown', codeSearch: true, dirs: ['/tmp/proj'],
           }]
         : [];
       await route.fulfill({ json: { servers } });

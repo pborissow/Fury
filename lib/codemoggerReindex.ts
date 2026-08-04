@@ -128,7 +128,24 @@ export class CodemoggerReindexer {
         const w = fs.watch(dir, { recursive: true }, (_evt, filename) => {
           if (isIndexableChange(filename == null ? null : String(filename))) this.scheduleReindex(projectPath);
         });
-        w.on('error', () => { try { w.close(); } catch { /* ignore */ } });
+        w.on('error', (err) => {
+          try { w.close(); } catch { /* ignore */ }
+          // Remove the closed watcher from the map entry (P10). ensureWatching
+          // early-returns on watchers.has(key) and isWatching() reports length > 0,
+          // so a project whose watcher(s) all errored would otherwise be left with a
+          // map entry full of dead watchers — auto-reindex then no-ops every turn and
+          // the index silently drifts stale. Dropping it (and the key when empty) lets
+          // ensureWatching re-establish the watch on the next turn.
+          const arr = this.watchers.get(key);
+          if (arr) {
+            const i = arr.indexOf(w);
+            if (i >= 0) arr.splice(i, 1);
+            if (arr.length === 0) this.watchers.delete(key);
+          }
+          log.warn('codemogger.reindex', 'watcher error; will re-establish next turn', {
+            data: { dir, error: err instanceof Error ? err.message : String(err) },
+          });
+        });
         watchers.push(w);
       } catch (err) {
         log.warn('codemogger.reindex', 'watch failed', {

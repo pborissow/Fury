@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { cacheRewriteCost, costForUsage, latestRate, modelTierRank } from '../../lib/pricing';
+import { cacheRewriteCost, costForUsage, latestRate, modelTierRank, rateFor } from '../../lib/pricing';
 
 describe('modelTierRank — picker ordering', () => {
   it('orders the catalog most-capable-first: fable, opus, sonnet, haiku', () => {
@@ -82,5 +82,21 @@ describe('costForUsage — cache TTL pricing', () => {
     });
     expect(priced).toBe(false);
     expect(cost).toBe(0);
+  });
+});
+
+describe('Sonnet-5 rate (P9)', () => {
+  // Sonnet-5 is DELIBERATELY held at the reviewed sticker rate ($3/$15) as a single
+  // period — the intro ($2/$10 through 2026-08-31) is not hardcoded because the
+  // pricing poller owns runtime updates and treats the intro-vs-standard rows as
+  // ambiguous (see lib/pricing.ts / lib/pricingPoller.ts). This test pins that
+  // decision: the rate is the same inside and after the intro window. If an account
+  // is confirmed to get intro pricing, a dated period/override changes these numbers
+  // and this test updates alongside it — so the choice can't silently drift.
+  it('prices at sticker $3/$15 both inside and after the intro window', () => {
+    const insideWindow = rateFor('claude-sonnet-5', '2026-08-15'); // during intro window
+    const afterWindow = rateFor('claude-sonnet-5', '2026-09-15');  // after 2026-08-31
+    expect(insideWindow).toMatchObject({ input: 3, output: 15 });
+    expect(afterWindow).toMatchObject({ input: 3, output: 15 });
   });
 });
