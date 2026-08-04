@@ -76,6 +76,11 @@ const locks = new Map<string, Promise<unknown>>();
 // only closes a CodeIndex when inFlight === 0, so a close can never race a live op.
 interface Usage { lastUsed: number; inFlight: number }
 const usage = new Map<string, Usage>();
+// Bumped whenever dropProject actually closes a project. reindexProject captures the
+// value at start and checks it between directories, so a DELETE/disable that lands
+// mid-reindex (when inFlight is momentarily 0 between dirs) aborts the loop instead of
+// re-opening a CodeIndex into the now-disabled project's orphaned DB (F10).
+const generations = new Map<string, number>();
 const norm = (p: string) => p.replace(/\\/g, '/');
 
 /** Serialize an op behind the project's current op (search never overlaps reindex). */
@@ -217,7 +222,15 @@ export function codemoggerSdkServer(projectPath: string, dbPath: string): McpSdk
  */
 export async function reindexProject(projectPath: string, dbPath: string, dirs: string[]): Promise<void> {
   const key = norm(projectPath);
+  const startGen = generations.get(key) ?? 0;
   for (const dir of dirs) {
+    // Bail if the project was dropped (code search disabled) between directories —
+    // else the withEngine below would re-open a CodeIndex for a now-disabled project
+    // and index into its orphaned DB, leaving a handle until idle eviction (F10).
+    if ((generations.get(key) ?? 0) !== startGen) {
+      log.info('codemogger.reindex', 'aborted: project dropped mid-reindex', { data: { key } });
+      break;
+    }
     try {
       const r = await withEngine(key, dbPath, ci => ci.index(dir));
       log.info('codemogger.reindex', 'indexed', {
@@ -272,6 +285,9 @@ export async function dropProject(projectPath: string): Promise<void> {
     const p = registry.get(key);
     registry.delete(key);
     usage.delete(key);
+    // Signal any in-flight reindex loop (which releases the lock between dirs) that
+    // this project was dropped, so it aborts instead of re-opening the engine (F10).
+    generations.set(key, (generations.get(key) ?? 0) + 1);
     if (p) { try { (await p).codeIndex.close(); } catch { /* already closed / never opened */ } }
   });
   // Deliberately DO NOT locks.delete(key) here: deleting the chain while an op may

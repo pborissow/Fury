@@ -76,6 +76,9 @@ export async function parseSubagentUsageEvents(subagentsDir: string): Promise<Us
     try {
       content = await readFile(full, 'utf-8');
     } catch {
+      // Transient read failure: serve the last-known events for this file rather than
+      // omitting them (a one-off token UNDERCOUNT). Self-heals on the next pass (F13).
+      if (cached) out.push(...cached.events);
       continue;
     }
     const events: UsageEvent[] = content.trim()

@@ -85,9 +85,15 @@ export async function isCurrentlyArchived(
 /**
  * Archive a transcript to SQLite. Skips if the content hash hasn't changed.
  *
- * Uses a transaction: UPSERT the session, then delete + re-insert all
- * messages and raw lines. This handles both new sessions and updates
- * (e.g. after a session grows or is rewound).
+ * UPSERTs the session, then deletes + re-inserts all messages and raw lines, handling
+ * both new sessions and updates (a session that grew or was rewound).
+ *
+ * NOT a single transaction across the whole write (F9): the preamble + first 500 rows
+ * commit in one db.batch, and each additional 500-row chunk commits separately, so a
+ * concurrent reader between chunks (loadTranscript / restoreJsonlFromArchive) can see a
+ * truncated prefix. It self-heals — the content hash is stamped only on the FINAL chunk,
+ * so isCurrentlyArchived stays false and the next archive re-writes — but the window is
+ * real for sessions over 500 rows.
  */
 export async function archiveTranscript(
   sessionId: string,
@@ -722,6 +728,54 @@ export async function setSessionStatus(
   await db.execute({
     sql: 'UPDATE sessions SET status = ? WHERE session_id = ?',
     args: [status, sessionId],
+  });
+}
+
+/** True if a durable `sessions` row exists (gates the delete route's JSONL unlink). */
+async function sessionRowExists(sessionId: string): Promise<boolean> {
+  const db = await getDb();
+  const r = await db.execute({
+    sql: 'SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1',
+    args: [sessionId],
+  });
+  return r.rows.length > 0;
+}
+
+/**
+ * Persist a session to SQLite BEFORE the delete route destroys its JSONL, then flip
+ * it to 'archived'. Returns whether a durable row now exists.
+ *
+ * The delete route MUST NOT unlink the JSONL unless this returns true — otherwise a
+ * session with no prior DB row (deleted inside the fire-and-forget startup-archive
+ * window, db.ts, or a history entry that never archived) loses its ONLY copy, and its
+ * usage vanishes from Stats even though the confirm dialog promised otherwise (F1).
+ *
+ * Because a row now exists with status 'archived' when we return true, a reactive
+ * re-archive racing the delete can only UPDATE (the ON CONFLICT upsert never writes
+ * `status`), so it can't resurrect the session as 'active' (F1b). The status flip runs
+ * under the per-session meta lock so it serializes with those reactive archives.
+ * archiveSessionFromDisk is called OUTSIDE the lock because it acquires the lock
+ * itself (via archiveTranscript) — nesting would deadlock.
+ */
+export async function archiveForDelete(sessionId: string, project: string | null): Promise<boolean> {
+  const sanitized = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
+  if (project) {
+    try {
+      await archiveSessionFromDisk(sanitized, project);
+    } catch (err) {
+      console.error('[archiveForDelete] archive failed; JSONL will be preserved:', err);
+    }
+  }
+  return withSessionMetaLock(sanitized, async () => {
+    const exists = await sessionRowExists(sanitized);
+    if (exists) {
+      const db = await getDb();
+      await db.execute({
+        sql: 'UPDATE sessions SET status = ? WHERE session_id = ?',
+        args: ['archived', sanitized],
+      });
+    }
+    return exists;
   });
 }
 

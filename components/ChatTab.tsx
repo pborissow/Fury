@@ -1839,7 +1839,12 @@ export default function ChatTab({
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         console.error(`Failed to ${label} question:`, data.error || `HTTP ${res.status}`);
-        if (res.status !== 409) restore();
+        // A 409 with code 'no_pending' means the question really is already settled
+        // (answered/superseded) — don't restore. But a 409 'sdk_disabled' means the
+        // answer never landed and the turn is still parked, so restore the dialog so
+        // the user isn't stranded with a locked composer and no dialog (F6). Any other
+        // status also restores.
+        if (res.status !== 409 || data.code === 'sdk_disabled') restore();
       }
     } catch (error) {
       // Network failure — the server never heard us, so it is definitely still parked.
@@ -2304,6 +2309,10 @@ export default function ChatTab({
 
     {askUserQuestion && (
       <AskUserQuestionDialog
+        // Remount on question identity so an in-place question swap (server supersede
+        // / applyPendingAskFromBuffer on reconnect) resets the selection state — else
+        // question Y renders with question X's stale pre-checked answers (F5).
+        key={askUserQuestion.toolUseID ?? 'cli'}
         open={true}
         questions={askUserQuestion.input.questions}
         context={
@@ -2410,7 +2419,7 @@ export default function ChatTab({
             <br /><br />
           </>
         )}
-        This will remove the session from your list. The transcript and its usage history are kept, and it will still count in Stats.
+        This removes the session from your list. Its usage history is preserved and it will still count in Stats.
       </>}
       confirmLabel="Archive"
       onConfirm={() => { if (archiveConfirm) handleArchiveSession(archiveConfirm.sessionId, archiveConfirm.project); }}

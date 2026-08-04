@@ -110,10 +110,13 @@ export async function approveProjectServer(
         if (!projects[key]) projects[key] = newProjectDefaults();
 
         const enabled = projects[key].enabledMcpjsonServers || [];
+        const disabled = projects[key].disabledMcpjsonServers || [];
+        // Idempotent no-op: already enabled and not on the disabled list → nothing to
+        // change. Return without rewriting the large, hot ~/.claude.json (F13).
+        if (enabled.includes(serverName) && !disabled.includes(serverName)) return true;
         if (!enabled.includes(serverName)) enabled.push(serverName);
         projects[key].enabledMcpjsonServers = enabled;
-        projects[key].disabledMcpjsonServers =
-          (projects[key].disabledMcpjsonServers || []).filter(n => n !== serverName);
+        projects[key].disabledMcpjsonServers = disabled.filter(n => n !== serverName);
 
         await atomicWrite(cfgPath, JSON.stringify(cfg, null, 2));
 

@@ -523,7 +523,10 @@ async function initDb(client: Client): Promise<void> {
         patch.contextWindow = inferredWindow;
         windowsRecovered++;
         await client.execute({
-          sql: 'UPDATE usage_events SET context_window = ? WHERE session_id = ? AND context_window = 0',
+          // is_sidechain = 0: subagent rows are written with context_window = 0 on
+          // purpose (they don't have the main thread's window); don't backfill them
+          // with the inferred main-thread window (F8).
+          sql: 'UPDATE usage_events SET context_window = ? WHERE session_id = ? AND context_window = 0 AND is_sidechain = 0',
           args: [inferredWindow, sid],
         });
       }

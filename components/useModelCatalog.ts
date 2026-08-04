@@ -44,7 +44,13 @@ export const norm = (v: string | undefined | null): string => (v ? normalizeMode
 /** Parse family + version from a wire id ('claude-sonnet-4-6' -> sonnet/4.6).
  *  Used for the SDK-fallback families and for reading SDK taglines by family. */
 export function familyVersionFromId(id: string): { family: string; version: string } | null {
-  const m = stripCtx(id).match(/(fable|mythos|opus|sonnet|haiku)-(\d+)(?:-(\d+))?/i);
+  const s = stripCtx(id);
+  // Legacy 3.x ids are VERSION-first ('claude-3-5-sonnet-20241022'). Match that shape
+  // FIRST — otherwise the family-first pattern below captures the dated snapshot
+  // ('20241022') as the version and the model sorts to the top of its family (F4).
+  const vf = s.match(/(\d+)(?:-(\d+))?-(fable|mythos|opus|sonnet|haiku)/i);
+  if (vf) return { family: vf[3].toLowerCase(), version: vf[2] ? `${vf[1]}.${vf[2]}` : vf[1] };
+  const m = s.match(/(fable|mythos|opus|sonnet|haiku)-(\d+)(?:-(\d+))?/i);
   if (!m) return null;
   return { family: m[1].toLowerCase(), version: m[3] ? `${m[2]}.${m[3]}` : m[2] };
 }

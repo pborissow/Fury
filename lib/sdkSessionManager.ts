@@ -440,18 +440,34 @@ class SdkSessionManager {
       throw new Error('Claude is waiting for an answer to its question. Answer or dismiss it first.');
     }
 
-    // MUST precede startQuery: it replays s.model into options.model, so a
-    // session resumed after a restart would otherwise open its query on the
-    // default model and only correct itself on some later turn.
-    await this.ensureModelHydrated(s);
+    // Re-entrancy guard (F3): reject a second send while a turn is already in flight.
+    // Both awaits below yield before startQuery, so without this a double-send
+    // (double-click, retry, or first-send race) would replace s.streamBuffer and clear
+    // s.usageByMsg mid-turn — discarding turn 1's stream buffer and token tally. Claim
+    // the turn SYNCHRONOUSLY here so two near-simultaneous sends can't both pass; the
+    // try/catch releases the claim if a pre-turn await throws (the turn never started).
+    if (s.isProcessing) {
+      throw new Error('A turn is already in progress for this session. Wait for it to finish.');
+    }
+    s.isProcessing = true;
 
-    // When the session is live in an external terminal, POST /api/claude detects
-    // it and answers the send with a 409 the UI turns into a takeover dialog.
-    // The confirmed re-send arrives here with confirmTakeover: end that external
-    // process cleanly BEFORE opening our resume query — two live processes
-    // writing one JSONL would break single-writer. Only reached post-confirmation.
-    if (opts?.confirmTakeover) {
-      await this.takeoverExternalOwner(s);
+    try {
+      // MUST precede startQuery: it replays s.model into options.model, so a
+      // session resumed after a restart would otherwise open its query on the
+      // default model and only correct itself on some later turn.
+      await this.ensureModelHydrated(s);
+
+      // When the session is live in an external terminal, POST /api/claude detects
+      // it and answers the send with a 409 the UI turns into a takeover dialog.
+      // The confirmed re-send arrives here with confirmTakeover: end that external
+      // process cleanly BEFORE opening our resume query — two live processes
+      // writing one JSONL would break single-writer. Only reached post-confirmation.
+      if (opts?.confirmTakeover) {
+        await this.takeoverExternalOwner(s);
+      }
+    } catch (err) {
+      s.isProcessing = false; // release the guard — the turn never opened
+      throw err;
     }
 
     if (!s.q) this.startQuery(s);
@@ -1209,6 +1225,12 @@ class SdkSessionManager {
    */
   private async isFuryOwned(sessionId: string, pid: number): Promise<boolean> {
     if (this.sessions.get(sessionId)?.spawnedPids.has(pid)) return true;
+    // Manager-level spawn record survives the session record being dropped from the
+    // map (and is rehydrated across a singleton reload), so consult it too — otherwise
+    // a warm process whose session entry is gone falls through to OS ancestry, which
+    // can't prove ownership after a re-parent and wrongly reports Fury's own process
+    // as an external owner (spurious takeover dialog) (F12).
+    if (this.spawnedProcs.get(pid) === sessionId) return true;
     return (await parentPidOf(pid)) === process.pid;
   }
 
@@ -1947,14 +1969,23 @@ class SdkSessionManager {
   }
 
   private async consume(s: SdkSession): Promise<void> {
+    // Capture the abort SIGNAL up front. An intentional teardown (stop/killSession)
+    // calls abort() and then SYNCHRONOUSLY nulls s.abortController, but the for-await
+    // rejection arrives as a LATER microtask — so by the time the catch runs,
+    // s.abortController is already undefined and reading `s.abortController?.signal`
+    // there yields nothing. This captured reference still points at the (now aborted)
+    // signal, so signal.aborted is the reliable "was this an intentional teardown?"
+    // test. (The SDK's abort rejection is a plain Error 'Operation aborted', NOT a
+    // named AbortError, so matching by name alone missed it and delete/shutdown got
+    // logged as a crash — F2.)
+    const signal = s.abortController?.signal;
     try {
       for await (const msg of s.q!) {
         this.handle(s, msg);
       }
     } catch (err) {
-      // An intentional teardown (stop/killSession aborts the controller)
-      // surfaces here as an AbortError — don't report it as a session error.
-      if (!s.abortController?.signal.aborted) {
+      const isAbort = signal?.aborted || (err instanceof Error && err.name === 'AbortError');
+      if (!isAbort) {
         const message = err instanceof Error ? err.message : String(err);
         log.error('sdk.turn', 'query threw', {
           sessionId: s.sessionId,
@@ -2675,7 +2706,14 @@ class SdkSessionManager {
 //     is on — the single-writer invariant is enforced where the CLI would spawn,
 //     not only at enable/migrate time (review follow-up). Without this bump a stale
 //     instance could let a surviving stdio entry spawn a 2nd DB writer.
-const SINGLETON_VERSION = 34;
+// 35: consume() captures the abort SIGNAL up front and uses signal.aborted to detect
+//     an intentional teardown (F2 pre-merge review). killSession/stop null
+//     s.abortController before the for-await rejection lands, and the SDK's abort
+//     rejection is a plain Error 'Operation aborted' (not a named AbortError), so
+//     neither the nulled-controller signal check nor an err.name check caught it — a
+//     normal delete/shutdown logged a spurious sdk.turn 'query threw'. Without this
+//     bump the live instance keeps mislogging teardowns.
+const SINGLETON_VERSION = 35;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

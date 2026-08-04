@@ -125,10 +125,14 @@ export function readOAuthToken(): string | null {
 
 // ---- parsing ----
 
-/** Space form, e.g. from display_name 'Claude Sonnet 4.6'. */
+/** Space form, family-first, e.g. from display_name 'Claude Sonnet 4.6'. */
 const FAMILY_RE = /(fable|mythos|opus|sonnet|haiku)\s+(\d+(?:\.\d+)?)/i;
-/** Hyphen form, e.g. from a wire id 'claude-sonnet-4-6' (minor after a dash). */
+/** Space form, VERSION-first — legacy 3.x display names ('Claude 3.5 Sonnet'). */
+const FAMILY_VERSION_FIRST_RE = /(\d+(?:\.\d+)?)\s+(fable|mythos|opus|sonnet|haiku)/i;
+/** Hyphen form, family-first, e.g. from a wire id 'claude-sonnet-4-6'. */
 const FAMILY_ID_RE = /(fable|mythos|opus|sonnet|haiku)-(\d+)(?:-(\d+))?/i;
+/** Hyphen form, VERSION-first — legacy 3.x ids ('claude-3-5-sonnet-20241022'). */
+const FAMILY_ID_VERSION_FIRST_RE = /(\d+)(?:-(\d+))?-(fable|mythos|opus|sonnet|haiku)/i;
 
 /** Title-case a family key for the row header ('opus' -> 'Opus'). */
 function familyLabel(family: string): string {
@@ -162,19 +166,33 @@ export function parseModel(m: {
   if (!id) return null;
   const displayName = typeof m.display_name === 'string' && m.display_name ? m.display_name : id;
 
-  // Prefer the display name's clean 'Sonnet 4.6' form; fall back to the wire id,
-  // where the version's minor is dash-separated ('sonnet-4-6' -> '4.6').
+  // Prefer the display name's clean form; fall back to the wire id. Handle BOTH the
+  // modern family-first shape ('Sonnet 4.6' / 'sonnet-4-6') and the legacy 3.x
+  // VERSION-first shape ('Claude 3.5 Sonnet' / 'claude-3-5-sonnet-20241022'). The
+  // version-first id form is tried BEFORE the family-first one, otherwise
+  // 'claude-3-5-sonnet-20241022' would capture the dated snapshot '20241022' as the
+  // version and the model would sort to the top of its family (F4).
   let family: string;
   let versionLabel: string;
   const nameMatch = displayName.match(FAMILY_RE);
+  const nameVfMatch = nameMatch ? null : displayName.match(FAMILY_VERSION_FIRST_RE);
   if (nameMatch) {
     family = nameMatch[1].toLowerCase();
     versionLabel = nameMatch[2];
+  } else if (nameVfMatch) {
+    family = nameVfMatch[2].toLowerCase();
+    versionLabel = nameVfMatch[1];
   } else {
-    const idMatch = id.match(FAMILY_ID_RE);
-    if (!idMatch) return null;
-    family = idMatch[1].toLowerCase();
-    versionLabel = idMatch[3] ? `${idMatch[2]}.${idMatch[3]}` : idMatch[2];
+    const idVf = id.match(FAMILY_ID_VERSION_FIRST_RE);
+    if (idVf) {
+      family = idVf[3].toLowerCase();
+      versionLabel = idVf[2] ? `${idVf[1]}.${idVf[2]}` : idVf[1];
+    } else {
+      const idMatch = id.match(FAMILY_ID_RE);
+      if (!idMatch) return null;
+      family = idMatch[1].toLowerCase();
+      versionLabel = idMatch[3] ? `${idMatch[2]}.${idMatch[3]}` : idMatch[2];
+    }
   }
 
   return {

@@ -138,7 +138,9 @@ test.describe('MCP code-search (codemogger) — in-process, live', () => {
     expect(existsSync(join(PROJECT_OK, '.mcp.json')), 'no .mcp.json codemogger entry created').toBe(false);
 
     // Wait for the initial in-process index (observed through the owning process).
-    expect(await waitForHits(PROJECT_OK, 'zorptangle', 90_000), 'symbol indexed in-process').toBeGreaterThan(0);
+    // Search the FULL identifier: codemogger's keyword FTS matches whole tokens, so a
+    // camelCase *partial* ("zorptangle") wouldn't hit "zorptangleReticulator".
+    expect(await waitForHits(PROJECT_OK, 'zorptangleReticulator', 90_000), 'symbol indexed in-process').toBeGreaterThan(0);
 
     const prompt =
       'Use the codemogger_search MCP tool (keyword mode, includeSnippet=true) to find the ' +

@@ -107,6 +107,12 @@ export function buildStructuredAnswers(
 
   for (let i = 0; i < questions.length; i++) {
     const q = questions[i];
+    // The output contract keys answers by question TEXT, so two questions with the
+    // same text in one call would overwrite each other. Warn so the collision is
+    // diagnosable rather than a silent dropped answer (F11).
+    if (Object.prototype.hasOwnProperty.call(answers, q.question)) {
+      console.warn(`[askUserQuestion] duplicate question text "${q.question}" — its earlier answer is overwritten`);
+    }
     const labels = selectedLabels(q, state, i);
     const custom = customText(state, i);
 

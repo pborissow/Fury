@@ -9,6 +9,12 @@ import { log } from './logger';
  * legacy migration), so a bare writeFileSync can expose a torn/partial file. A
  * rename is atomic on POSIX and replaces atomically on Windows (MoveFileEx). The
  * EPERM/EACCES retry covers a Windows reader transiently holding the destination.
+ *
+ * The retry is a BOUNDED busy-loop with NO backoff (unlike the async twin in
+ * mcpApprove.ts, which awaits a delay): this function is synchronous, so a delay could
+ * only be a blocking sleep that stalls the event loop — worse than retrying. It's
+ * capped at 10 immediate attempts and POSIX never hits the retry at all (rename over
+ * an open file succeeds), so the loop is effectively Windows-only and short (F13).
  */
 let atomicTmpCounter = 0;
 function atomicWriteFileSync(path: string, data: string): void {

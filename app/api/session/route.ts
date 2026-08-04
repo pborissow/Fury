@@ -5,7 +5,7 @@ import { join } from 'path';
 import { sessionManager } from '@/lib/sessionManager';
 import { sdkSessionManager } from '@/lib/sdkSessionManager';
 import { projectPathToSlug } from '@/lib/utils';
-import { setSessionStatus, invalidateArchive, updateSessionMetadata } from '@/lib/transcriptArchiver';
+import { archiveForDelete, invalidateArchive, updateSessionMetadata } from '@/lib/transcriptArchiver';
 import { isInternalContent } from '@/lib/transcriptParser';
 
 export const runtime = 'nodejs';
@@ -62,22 +62,25 @@ export async function DELETE(request: NextRequest) {
     // Not an SDK-managed session — fine
   }
 
-  // 2. Soft-delete in SQLite: flip status to 'archived' rather than deleting the
-  //    row. The row's usage_events survive, so archiving a session no longer
-  //    retroactively rewrites the Stats tab's spend history, and the transcript
-  //    stays intact for a future restore.
-  //
-  //    This flag — not the file cleanup in steps 3/4 — is what hides the session:
-  //    /api/history filters BOTH its history.jsonl-sourced list and its DB merge
-  //    against it. That's what makes steps 3/4 safe to be best-effort. A racing
-  //    re-archive is benign too: archiveTranscript never writes status on
-  //    conflict. See docs/delete-to-archive.md.
-  await setSessionStatus(sanitizedSessionId, 'archived').catch(err =>
-    console.error('[DeleteSession] Failed to archive session:', err)
-  );
+  // 2. Archive to SQLite BEFORE any destructive cleanup. archiveForDelete persists
+  //    the row + raw_jsonl + usage_events (from the JSONL, if not already archived)
+  //    and flips status to 'archived' — so Stats keeps counting it and the transcript
+  //    has a durable copy. It returns whether a durable row now exists; step 3 unlinks
+  //    the JSONL ONLY when it does, so a session with no prior DB row (deleted inside
+  //    the fire-and-forget startup-archive window) can never lose its only copy (F1).
+  //    Archiving-first also prevents a reactive re-archive from resurrecting it as
+  //    'active' (F1b), since a row now exists and the ON CONFLICT upsert never writes
+  //    status. The 'archived' flag — not the file cleanup in steps 3/4 — is what hides
+  //    the session (/api/history filters BOTH its history.jsonl list and its DB merge
+  //    against it). See docs/delete-to-archive.md.
+  const archived = await archiveForDelete(sessionId, project).catch(err => {
+    console.error('[DeleteSession] Failed to archive session:', err);
+    return false;
+  });
 
-  // 3. Delete the session JSONL file
-  if (project) {
+  // 3. Delete the session JSONL file — ONLY once a durable DB copy exists, so we never
+  //    destroy the sole copy of an un-archived transcript.
+  if (project && archived) {
     const slug = projectPathToSlug(project);
     const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sanitizedSessionId}.jsonl`);
     try {
@@ -88,6 +91,11 @@ export async function DELETE(request: NextRequest) {
         console.error('[DeleteSession] Failed to delete JSONL:', err);
       }
     }
+  } else if (project && !archived) {
+    // Nothing durable was archived (empty/unparseable transcript, or a transient
+    // archive failure) — keep the JSONL rather than destroy the only copy. The
+    // session is still hidden by the history.jsonl strip in step 4.
+    results.push('Kept session JSONL (nothing archived to preserve)');
   }
 
   // 4. Remove matching entries from history.jsonl (uses raw sessionId —

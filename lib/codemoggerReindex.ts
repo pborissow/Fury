@@ -78,6 +78,9 @@ function defaultReindex(projectPath: string, dbPath: string, dirs: string[]): Pr
 
 export class CodemoggerReindexer {
   private watchers = new Map<string, fs.FSWatcher[]>();
+  // Signature of the dir set currently watched per project, so ensureWatching can
+  // detect a config change and re-attach instead of watching a stale set (F7).
+  private watchedDirs = new Map<string, string>();
   private debounces = new Map<string, NodeJS.Timeout>();
   private running = new Set<string>();
   private dirty = new Set<string>();
@@ -107,7 +110,6 @@ export class CodemoggerReindexer {
   ensureWatching(projectPath: string): void {
     if (!projectPath) return;
     const key = this.key(projectPath);
-    if (this.watchers.has(key)) return;
     if (!isCodeSearchEnabled(projectPath)) return; // code search not enabled here
     if (!RECURSIVE_WATCH_SUPPORTED) {
       // Log ONCE (ensureWatching runs every turn) so it's diagnosable, not a scary
@@ -122,6 +124,15 @@ export class CodemoggerReindexer {
     }
     const dirs = codeSearchDirs(projectPath).filter(d => existsSync(d));
     if (!dirs.length) return;
+    // Reconcile against the CURRENT selected-dir set (F7): if we're already watching
+    // and the set is unchanged, nothing to do; if the config gained/dropped a dir,
+    // tear down and re-attach below so edits under a newly-added dir still fire a
+    // reindex instead of the index silently drifting stale until a restart.
+    const dirSig = [...dirs].sort().join('\0');
+    if (this.watchers.has(key)) {
+      if (this.watchedDirs.get(key) === dirSig) return;
+      this.stopWatching(projectPath);
+    }
     const watchers: fs.FSWatcher[] = [];
     for (const dir of dirs) {
       try {
@@ -155,6 +166,7 @@ export class CodemoggerReindexer {
     }
     if (!watchers.length) return;
     this.watchers.set(key, watchers);
+    this.watchedDirs.set(key, dirSig);
     log.info('codemogger.reindex', 'watching', { data: { project: projectPath, dirs } });
   }
 
@@ -211,6 +223,7 @@ export class CodemoggerReindexer {
     const key = this.key(projectPath);
     for (const w of this.watchers.get(key) ?? []) { try { w.close(); } catch { /* ignore */ } }
     this.watchers.delete(key);
+    this.watchedDirs.delete(key);
     const d = this.debounces.get(key);
     if (d) { clearTimeout(d); this.debounces.delete(key); }
     this.dirty.delete(key);
@@ -220,6 +233,7 @@ export class CodemoggerReindexer {
   stopAll(): void {
     for (const [, ws] of this.watchers) for (const w of ws) { try { w.close(); } catch { /* ignore */ } }
     this.watchers.clear();
+    this.watchedDirs.clear();
     for (const [, d] of this.debounces) clearTimeout(d);
     this.debounces.clear();
     this.dirty.clear();
@@ -236,7 +250,10 @@ export class CodemoggerReindexer {
 //      reindexProject() in Fury's process instead of spawning `codemogger index`
 //      (docs/ticket-codesearch-inprocess-mcp-macos-contention.md, Option A). Without
 //      this bump the live instance keeps the old spawn path (the competing process).
-const SINGLETON_VERSION = 3;
+//   4: ensureWatching reconciles the watched dir set against the current config and
+//      re-attaches when it changed (F4/F7 pre-merge review) — a project that gains an
+//      indexed dir now watches it instead of drifting stale until restart.
+const SINGLETON_VERSION = 4;
 const globalKey = '__fury_codemogger_reindexer__';
 const globalVerKey = '__fury_codemogger_reindexer_v__';
 const g = globalThis as any;

@@ -62,8 +62,11 @@ export async function POST(req: NextRequest) {
       return Response.json({ error: 'toolUseID is required' }, { status: 400 });
     }
     if (!(await sdkEnabled())) {
+      // Distinct from the "no pending question" 409 below (F6): here the answer never
+      // had a chance to land, so the client must RESTORE the dialog rather than treat
+      // it as settled and strand the parked turn.
       return Response.json(
-        { error: 'Answering a question requires SDK sessions to be enabled' },
+        { error: 'Answering a question requires SDK sessions to be enabled', code: 'sdk_disabled' },
         { status: 409 },
       );
     }
@@ -74,7 +77,7 @@ export async function POST(req: NextRequest) {
       const ok = sdkSessionManager.resolveAsk(sessionId, toolUseID, { skip: true });
       return ok
         ? Response.json({ ok: true, skipped: true })
-        : Response.json({ error: 'No matching pending question' }, { status: 409 });
+        : Response.json({ error: 'No matching pending question', code: 'no_pending' }, { status: 409 });
     }
 
     // Enforce the value shape rather than trusting the client: a non-string
@@ -98,10 +101,11 @@ export async function POST(req: NextRequest) {
     });
 
     // 409, not 404: the session is likely alive and fine — this specific
-    // question just isn't the one parked (already answered, or superseded).
+    // question just isn't the one parked (already answered, or superseded). The
+    // 'no_pending' code tells the client NOT to restore (correctly settled).
     return ok
       ? Response.json({ ok: true })
-      : Response.json({ error: 'No matching pending question' }, { status: 409 });
+      : Response.json({ error: 'No matching pending question', code: 'no_pending' }, { status: 409 });
   } catch (error) {
     console.error('[api/claude-sdk/answer] failed:', error);
     return Response.json({ error: 'Failed to answer question' }, { status: 500 });
