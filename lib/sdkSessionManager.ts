@@ -450,6 +450,16 @@ class SdkSessionManager {
       throw new Error('A turn is already in progress for this session. Wait for it to finish.');
     }
     s.isProcessing = true;
+    // Refresh the stuck detector's clock the moment isProcessing flips true.
+    // computeStuck measures `Date.now() - lastActivity`, but lastActivity was only
+    // ever set on session creation and on each INCOMING message — so a follow-up
+    // sent after an idle gap longer than STUCK_AFTER_MS emitted, at the instant of
+    // send, "No response from Claude for Ns — the session may be stuck." The first
+    // token corrected it, but coming back later and sending a follow-up is a common
+    // path and the message is plainly wrong. Set here rather than at the per-turn
+    // block below because this is where the flag the detector gates on is claimed:
+    // the awaits between the two points can overlap a reconcile-tick health emit.
+    s.lastActivity = Date.now();
 
     try {
       // MUST precede startQuery: it replays s.model into options.model, so a
@@ -2498,6 +2508,10 @@ class SdkSessionManager {
    * isProcessing would otherwise stay true forever with no "kill" affordance. A
    * turn making progress (any message) keeps resetting lastActivity, and a live
    * background task counts as activity, so neither trips this.
+   *
+   * lastActivity is also stamped at turn start (sendMessage's re-entrancy claim),
+   * so the window is measured from when the turn actually began — otherwise a
+   * follow-up sent after a long idle gap reads as instantly stuck.
    */
   private computeStuck(s: SdkSession, isProcessing: boolean, backgroundActive: boolean): {
     isStuck: boolean;

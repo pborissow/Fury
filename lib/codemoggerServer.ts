@@ -76,10 +76,12 @@ const locks = new Map<string, Promise<unknown>>();
 // only closes a CodeIndex when inFlight === 0, so a close can never race a live op.
 interface Usage { lastUsed: number; inFlight: number }
 const usage = new Map<string, Usage>();
-// Bumped whenever dropProject actually closes a project. reindexProject captures the
-// value at start and checks it between directories, so a DELETE/disable that lands
-// mid-reindex (when inFlight is momentarily 0 between dirs) aborts the loop instead of
-// re-opening a CodeIndex into the now-disabled project's orphaned DB (F10).
+// Bumped on EVERY dropProject, whether or not it can close the connection right then.
+// reindexProject captures the value at start; a mismatch means "code search was
+// disabled for this project — stop". It is checked twice: between directories (a cheap
+// fast path) and again inside withEngine under the per-project lock (authoritative).
+// Without it, a DELETE/disable landing mid-reindex would keep indexing into the
+// now-disabled project, and could re-open a CodeIndex against its orphaned DB (F10).
 const generations = new Map<string, number>();
 const norm = (p: string) => p.replace(/\\/g, '/');
 
@@ -91,6 +93,15 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
+/** Thrown when a project was dropped while an op waited for its lock. Not a failure —
+ *  reindexProject catches it to end the loop quietly. */
+export class ProjectDroppedError extends Error {
+  constructor(key: string) {
+    super(`code search was disabled for ${key} while the operation was queued`);
+    this.name = 'ProjectDroppedError';
+  }
+}
+
 /**
  * Acquire the project's engine AND run `fn` under one lock hold — the SINGLE access
  * point for the CodeIndex. getOrCreate happens INSIDE the lock, and inFlight is bumped
@@ -98,13 +109,28 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
  * what makes idle eviction safe: it only closes a connection when inFlight === 0, so
  * it can never close a CodeIndex a handler is mid-way through using. If a project was
  * evicted between calls, getOrCreate simply re-opens it here.
+ *
+ * `expectGeneration` makes the drop check AUTHORITATIVE: it is re-tested here, under
+ * the lock, immediately before getOrCreate. reindexProject also checks between
+ * directories, but that check is only safe because nothing awaits between it and this
+ * call — an invariant a future refactor could quietly break, after which a drop that
+ * interleaved would re-open a CodeIndex into the just-disabled project's DB. Checking
+ * under the lock does not depend on that invariant (F10).
  */
-function withEngine<T>(key: string, dbPath: string, fn: (ci: CodeIndex) => Promise<T>): Promise<T> {
+function withEngine<T>(
+  key: string,
+  dbPath: string,
+  fn: (ci: CodeIndex) => Promise<T>,
+  expectGeneration?: number,
+): Promise<T> {
   let u = usage.get(key);
   if (!u) { u = { lastUsed: Date.now(), inFlight: 0 }; usage.set(key, u); }
   u.inFlight++; u.lastUsed = Date.now();
   const done = () => { u!.inFlight--; u!.lastUsed = Date.now(); };
   return withLock(key, async () => {
+    if (expectGeneration !== undefined && (generations.get(key) ?? 0) !== expectGeneration) {
+      throw new ProjectDroppedError(key);
+    }
     const { codeIndex } = await getOrCreate(key, dbPath);
     return fn(codeIndex);
   }).then(
@@ -227,16 +253,24 @@ export async function reindexProject(projectPath: string, dbPath: string, dirs: 
     // Bail if the project was dropped (code search disabled) between directories —
     // else the withEngine below would re-open a CodeIndex for a now-disabled project
     // and index into its orphaned DB, leaving a handle until idle eviction (F10).
+    // Fast path: skip even enqueueing onto the lock chain. withEngine re-tests the
+    // same generation under the lock, which is the authoritative check.
     if ((generations.get(key) ?? 0) !== startGen) {
       log.info('codemogger.reindex', 'aborted: project dropped mid-reindex', { data: { key } });
       break;
     }
     try {
-      const r = await withEngine(key, dbPath, ci => ci.index(dir));
+      const r = await withEngine(key, dbPath, ci => ci.index(dir), startGen);
       log.info('codemogger.reindex', 'indexed', {
         data: { dir, summary: `Indexed ${r.files} files → ${r.chunks} chunks, skipped ${r.skipped}, removed ${r.removed}` },
       });
     } catch (err) {
+      // A drop that landed while this dir waited for the lock — end the loop, don't
+      // log it as an index failure.
+      if (err instanceof ProjectDroppedError) {
+        log.info('codemogger.reindex', 'aborted: project dropped while queued', { data: { key, dir } });
+        break;
+      }
       log.warn('codemogger.reindex', 'index failed', {
         data: { dir, error: err instanceof Error ? err.message : String(err) },
       });
@@ -273,6 +307,17 @@ export async function searchProject(
 export async function dropProject(projectPath: string): Promise<void> {
   const key = norm(projectPath);
   await withLock(key, async () => {
+    // Signal any in-flight reindex loop that this project was dropped, so it aborts
+    // instead of indexing further directories into a now-disabled project (F10).
+    //
+    // Bumped BEFORE the deferral check below, and unconditionally: the generation's
+    // job is to tell the reindex loop to stop, which is true regardless of whether
+    // we can safely close right now. Bumping it only on the closing path meant the
+    // common case — a drop arriving WHILE a directory is being indexed, so inFlight
+    // is non-zero and we defer — never signalled the loop at all, and the reindex
+    // ran to completion against the project the user had just disabled.
+    generations.set(key, (generations.get(key) ?? 0) + 1);
+
     // By the time this runs, every op queued before it has completed and
     // decremented inFlight. A residual inFlight > 0 means a NEWER op enqueued
     // behind us — closing would race it, so defer (the idle sweeper or a later
@@ -285,9 +330,6 @@ export async function dropProject(projectPath: string): Promise<void> {
     const p = registry.get(key);
     registry.delete(key);
     usage.delete(key);
-    // Signal any in-flight reindex loop (which releases the lock between dirs) that
-    // this project was dropped, so it aborts instead of re-opening the engine (F10).
-    generations.set(key, (generations.get(key) ?? 0) + 1);
     if (p) { try { (await p).codeIndex.close(); } catch { /* already closed / never opened */ } }
   });
   // Deliberately DO NOT locks.delete(key) here: deleting the chain while an op may
