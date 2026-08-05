@@ -168,6 +168,9 @@ export default function ChatTab({
 
   // AskUserQuestion dialog state
   const [askUserQuestion, setAskUserQuestion] = useState<AskUserQuestionState | null>(null);
+  // The middle-panel container the AskUserQuestion modal anchors to, so the
+  // question dialog appears within the Chat panel rather than over the whole app.
+  const middlePanelRef = useRef<HTMLDivElement>(null);
 
   /** When a question last PARKED, via SSE. Guards the stale-close race below. */
   const lastAskEventAtRef = useRef(0);
@@ -1995,7 +1998,7 @@ export default function ChatTab({
 
       {/* Middle Panel - Chat Interface / Transcript Viewer */}
       <Panel defaultSize={chatHorizontalLayout[1]} minSize={30}>
-        <div className="h-full bg-card border-r border-border flex flex-col">
+        <div ref={middlePanelRef} className="relative h-full bg-card border-r border-border flex flex-col">
           {viewingTranscriptId ? (
             <>
               {isStuck && (
@@ -2314,6 +2317,9 @@ export default function ChatTab({
         // question Y renders with question X's stale pre-checked answers.
         key={askUserQuestion.toolUseID ?? 'cli'}
         open={true}
+        // Anchor the modal to the Chat tab's middle panel instead of the
+        // whole viewport, so it dims/centers within the conversation column.
+        portalContainer={middlePanelRef.current}
         questions={askUserQuestion.input.questions}
         context={
           // The text Claude wrote leading up to the question — the same

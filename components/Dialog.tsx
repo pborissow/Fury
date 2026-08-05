@@ -46,6 +46,12 @@ interface DialogProps {
   onResizeEnd?: (size: { width: number; height: number }) => void;
   /** Fires after the user finishes dragging — use to persist the new position. */
   onMoveEnd?: (position: { x: number; y: number }) => void;
+  /** When provided, the dialog is portaled INTO this element and positioned
+   *  relative to it (absolute, centered) instead of the viewport (fixed). The
+   *  dim overlay then covers only that container. The element must be
+   *  positioned (e.g. `relative`). Used to anchor a modal to a single panel
+   *  rather than the whole app. */
+  portalContainer?: HTMLElement | null;
 }
 
 export default function Dialog({
@@ -65,7 +71,11 @@ export default function Dialog({
   resetOnOpen = true,
   onResizeEnd,
   onMoveEnd,
+  portalContainer,
 }: DialogProps) {
+  // When anchored to a container, position relative to it (absolute) and dim
+  // only it, rather than the whole viewport (fixed).
+  const contained = !!portalContainer;
   const [size, setSize] = useState({ width: defaultWidth, height: defaultHeight });
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const dragRef = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
@@ -242,10 +252,10 @@ export default function Dialog({
 
   return (
     <DialogPrimitive.Root open={open} onOpenChange={handleOpenChange}>
-      <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/50" onClick={(e) => e.stopPropagation()} />
+      <DialogPrimitive.Portal container={portalContainer ?? undefined}>
+        <DialogPrimitive.Overlay className={`${contained ? 'absolute' : 'fixed'} inset-0 z-50 bg-black/50`} onClick={(e) => e.stopPropagation()} />
         <DialogPrimitive.Content
-          className="fixed z-50 focus:outline-none"
+          className={`${contained ? 'absolute' : 'fixed'} z-50 focus:outline-none`}
           style={{
             top: '50%',
             left: '50%',
@@ -260,7 +270,8 @@ export default function Dialog({
             className={`bg-card border flex flex-col overflow-hidden relative${maximized ? '' : ' rounded-lg'}`}
             style={{
               width: size.width, height: size.height,
-              maxWidth: maximized ? '100vw' : '95vw', maxHeight: maximized ? '100vh' : '95vh',
+              maxWidth: contained ? '100%' : (maximized ? '100vw' : '95vw'),
+              maxHeight: contained ? '100%' : (maximized ? '100vh' : '95vh'),
               boxShadow: '0 8px 40px rgba(0, 0, 0, 0.8), 0 2px 12px rgba(0, 0, 0, 0.6)',
             }}
           >

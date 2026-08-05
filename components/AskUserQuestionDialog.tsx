@@ -5,7 +5,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Dialog from '@/components/Dialog';
 import CopyableCodeBlock from '@/components/CopyableCodeBlock';
-import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
 import {
   buildProseAnswer,
   buildStructuredAnswers,
@@ -50,6 +50,9 @@ interface AskUserQuestionDialogProps {
     annotations?: Record<string, { notes?: string }>;
   }) => void;
   onSkip: () => void;
+  /** When set, the modal is anchored to this element (the Chat tab's middle
+   *  panel) instead of the whole viewport. */
+  portalContainer?: HTMLElement | null;
 }
 
 export default function AskUserQuestionDialog({
@@ -59,6 +62,7 @@ export default function AskUserQuestionDialog({
   onSubmit,
   onSubmitStructured,
   onSkip,
+  portalContainer,
 }: AskUserQuestionDialogProps) {
   // Per-question state: selected option indices
   const [selections, setSelections] = useState<Map<number, Set<number>>>(new Map());
@@ -148,6 +152,7 @@ export default function AskUserQuestionDialog({
       minWidth={400}
       minHeight={300}
       maximizable
+      portalContainer={portalContainer}
       buttons={[
         { label: 'Skip', onClick: onSkip, variant: 'outline' },
         { label: 'Submit', onClick: handleSubmit, disabled: !isValid },
@@ -234,15 +239,18 @@ export default function AskUserQuestionDialog({
                 <div className="flex-1">
                   <div className="text-sm font-medium">Other</div>
                   {useOther.get(qIndex) && (
-                    <Input
+                    <Textarea
                       value={otherText.get(qIndex) || ''}
                       onChange={(e) => setOtherTextForQuestion(qIndex, e.target.value)}
                       placeholder="Type your answer..."
+                      rows={2}
                       className="mt-2"
                       autoFocus
                       onClick={(e) => e.stopPropagation()}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter' && isValid) {
+                        // Plain Enter inserts a newline for longer responses;
+                        // Cmd/Ctrl+Enter submits.
+                        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && isValid) {
                           e.preventDefault();
                           handleSubmit();
                         }
