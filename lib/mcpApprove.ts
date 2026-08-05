@@ -1,4 +1,5 @@
-import { readFile, writeFile, rename, rm } from 'fs/promises';
+import { readFile } from 'fs/promises';
+import { atomicWriteFile as atomicWrite } from './atomicWrite';
 
 /** Shape of a per-project entry in ~/.claude.json we care about. */
 interface ProjectEntry {
@@ -20,32 +21,11 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   return run;
 }
 
-let tmpCounter = 0;
-
-/**
- * Write `data` to `cfgPath` atomically: temp file in the same dir, then rename
- * over the target. Retries EPERM/EACCES on the rename — on Windows a concurrent
- * writer holding the destination makes rename transiently fail even though the
- * swap is legal a moment later.
- */
-async function atomicWrite(cfgPath: string, data: string): Promise<void> {
-  const tmp = `${cfgPath}.fury-${process.pid}-${tmpCounter++}.tmp`;
-  await writeFile(tmp, data);
-  for (let i = 0; ; i++) {
-    try {
-      await rename(tmp, cfgPath);
-      return;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if ((code === 'EPERM' || code === 'EACCES') && i < 10) {
-        await new Promise(r => setTimeout(r, 5 * (i + 1)));
-        continue;
-      }
-      await rm(tmp, { force: true }).catch(() => {});
-      throw err;
-    }
-  }
-}
+// `atomicWrite` (imported above) writes a temp file in the same dir and renames it
+// over the target, retrying EPERM/EACCES with linear backoff — on Windows a
+// concurrent writer holding the destination makes rename transiently fail even
+// though the swap is legal a moment later. The `withLock` chain above keeps this
+// process's own writes from racing each other; the retry covers other processes.
 
 export function newProjectDefaults(): ProjectEntry {
   return {

@@ -1,37 +1,11 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, rmSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
 import { log } from './logger';
-
-/**
- * Atomic write (P20): write to a temp file in the same directory, then rename over
- * the target. `.mcp.json` is read by other Claude processes and rewritten from two
- * near-simultaneous callers (GET /api/mcp and GET /api/code-search both fire the
- * legacy migration), so a bare writeFileSync can expose a torn/partial file. A
- * rename is atomic on POSIX and replaces atomically on Windows (MoveFileEx). The
- * EPERM/EACCES retry covers a Windows reader transiently holding the destination.
- *
- * The retry is a BOUNDED busy-loop with NO backoff (unlike the async twin in
- * mcpApprove.ts, which awaits a delay): this function is synchronous, so a delay could
- * only be a blocking sleep that stalls the event loop — worse than retrying. It's
- * capped at 10 immediate attempts and POSIX never hits the retry at all (rename over
- * an open file succeeds), so the loop is effectively Windows-only and short.
- */
-let atomicTmpCounter = 0;
-function atomicWriteFileSync(path: string, data: string): void {
-  const tmp = `${path}.fury-${process.pid}-${atomicTmpCounter++}.tmp`;
-  writeFileSync(tmp, data);
-  for (let i = 0; ; i++) {
-    try {
-      renameSync(tmp, path);
-      return;
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if ((code === 'EPERM' || code === 'EACCES') && i < 10) continue;
-      try { rmSync(tmp, { force: true }); } catch { /* ignore */ }
-      throw err;
-    }
-  }
-}
+// Atomic write (P20): `.mcp.json` is read by other Claude processes and rewritten
+// from two near-simultaneous callers (GET /api/mcp and GET /api/code-search both
+// fire the legacy migration), so a bare writeFileSync can expose a torn file.
+// Implementation (and the sync-vs-async retry rationale) lives in ./atomicWrite.
+import { atomicWriteFileSync } from './atomicWrite';
 
 /**
  * "This project" code-search configuration — the IN-PROCESS replacement for the
