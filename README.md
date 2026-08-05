@@ -1,16 +1,16 @@
 # Fury IDE
 
-A prototype IDE for AI-assisted development built with Next.js and Claude Code. Fury IDE provides a web-based interface for interacting with the Claude CLI, managing chat sessions, building visual workflows, and organizing project notes.
+A prototype IDE for AI-assisted development built with Next.js and the Claude Agent SDK. Fury IDE provides a web-based interface for interacting with Claude, managing chat sessions, building visual workflows, and organizing project notes.
 
 ## Features
 
 ### Chat Interface
-- **Claude CLI sessions** - Sessions are native Claude CLI sessions using `--session-id` and `--resume`, with full conversation context managed by the CLI
+- **SDK-backed sessions** - Sessions run on the Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`): one persistent, warm streaming query per session, with mid-session model switching, native rewind, and background-task activity. A legacy Claude CLI path remains behind the `sdkSessionsEnabled` setting (on by default)
 - **Unified session list** - Browse all sessions from `~/.claude/history.jsonl` with live session indicators
-- **Streaming responses** - Real-time streamed output from Claude CLI with tool use activity indicators
+- **Streaming responses** - Real-time streamed output over SSE with tool use activity indicators
 - **Markdown rendering** - Assistant responses rendered with syntax highlighting (via `react-markdown`, `remark-gfm`, `rehype-highlight`)
 - **Rich text input** - TipTap-based editor with code block support (Enter to send, Shift+Enter for newline)
-- **Stop/Kill controls** - Abort in-flight requests or kill stuck Claude CLI processes
+- **Stop/Kill controls** - Abort an in-flight turn or kill a stuck session's warm process
 - **AskUserQuestion support** - Interactive dialog when Claude requests user input via the AskUserQuestion tool
 - **Prompt suggestions** - Detects stale/idle sessions with incomplete responses and suggests follow-up prompts (configurable)
 - **Long conversation warnings** - Visual indicator when sessions exceed 50 messages
@@ -93,7 +93,7 @@ responses go through a two-pass tighten + list-stripping pipeline.
 - **Styling**: Tailwind CSS 4, shadcn/ui components (Radix UI primitives)
 - **Editor**: TipTap (rich text input + notes)
 - **Canvas**: Drawflow
-- **AI**: Claude CLI (`claude` command) spawned as child processes via `SessionManager`
+- **AI**: Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) — one persistent streaming `query()` per session via `SdkSessionManager`; the legacy Claude CLI child-process path (`SessionManager`) remains as a fallback
 - **Code Search**: codemogger (local semantic + keyword search via MCP)
 - **Fonts**: Geist Sans / Geist Mono
 
@@ -101,8 +101,8 @@ responses go through a two-pass tighten + list-stripping pipeline.
 
 | Data | Location |
 |------|----------|
-| Session transcripts | `~/.claude/projects/<slug>/<sessionId>.jsonl` (Claude CLI managed) |
-| Chat history | `~/.claude/history.jsonl` (Claude CLI global, also appended by Fury) |
+| Session transcripts | `~/.claude/projects/<slug>/<sessionId>.jsonl` (written by the Claude Code subprocess) |
+| Chat history | `~/.claude/history.jsonl` (Claude Code global, also appended by Fury) |
 | **Transcript archive** | **`~/.claude/fury.db` (SQLite, Fury managed)** |
 | Workflows | `.claude-workflows/*.json` (project-local) |
 | UI state | `.claude-ui-state/state.json` (project-local) |
@@ -127,10 +127,13 @@ The database is populated automatically through four triggers:
 
 A SHA-256 hash per session ensures duplicate archival is a no-op. When a JSONL file is missing (deleted by cleanup), the transcript API falls back to SQLite transparently. The history list merges archived sessions so cleaned-up sessions remain visible.
 
-**Schema** (3 tables):
-- `sessions` — session metadata, project path, display text, message count, content hash
+**Schema** (core tables):
+- `sessions` — session metadata: project path, display text, message count, content hash, status (`active`/`archived`), and a JSON `metadata` blob (model, context tokens/window, token totals, compaction count)
 - `messages` — parsed transcript messages (role, content, timestamp, turn index)
 - `raw_jsonl` — original JSONL lines preserved for full-fidelity restoration
+- `usage_events` — per-message token usage (input / output / cache read + write, `is_sidechain` for subagents) that powers the Stats tab, retained even after a session is archived
+
+Plus internal tables for the model catalog and pricing cache.
 
 **Technology:** `@libsql/client` (Turso/libSQL) with WAL mode for concurrent read/write safety.
 
@@ -144,24 +147,28 @@ npx tsx scripts/populate-db.ts --verbose # Show per-file details
 
 ## Session Lifecycle
 
-Fury does **not** maintain long-running Claude processes. Sessions are stateless on the server between messages:
+Fury runs sessions on the **Claude Agent SDK** (`sdkSessionsEnabled`, on by default). Each session is backed by **one long-lived streaming `query()`** and its warm CLI subprocess, tracked in memory by `SdkSessionManager`:
 
-1. **Creating a session** — Purely a frontend operation. A UUID is generated and stored in React state. No Claude process is spawned, no server-side state is created. The session only materialises on disk when the first message is sent.
+1. **Creating a session** — A frontend operation: a UUID is generated and held in React state. Nothing spawns and no server-side state is created until the first message; the session materialises on disk (and in the manager) when the first prompt is sent.
 
-2. **Sending a message** — A `claude --print --session-id <uuid>` process is spawned (or `--resume <uuid>` for subsequent messages). It handles **one prompt**, streams the response back via SSE, writes to the JSONL transcript file, and exits. There is no persistent process per session.
+2. **Sending a message** — The first send opens a persistent `query()` with a streaming-input generator and spawns the CLI subprocess; the prompt is pushed into that input stream and the response streams back over SSE. Subsequent messages reuse the **same warm query and process** — no cold start per turn. Per-turn tokens, context window, and partial output are tracked in memory and emitted live.
 
-3. **Switching sessions** — Purely a frontend operation. The UI swaps which transcript is displayed by loading the target session's JSONL from disk. No processes are spawned or terminated. If a Claude process is mid-response when you switch away, it continues running to completion in the background — its SSE handler simply stops updating the display, and the data is persisted to JSONL for when you return.
+3. **Switching sessions** — A frontend operation: the UI swaps which transcript is displayed. The other session's query keeps running in the background — its output is persisted to JSONL and its health/SSE events continue, so a background turn (or a subagent it dispatched) stays "live" with its dots still bouncing.
 
-4. **Conversation continuity** — Managed entirely by the Claude CLI via `--resume <uuid>`. On each message, the CLI re-reads the session's JSONL file to reconstruct conversation context. Fury itself does not track conversation history.
+4. **Conversation continuity** — The live query holds context in-process; across a server restart the session re-opens with the SDK's `resume`, replaying the archived transcript. Rewind uses the SDK's native `resume` + `resumeSessionAt`.
 
-5. **Parallel sessions** — Multiple sessions can process messages concurrently. Each spawns its own short-lived Claude process with a distinct session UUID. The `activeSessionRef` mechanism ensures only the currently-viewed session's SSE handler updates the display, preventing cross-session contamination.
+5. **Model, stop & stuck handling** — The model can be switched mid-session (`setModel`, replayed into the query). Stop/interrupt aborts the current turn while leaving the session resumable; a hang watchdog surfaces a stuck turn so it can be killed. Background tasks (subagents, `run_in_background` Bash, Monitor) drive their own turns via injected `<task-notification>`s.
+
+6. **Parallel sessions** — Multiple sessions run concurrent warm queries, each with its own subprocess and session UUID. The `activeSessionRef` mechanism ensures only the currently-viewed session's SSE handler updates the display, preventing cross-session contamination. Deleting a session terminates its warm process.
+
+> **Legacy CLI path** — With `sdkSessionsEnabled` off, Fury falls back to the original stateless model: a short-lived `claude --print --session-id <uuid>` (`--resume` for follow-ups) is spawned per prompt via `SessionManager`, with conversation continuity managed by the CLI re-reading the JSONL. The SSE stream shape is identical either way, so the frontend keeps calling `/api/claude` regardless.
 
 ## Getting Started
 
 ### Prerequisites
 
 - Node.js 20+
-- Claude CLI installed and authenticated (`claude` command available in PATH)
+- Claude Code CLI installed and authenticated (`claude` command available in PATH) — used by both the Agent SDK and the legacy fallback path
 
 ### Install & Run
 
