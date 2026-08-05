@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import { readFile, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
-import { loadArchivedSessions } from '@/lib/transcriptArchiver';
+import { loadArchivedSessions, loadArchivedSessionIds } from '@/lib/transcriptArchiver';
 
 export const runtime = 'nodejs';
 
@@ -65,7 +65,7 @@ export async function GET(req: NextRequest) {
       }
 
       // Sort by timestamp (most recent first), drop sessions with no meaningful messages
-      const allEntriesFlat = Array.from(sessionBestEntry.entries())
+      let allEntriesFlat = Array.from(sessionBestEntry.entries())
         .filter(([, entry]) => !isSkippableDisplay(entry.display))
         .map(([key, entry]) => ({
           ...entry,
@@ -76,7 +76,26 @@ export async function GET(req: NextRequest) {
       // Merge archived sessions from SQLite (surfaces sessions that survived
       // in the DB after Claude deleted the JSONL + history entries)
       try {
-        const archivedSessions = await loadArchivedSessions();
+        const [archivedSessions, archivedIds] = await Promise.all([
+          loadArchivedSessions(),
+          loadArchivedSessionIds(),
+        ]);
+
+        // Soft-deleted sessions are hidden here, against the list built from
+        // history.jsonl — NOT only in loadArchivedSessions (which governs just
+        // the DB-merge below). The `status` column is the durable authority on
+        // what the sidebar shows; the delete route's history-strip is
+        // best-effort (its failure is caught and logged while the route still
+        // returns success), and an external `claude --resume <id>` re-appends a
+        // history line for an archived session at any time. Filtering on the
+        // file's contents alone would let either case resurrect the session.
+        // See docs/delete-to-archive.md (trap #1).
+        if (archivedIds.size > 0) {
+          allEntriesFlat = allEntriesFlat.filter(
+            e => !e.sessionId || !archivedIds.has(e.sessionId)
+          );
+        }
+
         const existingIds = new Set(allEntriesFlat.map(e => e.sessionId).filter(Boolean));
 
         // Build a metadata lookup from archived sessions
@@ -110,6 +129,12 @@ export async function GET(req: NextRequest) {
         // Re-sort after merging
         allEntriesFlat.sort((a, b) => b.timestamp - a.timestamp);
       } catch (archiveErr) {
+        // Deliberately fails OPEN: on a DB error we serve the unfiltered
+        // history.jsonl list rather than blanking the sidebar. The cost is that
+        // an archived session whose history entry outlived the strip can
+        // reappear while the DB is unreachable — narrow, and self-correcting on
+        // the next successful read. Do not "fix" this by rethrowing or by
+        // returning empty: a dead DB must not cost the user their session list.
         console.error('[History] Failed to load archived sessions:', archiveErr);
       }
 

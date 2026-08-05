@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { sessionManager } from '@/lib/sessionManager';
+import { sdkSessionManager } from '@/lib/sdkSessionManager';
 
 export const runtime = 'nodejs';
 
@@ -21,22 +22,57 @@ export async function GET(req: NextRequest) {
   }
 
   const health = sessionManager.getSessionHealth(sessionId);
-  const buffer = sessionManager.getStreamBuffer(sessionId);
+  // A turn served by the persistent SDK manager isn't tracked by the CLI
+  // sessionManager, so fall back to its buffer. Without this the response is
+  // `hasBuffer:false` for every SDK session, and ChatTab skips the branch that
+  // strips the in-flight turn's partial assistant messages from the JSONL —
+  // rendering intermediary bubbles above the bouncing dots — and loses stream
+  // restore (text/events/timer) on switch-back.
+  const buffer = sessionManager.getStreamBuffer(sessionId) ?? sdkSessionManager.getStreamBuffer(sessionId);
+  // Likewise OR in its processing state — otherwise ChatTab's poll sees
+  // isProcessing:false and clears transcriptLoading (no dots, no stream).
+  const isProcessing = health.isProcessing || sdkSessionManager.isSessionProcessing(sessionId);
+  // In-flight background work (a dispatched subagent) keeps the dots on even when
+  // the main turn is idle — docs/ticket-live-badge-dark-during-background-subagent.md.
+  const backgroundActive = sdkSessionManager.isBackgroundActive(sessionId);
+
+  // A question the SDK session is parked on, awaiting this user. Server-held
+  // state is the ONLY source of a pending question on the SDK path — the JSONL
+  // replay that serves the CLI path can't answer one (it has no toolUseID), so
+  // without this a browser refresh strands the turn: Claude waits forever on a
+  // dialog that no longer exists on screen.
+  //
+  // Fetched independently of `buffer` and returned on BOTH branches on purpose.
+  // This response whitelists its fields, so anything not named here is dropped —
+  // and a pending question must survive even when the buffer is missing/expired.
+  const pendingAsk = sdkSessionManager.getPendingAsk(sessionId);
+
+  // Durable per-session MCP failures (B4). Returned on BOTH branches so the
+  // client restores the "failed to connect" banner on open / switch-back even
+  // when there's no active buffer — it survives turn resets and navigation, and
+  // an empty array clears it after a recovery.
+  const mcpFailed = sdkSessionManager.getMcpFailed(sessionId);
 
   if (!buffer) {
     return Response.json({
       hasBuffer: false,
-      isProcessing: health.isProcessing,
+      isProcessing,
+      backgroundActive,
+      pendingAsk,
+      mcpFailed,
     });
   }
 
   return Response.json({
     hasBuffer: true,
-    isProcessing: health.isProcessing,
+    isProcessing,
+    backgroundActive,
     userPrompt: buffer.userPrompt,
     accumulatedText: buffer.accumulatedText,
     events: buffer.events,
     isActive: buffer.isActive,
     startedAt: buffer.startedAt,
+    pendingAsk,
+    mcpFailed,
   });
 }

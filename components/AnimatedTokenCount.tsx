@@ -2,9 +2,14 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-// Total billed tokens → compact label. <1000 shown raw ("57 tokens"),
+// Cumulative billed tokens → compact label. <1000 shown raw ("57 tokens"),
 // thousands rounded ("194k tokens"), millions with one decimal below 10
 // ("3.4M tokens") or whole above ("31M tokens").
+//
+// Used by the Stats tab, where the cumulative framing is correct — cache reads
+// really are re-billed per call, so a session's lifetime spend is genuinely in
+// the millions. Do NOT use this for a session's context size (see formatContext):
+// the two differ by ~150x and callers strip the " tokens" suffix by regex.
 export function formatTokens(n: number): string {
   if (n >= 1_000_000) {
     const m = n / 1_000_000;
@@ -12,6 +17,20 @@ export function formatTokens(n: number): string {
   }
   if (n >= 1000) return `${Math.round(n / 1000)}k tokens`;
   return `${n} token${n === 1 ? '' : 's'}`;
+}
+
+// Current context occupancy → compact label ("194k context").
+//
+// The millions branch is a ceiling case, not the common one: context is bounded
+// by the model's window (~1M today), where the cumulative count above routinely
+// reaches tens of millions.
+export function formatContext(n: number): string {
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return `${m >= 10 ? Math.round(m) : m.toFixed(1)}M context`;
+  }
+  if (n >= 1000) return `${Math.round(n / 1000)}k context`;
+  return `${n} context`;
 }
 
 // Eases the displayed value toward `target` using exponential approach: each
@@ -57,7 +76,17 @@ function useAnimatedNumber(target: number): number {
   return display;
 }
 
-export default function AnimatedTokenCount({ value }: { value: number }) {
+/**
+ * Eased numeric readout. `format` picks the label — default is the cumulative
+ * "N tokens"; the session list passes formatContext for "N context".
+ */
+export default function AnimatedTokenCount({
+  value,
+  format = formatTokens,
+}: {
+  value: number;
+  format?: (n: number) => string;
+}) {
   const display = useAnimatedNumber(value);
-  return <>{formatTokens(Math.round(display))}</>;
+  return <>{format(Math.round(display))}</>;
 }

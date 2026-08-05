@@ -28,9 +28,12 @@ interface DirectoryPickerProps {
   onSelect: (path: string) => void;
   recentDirectories?: string[];
   initialPath?: string;
+  /** Label for the confirm button. Defaults to 'Select Directory'; the
+   *  new-session wizard passes 'Next →' since a model step follows. */
+  confirmLabel?: string;
 }
 
-export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectories = [], initialPath }: DirectoryPickerProps) {
+export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectories = [], initialPath, confirmLabel = 'Select Directory' }: DirectoryPickerProps) {
   const [currentPath, setCurrentPath] = useState<string>('');
   const [directories, setDirectories] = useState<Directory[]>([]);
   const [parentPath, setParentPath] = useState<string | null>(null);
@@ -115,7 +118,7 @@ export function DirectoryPicker({ open, onOpenChange, onSelect, recentDirectorie
       minHeight={400}
       buttons={[
         { label: 'Cancel', onClick: handleCancel, variant: 'outline' },
-        { label: 'Select Directory', onClick: handleSelect, disabled: !selectedPath },
+        { label: confirmLabel, onClick: handleSelect, disabled: !selectedPath },
       ]}
     >
       {/* Description */}

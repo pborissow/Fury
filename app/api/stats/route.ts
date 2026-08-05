@@ -57,6 +57,17 @@ interface SessionAgg {
   priced: boolean;
   messages: number;
   lastMs: number;
+  /** Largest main-thread prompt this session ever assembled. */
+  peakContext: number;
+  /** Prompt size of the session's most recent main-thread call. */
+  finalContext: number;
+  /** Timestamp backing finalContext (internal; not serialized). */
+  contextMs: number;
+  /** Model context window; 0 = unknown (never guess a denominator). */
+  contextWindow: number;
+  /** Times the session was auto-summarised. The strongest bloat signal we have:
+   *  it means the conversation hit the wall and detail was thrown away. */
+  numCompactions: number;
 }
 
 export async function GET(req: Request) {
@@ -65,10 +76,20 @@ export async function GET(req: Request) {
     const localDay = dayFormatter(tz);
     const db = await getDb();
     const res = await db.execute(`
-      SELECT u.session_id, u.model, u.ts, u.input, u.output, u.cache_write, u.cache_read,
+      SELECT u.session_id, u.model, u.ts, u.input, u.output,
+             u.cache_write, u.cache_write_5m, u.cache_write_1h, u.cache_read,
+             u.context_window, u.is_sidechain,
              s.project, s.display, s.metadata, s.message_count, s.created_at
       FROM usage_events u
-      JOIN sessions s ON s.session_id = u.session_id`);
+      JOIN sessions s ON s.session_id = u.session_id
+      -- finalContext takes the LAST main-thread row per session, so row order
+      -- must be defined rather than left to the query planner. rowid is
+      -- insertion order (= transcript line order), which breaks ts ties
+      -- deterministically. Ties are not hypothetical: the parser writes ts ''
+      -- when a JSONL entry has no timestamp, which Date.parse turns into NaN and
+      -- the reader falls back to created_at — identical for every event in the
+      -- session, collapsing them all to one ms.
+      ORDER BY u.session_id, u.ts, u.rowid`);
 
     // (day|model) -> per-type token totals + cost
     const daily = new Map<string, {
@@ -90,13 +111,20 @@ export async function GET(req: Request) {
       const cacheRead = Number(r.cache_read) || 0;
       const tokens = input + output + cacheWrite + cacheRead;
 
+      // Cache writes are priced by TTL (5m = 1.25x, 1h = 2x input). Rows written
+      // before the split migration have cache_write (total) but 0 in both split
+      // columns — attribute that legacy total to 1h (Claude Code's default TTL).
+      let cw5m = Number(r.cache_write_5m) || 0;
+      let cw1h = Number(r.cache_write_1h) || 0;
+      if (cw5m === 0 && cw1h === 0 && cacheWrite > 0) cw1h = cacheWrite;
+
       const tsMs = r.ts ? Date.parse(r.ts as string) : NaN;
       const ms = Number.isFinite(tsMs) ? tsMs : Number(r.created_at) || 0;
       const day = localDay(ms);
 
       // Price by the rate in effect on the event's day, so past sessions keep
       // their original cost when rates change going forward.
-      const { cost, priced } = costForUsage(rawModel, { input, output, cacheWrite, cacheRead }, day);
+      const { cost, priced } = costForUsage(rawModel, { input, output, cacheWrite5m: cw5m, cacheWrite1h: cw1h, cacheRead }, day);
       if (!priced) { unpricedEvents++; unpricedTokens += tokens; }
 
       const dk = day + '|' + model;
@@ -114,10 +142,16 @@ export async function GET(req: Request) {
       let s = sessions.get(sid);
       if (!s) {
         // Prefer the user-set session label (metadata.label) over the
-        // first-prompt snippet, matching the chat sidebar.
+        // first-prompt snippet, matching the chat sidebar. numCompactions comes
+        // from the same blob — parse once and reuse.
         let label: string | undefined;
+        let numCompactions = 0;
         if (r.metadata) {
-          try { label = JSON.parse(r.metadata as string)?.label || undefined; } catch { /* ignore */ }
+          try {
+            const m = JSON.parse(r.metadata as string);
+            label = m?.label || undefined;
+            numCompactions = Number(m?.numCompactions) || 0;
+          } catch { /* ignore */ }
         }
         s = {
           sessionId: sid,
@@ -129,6 +163,8 @@ export async function GET(req: Request) {
           cost: 0, priced: true,
           messages: Number(r.message_count) || 0,
           lastMs: 0,
+          peakContext: 0, finalContext: 0, contextMs: -1, contextWindow: 0,
+          numCompactions,
         };
         sessions.set(sid, s);
       }
@@ -137,6 +173,24 @@ export async function GET(req: Request) {
       if (!priced) s.priced = false;
       if (model !== 'unknown') s.models.add(model);
       if (ms > s.lastMs) s.lastMs = ms;
+
+      // Context occupancy at this call = its prompt size. Already stored per
+      // event, so peak/final need no new columns.
+      //
+      // Sidechains are EXCLUDED: a subagent runs its own fresh (much smaller)
+      // context under a possibly different model, so counting it would dent the
+      // curve and — since `final` is the latest event — could report a
+      // subagent's ~3k call as the session's ending context. Its tokens still
+      // count toward cost above; only the context view filters.
+      if (Number(r.is_sidechain) !== 1) {
+        const eventContext = input + cacheWrite + cacheRead;
+        if (eventContext > s.peakContext) s.peakContext = eventContext;
+        // Latest main-thread call wins — ts ties resolve to the last row read,
+        // which is insertion (line) order.
+        if (ms >= s.contextMs) { s.contextMs = ms; s.finalContext = eventContext; }
+        const win = Number(r.context_window) || 0;
+        if (win > s.contextWindow) s.contextWindow = win;
+      }
     }
 
     // Stable model ordering by total cost desc → fixed color slots on the client.
@@ -155,6 +209,25 @@ export async function GET(req: Request) {
       messages: s.messages,
       day: localDay(s.lastMs),
       lastMs: s.lastMs,
+      // Context view (main thread only — see the aggregation above).
+      peakContext: s.peakContext,
+      finalContext: s.finalContext,
+      // 0 = unknown denominator (session predates window capture) — the client
+      // renders the size but no fill %, rather than guessing.
+      contextWindow: s.contextWindow,
+      peakFill: s.contextWindow > 0 ? s.peakContext / s.contextWindow : 0,
+      numCompactions: s.numCompactions,
+      // Normalized efficiency. Raw cost/tokens only ever surface the LONGEST
+      // sessions — "I did a lot of work" — which is not the same question as
+      // "was that work efficient". Per-message divides that out, so a 20-message
+      // session that cost $12 outranks a 300-message one that cost $15.
+      // Serialized (not derived on the client) so the table can sort on it like
+      // any other column. messages can be 0 for a session whose history entry
+      // never landed; 0 sorts to the bottom rather than dividing by zero.
+      costPerMsg: s.messages > 0 ? s.cost / s.messages : 0,
+      tokensPerMsg: s.messages > 0
+        ? (s.input + s.output + s.cacheWrite + s.cacheRead) / s.messages
+        : 0,
     })).sort((a, b) => b.lastMs - a.lastMs);
 
     return NextResponse.json({

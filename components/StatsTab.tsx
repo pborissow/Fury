@@ -1,7 +1,18 @@
 'use client';
 
 /**
- * Stats tab — token & estimated-cost analytics over all archived sessions.
+ * Stats tab — usage, cost, and CONTEXT-EFFICIENCY analytics over all archived
+ * sessions.
+ *
+ * The tab answers two different questions and is laid out in that order:
+ *   1. "What did I spend?"  — volume: KPIs, daily bars, calendar, donuts.
+ *   2. "Was it efficient?"  — pressure: which sessions bloated, and how badly.
+ * (2) is the reason the tab exists: a session that carries a 600k context costs
+ * ~6x per message what the same work costs at 100k, and the only cure is to
+ * notice and start a new one. Volume alone can't show that — the biggest spender
+ * is usually just the longest session, which is "I did a lot of work", not a
+ * problem. Everything normalized (per-message, per-fill) exists to divide length
+ * back out so genuine inefficiency surfaces instead.
  *
  * Data comes from /api/stats (per-(day, model) rows + per-session rows, already
  * cost-priced and bucketed to the caller's local day — we pass the browser's
@@ -19,7 +30,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as echarts from 'echarts';
-import { RefreshCw, TriangleAlert } from 'lucide-react';
+import { RefreshCw, TriangleAlert, ShieldAlert, AlertTriangle } from 'lucide-react';
 import { formatTokens } from './AnimatedTokenCount';
 
 // ---- types (mirror /api/stats) ----
@@ -32,6 +43,12 @@ interface SessionRow {
   sessionId: string; project: string; projectName: string; display: string;
   models: string[]; input: number; output: number; cacheWrite: number; cacheRead: number;
   tokens: number; cost: number; priced: boolean; messages: number; day: string; lastMs: number;
+  /** Context view — main thread only (the API excludes sidechains). */
+  peakContext: number; finalContext: number;
+  /** 0 = unknown denominator; render size but never a guessed fill %. */
+  contextWindow: number; peakFill: number;
+  numCompactions: number;
+  costPerMsg: number; tokensPerMsg: number;
 }
 interface StatsData {
   timezone: string; pricingAsOf: string; generatedAt: number; today: string;
@@ -42,20 +59,53 @@ interface StatsData {
 type Measure = 'cost' | 'tokens';
 type Range = 'all' | 'mtd' | '7d' | '30d' | '90d';
 
+/** Context fill at which a session is "running hot" — calibrated on 173 real
+ *  sessions (median fill 28%; only 13% ever exceed 70%), the same breakpoint the
+ *  chat sidebar uses. Kept in sync deliberately: two different answers to "is
+ *  this session in trouble?" across two views would be worse than either. */
+const HOT_FILL = 0.7;
+
 // ---- theme (resolved from globals.css oklch tokens → hex for ECharts) ----
 // Categorical hues = dataviz validated reference palette (both modes selected).
+//
+// `cat` SLOT ORDER IS LOAD-BEARING, not cosmetic: it's the CVD-safety mechanism,
+// derived by maximizing the minimum adjacent ΔE. This is the palette's July-2026
+// order; the previous one (blue, aqua, yellow, green, violet, red, magenta,
+// orange) FAILED the normal-vision floor in both modes against our own surfaces —
+// light worst-adjacent orange↔magenta ΔE 12.9, dark worst-adjacent
+// magenta↔red ΔE 7.8, both under the 15 floor, i.e. adjacent stack segments that
+// full-color readers cannot tell apart. Re-validated against THIS app's chart
+// surface (bg-card: #ffffff / #171717, not the reference's):
+//   light  → ALL PASS (worst adjacent CVD ΔE 9.1, normal-vision 19.6)
+//   dark   → ALL PASS (worst adjacent CVD ΔE 8.4, normal-vision 19.3)
+// Re-run before touching:
+//   node scripts/validate_palette.js "<hexes>" --mode light --surface "#ffffff"
+//   node scripts/validate_palette.js "<hexes>" --mode dark  --surface "#171717"
+// Light carries a documented contrast WARN (magenta/yellow/aqua sit below 3:1 on
+// white) — discharged by the relief rule: every series is also named in a legend
+// and in the sessions table, so hue never carries meaning alone.
+//
+// `status` is the RESERVED status ramp — deliberately distinct steps so a status
+// color can never impersonate a series, and vice versa. Only ever used where the
+// color MEANS state (context pressure), always paired with an icon + label.
 const THEME = {
   dark: {
     fg: '#fafafa', muted: '#a1a1a1', card: '#171717', bg: '#0a0a0a',
     grid: '#2c2c2a', border: 'rgba(255,255,255,0.10)',
-    cat: ['#3987e5', '#199e70', '#c98500', '#008300', '#9085e9', '#e66767', '#d55181', '#d95926'],
+    cat: ['#3987e5', '#008300', '#d55181', '#c98500', '#199e70', '#d95926', '#9085e9', '#e66767'],
     heat: ['#233457', '#6aa8f5'], heatEmpty: '#1f1f1f',
+    status: { good: '#0ca30c', warning: '#fab219', serious: '#ec835a', critical: '#d03b3b' },
+    // Meter track: a lighter step of the same blue ramp, so state reads across
+    // the whole bar rather than only where it's filled.
+    track: '#233457',
   },
   light: {
     fg: '#0a0a0a', muted: '#737373', card: '#ffffff', bg: '#f5f5f5',
     grid: '#e5e5e5', border: 'rgba(10,10,10,0.10)',
-    cat: ['#2a78d6', '#1baf7a', '#eda100', '#008300', '#4a3aa7', '#e34948', '#e87ba4', '#eb6834'],
+    cat: ['#2a78d6', '#008300', '#e87ba4', '#eda100', '#1baf7a', '#eb6834', '#4a3aa7', '#e34948'],
     heat: ['#dbeafe', '#1e40af'], heatEmpty: '#efefef',
+    status: { good: '#0ca30c', warning: '#fab219', serious: '#ec835a', critical: '#d03b3b' },
+    track: '#cde2fb',
   },
 } as const;
 
@@ -65,10 +115,30 @@ function formatUsd(n: number): string {
   if (n >= 100) return '$' + n.toFixed(0);
   return '$' + n.toFixed(2);
 }
+/** Sub-dollar amounts, for per-message cost where $0.00 would erase the signal. */
+function formatUsdFine(n: number): string {
+  if (n >= 100) return '$' + Math.round(n).toLocaleString('en-US');
+  if (n >= 1) return '$' + n.toFixed(2);
+  if (n > 0 && n < 0.01) return '<$0.01';
+  return '$' + n.toFixed(3);
+}
 const fmt = (n: number, m: Measure) => (m === 'cost' ? formatUsd(n) : formatTokens(n));
-// KPI values: drop the "tokens" suffix (the card label already says what it is).
-const fmtShort = (n: number, m: Measure) => (m === 'cost' ? formatUsd(n) : formatTokens(n).replace(/ tokens?$/, ''));
+// Bare number — the axis tick / column header / card label already says the unit.
+// Uses the anchored regex so the singular "1 token" is stripped too (a plain
+// .replace(' tokens','') misses it and leaks the unit into the axis).
+const bare = (n: number) => formatTokens(n).replace(/ tokens?$/, '');
+const fmtShort = (n: number, m: Measure) => (m === 'cost' ? formatUsd(n) : bare(n));
 const modelLabel = (m: string) => (m === 'unknown' ? 'unknown' : m.replace(/^claude-/, ''));
+const pct = (f: number) => `${Math.round(f * 100)}%`;
+
+/** Context fill → reserved status color. Never a categorical slot: this color
+ *  MEANS state, and is always shipped alongside the numeric % (and an icon in
+ *  the table), so it never carries meaning alone. */
+function fillStatus(fill: number, t: typeof THEME.dark | typeof THEME.light): string {
+  if (fill >= 0.9) return t.status.critical;
+  if (fill >= HOT_FILL) return t.status.warning;
+  return t.cat[0];
+}
 
 /** The browser's IANA timezone, sent to the API so day buckets are truly local. */
 const BROWSER_TZ = (() => {
@@ -106,6 +176,53 @@ function StatTile({ label, value, sub, hero }: { label: string; value: string; s
   );
 }
 
+/**
+ * Meter — a single ratio against a limit (context used ÷ model window).
+ *
+ * The form heuristic's answer for exactly this data: not a bar chart, not a
+ * 2-slice pie. The unfilled track is a lighter step of the SAME blue ramp
+ * (never a neutral gray), so the bar reads as one object and state carries
+ * across its whole length. The fill takes the reserved status ramp once it's
+ * hot; the numeric % always renders beside it, so color is never the only
+ * channel.
+ *
+ * `window === 0` means the denominator is unknowable (session predates window
+ * capture) — we render the size with no track and no %, rather than inventing a
+ * denominator. That's why `fill` is not simply `used / (window || 200_000)`.
+ */
+function Meter({
+  fill, label, title, t,
+}: { fill: number | null; label: string; title?: string; t: typeof THEME.dark | typeof THEME.light }) {
+  // fill === null ⇒ denominator unknown. Render the value with NO track and no
+  // %, but keep the track's footprint as a spacer: this column is tabular-nums,
+  // and without the spacer an unmetered row's number drifts right (past where
+  // the metered numbers sit) and the column stops aligning. Reserving the space
+  // is also honest — it shows there's a bar missing, not that the bar is empty.
+  const clamped = fill === null ? 0 : Math.max(0, Math.min(1, fill));
+  return (
+    <div className="flex items-center gap-2 justify-end" title={title}>
+      <span className="tabular-nums text-muted-foreground w-[3.5rem] text-right">{label}</span>
+      {fill === null ? (
+        <div className="h-1.5 w-14 shrink-0" aria-hidden />
+      ) : (
+        <div
+          className="h-1.5 w-14 rounded-full overflow-hidden shrink-0"
+          style={{ background: t.track }}
+          role="meter"
+          aria-valuenow={Math.round(clamped * 100)}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <div
+            className="h-full rounded-full"
+            style={{ width: `${clamped * 100}%`, background: fillStatus(clamped, t) }}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---- segmented control ----
 function Segmented<T extends string>({ options, value, onChange }: {
   options: { value: T; label: string }[]; value: T; onChange: (v: T) => void;
@@ -125,16 +242,29 @@ function Segmented<T extends string>({ options, value, onChange }: {
   );
 }
 
-export default function StatsTab({ isActive }: { isActive: boolean }) {
+interface StatsTabProps {
+  isActive: boolean;
+  /** Open a session's transcript in the Chat tab. */
+  onOpenSession: (sessionId: string, project: string, display: string) => void;
+}
+
+export default function StatsTab({ isActive, onOpenSession }: StatsTabProps) {
   const [data, setData] = useState<StatsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Deliberately NOT persisted and NOT tied to a plan/billing mode: both
+  // framings are always reachable, and the KPI row shows spend AND tokens at
+  // once regardless of this toggle. `measure` only re-scales the charts — a
+  // single plot cannot carry dollars and tokens at once without a second y-axis,
+  // which is the one thing a chart must never do.
   const [measure, setMeasure] = useState<Measure>('cost');
   const [range, setRange] = useState<Range>('all');
   // Lazy-init from the live theme to avoid a one-frame flash for light-mode users.
   const [dark, setDark] = useState(() =>
     typeof document !== 'undefined' && document.documentElement.classList.contains('dark'));
   const [sort, setSort] = useState<{ key: keyof SessionRow; dir: 1 | -1 }>({ key: 'cost', dir: -1 });
+  // Narrow the table to sessions that ran hot or were compacted.
+  const [onlyFlagged, setOnlyFlagged] = useState(false);
   const wasActive = useRef(false);
 
   // Track theme (globals.css toggles `.dark` on <html>).
@@ -219,22 +349,47 @@ export default function StatsTab({ isActive }: { isActive: boolean }) {
   );
 
   // ---- KPIs ----
+  //
+  // NOTE — the "cache hit rate" tile that used to live here was removed, not
+  // moved. It computed cacheRead / (input + cacheWrite + cacheRead), which for
+  // Claude Code is a near-constant ~90%+ and, worse, reads BACKWARDS for this
+  // tab's purpose: a bloated session re-reads its giant carried context on every
+  // call, so cacheRead dominates and the "efficiency" number goes UP as the
+  // session gets worse. It rewarded exactly what we're trying to surface. The
+  // normalized per-message cost and the hot-session count below are the honest
+  // replacements: both go the right way.
   const kpi = useMemo(() => {
-    let tokens = 0, cost = 0, input = 0, cacheWrite = 0, cacheRead = 0;
+    let tokens = 0, cost = 0;
     const days = new Set<string>();
     for (const d of daily) {
       tokens += d.tokens; cost += d.cost;
-      input += d.input; cacheWrite += d.cacheWrite; cacheRead += d.cacheRead;
       days.add(d.day);
     }
-    const cacheDenom = input + cacheWrite + cacheRead;
+    // Per-message is computed over session TOTALS, not by averaging each
+    // session's own rate: a 2-message session at $0.90/msg would otherwise
+    // weigh as much as a 300-message one, and the mean would track outliers
+    // instead of reality.
+    let msgs = 0;
+    for (const s of sessions) msgs += s.messages;
+    // "Hot" = the session's peak main-thread prompt crossed HOT_FILL of its
+    // window. Only sessions with a KNOWN window can be judged (peakFill is 0
+    // when the API couldn't determine a denominator), so they're excluded from
+    // both numerator and denominator rather than silently counted as fine.
+    const judgeable = sessions.filter(s => s.contextWindow > 0);
+    const hot = judgeable.filter(s => s.peakFill >= HOT_FILL);
+    const compacted = sessions.filter(s => s.numCompactions > 0);
     return {
       tokens, cost,
       activeDays: days.size,
       perDay: days.size ? (measure === 'cost' ? cost : tokens) / days.size : 0,
       sessions: sessions.length,
       projects: new Set(sessions.map(s => s.projectName || '—')).size,
-      cacheHit: cacheDenom ? cacheRead / cacheDenom : 0,
+      messages: msgs,
+      costPerMsg: msgs ? cost / msgs : 0,
+      tokensPerMsg: msgs ? tokens / msgs : 0,
+      hot: hot.length,
+      judgeable: judgeable.length,
+      compacted: compacted.length,
     };
   }, [daily, sessions, measure]);
 
@@ -292,7 +447,7 @@ export default function StatsTab({ isActive }: { isActive: boolean }) {
         splitLine: { lineStyle: { color: t.grid } },
         axisLabel: {
           color: t.muted, fontSize: 10,
-          formatter: (v: number) => (measure === 'cost' ? formatUsd(v).replace('.00', '') : formatTokens(v).replace(' tokens', '')),
+          formatter: (v: number) => (measure === 'cost' ? formatUsd(v).replace('.00', '') : bare(v)),
         },
       },
       dataZoom: days.length > 45 ? [{ type: 'inside', throttle: 60 }] : undefined,
@@ -384,8 +539,18 @@ export default function StatsTab({ isActive }: { isActive: boolean }) {
   }, [sessions, donutOption, measure, t, projectColor]);
 
   // ---- sessions table ----
+  // Sessions worth acting on: hot (known fill ≥ HOT_FILL) or already compacted.
+  // Compaction is the strongest bloat evidence we have — it means the
+  // conversation actually hit the wall and detail was thrown away — and unlike
+  // fill it needs no window, so it covers the sessions fill can't judge.
+  // MUST be declared before sortedSessions, which reads it during render.
+  const flagged = useMemo(
+    () => sessions.filter(s => s.numCompactions > 0 || (s.contextWindow > 0 && s.peakFill >= HOT_FILL)),
+    [sessions],
+  );
+
   const sortedSessions = useMemo(() => {
-    const s = [...sessions];
+    const s = onlyFlagged ? [...flagged] : [...sessions];
     const { key, dir } = sort;
     s.sort((a, b) => {
       const av = a[key], bv = b[key];
@@ -393,7 +558,7 @@ export default function StatsTab({ isActive }: { isActive: boolean }) {
       return String(av).localeCompare(String(bv)) * dir;
     });
     return s;
-  }, [sessions, sort]);
+  }, [sessions, sort, onlyFlagged, flagged]);
 
   const toggleSort = (key: keyof SessionRow) =>
     setSort(prev => (prev.key === key ? { key, dir: (prev.dir * -1) as 1 | -1 } : { key, dir: -1 }));
@@ -447,13 +612,46 @@ export default function StatsTab({ isActive }: { isActive: boolean }) {
           <div className="p-10 text-center text-sm text-muted-foreground">{loading ? 'Loading…' : ''}</div>
         ) : (
           <>
-            {/* KPI tiles */}
+            {/* KPI tiles — both framings always present, so neither plan has to
+                read past a number that doesn't apply to it. Spend and tokens sit
+                side by side (tiles 1–2); the efficiency tile carries both rates
+                at once. Only the charts follow the $/Tokens toggle, because a
+                single plot can't carry two units without a second y-axis. */}
             <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
-              <StatTile hero label={measure === 'cost' ? 'Estimated spend' : 'Total tokens'} value={fmtShort(measure === 'cost' ? kpi.cost : kpi.tokens, measure)} sub={range === 'all' ? 'all time' : range.toUpperCase()} />
-              <StatTile label="Per active day" value={fmtShort(kpi.perDay, measure)} sub={`${kpi.activeDays} active day${kpi.activeDays === 1 ? '' : 's'}`} />
-              <StatTile label="Sessions" value={kpi.sessions.toLocaleString()} sub={`Across ${kpi.projects} project${kpi.projects === 1 ? '' : 's'}`} />
-              <StatTile label="Cache hit rate" value={`${Math.round(kpi.cacheHit * 100)}%`} sub="of input tokens" />
-              <StatTile label={measure === 'cost' ? 'Total tokens' : 'Estimated spend'} value={fmtShort(measure === 'cost' ? kpi.tokens : kpi.cost, measure === 'cost' ? 'tokens' : 'cost')} />
+              <StatTile
+                hero
+                label="Estimated spend"
+                value={formatUsd(kpi.cost)}
+                sub={range === 'all' ? 'all time' : range.toUpperCase()}
+              />
+              <StatTile
+                label="Total tokens"
+                value={bare(kpi.tokens)}
+                sub={`${fmtShort(kpi.perDay, measure)} per active day · ${kpi.activeDays} day${kpi.activeDays === 1 ? '' : 's'}`}
+              />
+              <StatTile
+                label="Sessions"
+                value={kpi.sessions.toLocaleString()}
+                sub={`Across ${kpi.projects} project${kpi.projects === 1 ? '' : 's'}`}
+              />
+              {/* Replaces the old "cache hit rate", which rose as sessions got
+                  WORSE (a bloated session re-reads its carried context every
+                  call, so cache reads dominate). Per-message divides session
+                  length back out, so this moves only when efficiency moves. */}
+              <StatTile
+                label="Per message"
+                value={formatUsdFine(kpi.costPerMsg)}
+                sub={`${bare(kpi.tokensPerMsg)} tokens · ${kpi.messages.toLocaleString()} msgs`}
+              />
+              <StatTile
+                label="Ran hot"
+                value={kpi.judgeable > 0 ? `${kpi.hot}` : '—'}
+                sub={
+                  kpi.judgeable > 0
+                    ? `of ${kpi.judgeable} measurable · ${kpi.compacted} compacted`
+                    : `window unknown · ${kpi.compacted} compacted`
+                }
+              />
             </div>
 
             {/* Daily stacked */}
@@ -480,16 +678,37 @@ export default function StatsTab({ isActive }: { isActive: boolean }) {
               </div>
             </div>
 
-            {/* Sessions table */}
+            {/* Sessions table — also the chart's table view, so every value the
+                charts encode in color is reachable as text (the light palette's
+                sub-3:1 hues depend on this for relief). */}
             <div className="rounded-lg border border-border bg-card overflow-hidden">
-              <div className="text-sm font-medium text-foreground p-3 pb-2">Sessions</div>
+              <div className="flex flex-wrap items-baseline justify-between gap-2 p-3 pb-2">
+                <div className="text-sm font-medium text-foreground">
+                  Sessions
+                  <span className="ml-2 text-xs font-normal text-muted-foreground">
+                    click a row to open it in Chat
+                  </span>
+                </div>
+                <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    className="accent-current"
+                    checked={onlyFlagged}
+                    onChange={e => setOnlyFlagged(e.target.checked)}
+                  />
+                  Only ran hot or compacted ({flagged.length})
+                </label>
+              </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-xs text-muted-foreground border-y border-border">
                       {([
                         ['day', 'Date', 'left'], ['projectName', 'Project', 'left'], ['display', 'Title', 'left'],
-                        ['messages', 'Msgs', 'right'], ['tokens', 'Tokens', 'right'], ['cost', 'Cost', 'right'],
+                        ['messages', 'Msgs', 'right'],
+                        ['peakContext', 'Peak context', 'right'],
+                        [measure === 'cost' ? 'costPerMsg' : 'tokensPerMsg', 'Per msg', 'right'],
+                        ['tokens', 'Tokens', 'right'], ['cost', 'Cost', 'right'],
                       ] as [keyof SessionRow, string, string][]).map(([key, label, align]) => (
                         <th
                           key={key}
@@ -502,23 +721,87 @@ export default function StatsTab({ isActive }: { isActive: boolean }) {
                     </tr>
                   </thead>
                   <tbody>
-                    {sortedSessions.map(s => (
-                      <tr key={s.sessionId} className="border-b border-border/50 hover:bg-muted/40">
-                        <td className="px-3 py-1.5 text-muted-foreground whitespace-nowrap tabular-nums">{s.day.slice(5)}</td>
-                        <td className="px-3 py-1.5 text-foreground whitespace-nowrap max-w-[160px] truncate" title={s.project}>{s.projectName}</td>
-                        <td className="px-3 py-1.5 text-muted-foreground max-w-[280px] truncate" title={s.display}>
-                          <span className="inline-flex items-center gap-1.5">
-                            {s.models.map(m => <span key={m} className="inline-block h-2 w-2 rounded-sm" style={{ background: modelColor[m] ?? t.muted }} title={modelLabel(m)} />)}
-                            {s.display}
-                          </span>
-                        </td>
-                        <td className="px-3 py-1.5 text-right text-muted-foreground tabular-nums">{s.messages}</td>
-                        <td className="px-3 py-1.5 text-right text-foreground tabular-nums">{formatTokens(s.tokens).replace(' tokens', '')}</td>
-                        <td className="px-3 py-1.5 text-right text-foreground tabular-nums">{s.priced ? formatUsd(s.cost) : '—'}</td>
-                      </tr>
-                    ))}
+                    {sortedSessions.map(s => {
+                      const hot = s.contextWindow > 0 && s.peakFill >= HOT_FILL;
+                      return (
+                        <tr
+                          key={s.sessionId}
+                          onClick={() => s.project && onOpenSession(s.sessionId, s.project, s.display)}
+                          className="border-b border-border/50 hover:bg-muted/40 cursor-pointer"
+                        >
+                          <td className="px-3 py-1.5 text-muted-foreground whitespace-nowrap tabular-nums">{s.day.slice(5)}</td>
+                          <td className="px-3 py-1.5 text-foreground whitespace-nowrap max-w-[160px] truncate" title={s.project}>{s.projectName}</td>
+                          <td className="px-3 py-1.5 text-muted-foreground max-w-[280px] truncate" title={s.display}>
+                            <span className="inline-flex items-center gap-1.5">
+                              {s.models.map(m => <span key={m} className="inline-block h-2 w-2 rounded-sm shrink-0" style={{ background: modelColor[m] ?? t.muted }} title={modelLabel(m)} />)}
+                              {/* Status icons ride the row, never color alone.
+                                  Rendered independently: a session can be both
+                                  compacted AND hot — the worst state — and a
+                                  ternary would drop the second signal. */}
+                              {s.numCompactions > 0 && (
+                                <span
+                                  className="shrink-0 inline-flex"
+                                  title={`Context was auto-summarised ${s.numCompactions}× — earlier detail may be lost`}
+                                >
+                                  <ShieldAlert
+                                    className="h-3 w-3"
+                                    style={{ color: t.status.serious }}
+                                    aria-label={`Auto-summarised ${s.numCompactions} times`}
+                                  />
+                                </span>
+                              )}
+                              {hot && (
+                                <span
+                                  className="shrink-0 inline-flex"
+                                  title={`Peaked at ${pct(s.peakFill)} of its context window`}
+                                >
+                                  <AlertTriangle
+                                    className="h-3 w-3"
+                                    style={{ color: fillStatus(s.peakFill, t) }}
+                                    aria-label={`Peaked at ${pct(s.peakFill)} of context window`}
+                                  />
+                                </span>
+                              )}
+                              <span className="truncate">{s.display}</span>
+                            </span>
+                          </td>
+                          <td className="px-3 py-1.5 text-right text-muted-foreground tabular-nums">{s.messages}</td>
+                          <td className="px-3 py-1.5 text-right whitespace-nowrap">
+                            {s.peakContext > 0 ? (
+                              // fill=null when the window is unknown ⇒ no
+                              // denominator ⇒ no track and no %. Never guess
+                              // one; Meter keeps the column aligned regardless.
+                              <Meter
+                                fill={s.contextWindow > 0 ? s.peakFill : null}
+                                label={bare(s.peakContext)}
+                                title={
+                                  s.contextWindow > 0
+                                    ? `${bare(s.peakContext)} of ${bare(s.contextWindow)} — ${pct(s.peakFill)} full at its peak`
+                                    : `${bare(s.peakContext)} peak — context window unknown for this session, so fill % can't be computed`
+                                }
+                                t={t}
+                              />
+                            ) : (
+                              <span className="text-muted-foreground">—</span>
+                            )}
+                          </td>
+                          <td className="px-3 py-1.5 text-right text-foreground tabular-nums">
+                            {measure === 'cost'
+                              ? (s.priced ? formatUsdFine(s.costPerMsg) : '—')
+                              : bare(Math.round(s.tokensPerMsg))}
+                          </td>
+                          <td className="px-3 py-1.5 text-right text-muted-foreground tabular-nums">{bare(s.tokens)}</td>
+                          <td className="px-3 py-1.5 text-right text-foreground tabular-nums">{s.priced ? formatUsd(s.cost) : '—'}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
+                {sortedSessions.length === 0 && (
+                  <div className="p-6 text-center text-xs text-muted-foreground">
+                    No sessions match this filter.
+                  </div>
+                )}
               </div>
             </div>
           </>

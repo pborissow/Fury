@@ -5,14 +5,23 @@ import { Plus, RotateCcw, Check, AlertTriangle, Terminal, Globe, ChevronRight, F
 import { Button } from '@/components/ui/button';
 import Dialog, { ConfirmDialog } from '@/components/Dialog';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
+import { isServerRuntimeFailed } from '@/lib/mcpRuntimeStatus';
 
 interface McpServer {
   name: string;
+  /** Identity the runtime reports failures under, when it differs from `name`
+   *  (the code-search row: displayed as "This Project…", runs as `codemogger`). */
+  runtimeName?: string;
   url: string;
   status: string;
   statusDetail: string;
   scope?: 'project' | 'user' | 'unknown';
   transport?: 'stdio' | 'http' | 'unknown';
+  /** Synthetic entry for in-process "This project" code search (not a real MCP
+   *  server). Rendered in the list but disabled/removed via /api/code-search. */
+  codeSearch?: boolean;
+  /** Indexed directories, for the code-search synthetic entry. */
+  dirs?: string[];
 }
 
 interface McpForm {
@@ -110,19 +119,40 @@ ${dirList}
 Call \`codemogger_index\` for each directory above if not yet indexed.
 
 **Search modes:**
-- \`keyword\` — for identifiers, class names, method names
-- \`semantic\` — for conceptual queries
+- \`keyword\` — for short identifiers, class names, method names.
+- \`semantic\` — for conceptual queries AND for long or \`snake_case\` names.
 
-Use \`includeSnippet=true\` to get full source in results.
-After modifying source files, ask the user before calling \`codemogger_reindex\`.
+Tip: a long \`snake_case\` name searched literally in \`keyword\` mode can return
+nothing (the index drops long underscored queries). For those, use \`semantic\`
+mode, or search a distinctive sub-word — e.g. \`platypus\` to find
+\`compute_purple_platypus_quotient\`.
+
+Use \`includeSnippet=true\` to get full source in results. The index auto-refreshes
+when project files change, so a manual \`codemogger_reindex\` is rarely needed.
 `;
 }
 
 interface McpPanelProps {
   projectPath?: string | null;
+  /** Servers that FAILED to connect at the active session's init (B4). The
+   *  server list is otherwise config-derived and decoupled from runtime, so a
+   *  crashed server (e.g. codemogger on first use) would show a healthy badge;
+   *  this overrides matching rows with a runtime "failed" indicator. */
+  runtimeFailed?: { name: string; status: string }[];
 }
 
-export default function McpPanel({ projectPath }: McpPanelProps) {
+export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) {
+  const runtimeFailedNames = useMemo(
+    () => new Set((runtimeFailed ?? []).map(s => s.name)),
+    [runtimeFailed],
+  );
+  // Whether a panel row failed to connect in the active session. Matched on the
+  // row's RUNTIME identity, not its display label — the synthetic code-search row
+  // is shown as "This Project (Local MCP)" but reports failures as `codemogger`
+  // (lib/mcpRuntimeStatus.ts). Matching by display name kept an embedder/onnx init
+  // failure showing a green "connected" check (P16).
+  const isServerFailed = (server: McpServer): boolean =>
+    isServerRuntimeFailed(server, runtimeFailedNames);
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [mcpLoading, setMcpLoading] = useState(false);
   const [mcpError, setMcpError] = useState<string | null>(null);
@@ -155,6 +185,15 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
       return r !== 0 ? r : a.name.localeCompare(b.name);
     });
   }, [mcpServers]);
+
+  // Code search is "already set up" for THIS project when the in-process code-search
+  // entry is present (the API injects a synthetic `codeSearch` server when
+  // `<project>/.codemogger/fury-codesearch.json` exists). When set, the Step-1 "This
+  // project" wizard card is disabled up-front.
+  const codeSearchConfigured = useMemo(
+    () => mcpServers.some(s => s.codeSearch),
+    [mcpServers],
+  );
 
   // Live updates: refetch when the backend cache changes for our projectPath
   useEffect(() => {
@@ -196,11 +235,19 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
     if (!deleteTarget) return;
     setDeleteLoading(true);
     try {
-      const res = await fetch('/api/mcp', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: deleteTarget.name, projectPath }),
-      });
+      // The synthetic code-search entry isn't a real MCP server — disabling it goes
+      // through /api/code-search (removes the config + closes the in-process engine).
+      const res = deleteTarget.codeSearch
+        ? await fetch('/api/code-search', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectPath }),
+          })
+        : await fetch('/api/mcp', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: deleteTarget.name, projectPath }),
+          });
       const data = await res.json();
       if (!res.ok || data.error) {
         setMcpError(data.error || 'Failed to remove server');
@@ -289,41 +336,32 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
         });
       }
 
-      // Code search: translate to stdio with codemogger command
+      // Code search: enable the IN-PROCESS engine for this project (no MCP server
+      // is registered — docs/ticket-codesearch-inprocess-mcp-macos-contention.md).
+      // The route writes `<project>/.codemogger/fury-codesearch.json`, gitignores
+      // `.codemogger/`, strips any legacy stdio codemogger entry, and kicks off the
+      // initial in-process index. Search then runs inside Fury's process, so there's
+      // no separate codemogger process contending on the DB.
       if (mcpForm.transport === 'codesearch') {
-        // Fetch homeDir to compute shared DB path
-        let homeDir = '';
-        try {
-          const dirRes = await fetch('/api/directories');
-          const dirData = await dirRes.json();
-          homeDir = dirData.homeDir || '';
-        } catch { /* fall through */ }
-
-        const dbPath = homeDir ? `${homeDir}/.codemogger/index.db` : '.codemogger/index.db';
-
-        const res = await fetch('/api/mcp', {
+        const res = await fetch('/api/code-search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            name: mcpForm.name,
-            transport: 'stdio',
-            commandOrUrl: 'codemogger',
-            args: `--db ${dbPath} mcp`,
-            envVars: '',
-            scope: mcpForm.scope,
             projectPath,
+            // The directories the user chose to index (scoped, not the whole project).
+            dirs: mcpForm.directories,
           }),
         });
         const data = await res.json();
         if (!res.ok || data.error) {
-          setMcpAddError(data.error || 'Failed to add server');
+          setMcpAddError(data.error || 'Failed to enable code search');
           return;
         }
 
         fetchMcpServers();
         setEditingServerName(null);
-        setAddedServers([{ name: mcpForm.name, url: `codemogger (${mcpForm.directories.length} dirs)` }]);
-        setInstructions(generateCodeSearchTemplate(mcpForm.name, mcpForm.directories));
+        setAddedServers([{ name: 'codemogger', url: `in-process code search (${mcpForm.directories.length} dirs)` }]);
+        setInstructions(generateCodeSearchTemplate('codemogger', mcpForm.directories));
         setWizardStep('instructions');
         return;
       }
@@ -412,7 +450,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
     type: 'Add MCP Server',
     details: editingServerName
       ? `Edit: ${editingServerName}`
-      : mcpForm.transport === 'codesearch' ? 'Code Search'
+      : mcpForm.transport === 'codesearch' ? 'Project MCP'
         : mcpForm.transport === 'stdio' ? 'Local Process' : 'Remote Server',
     instructions: 'Usage Instructions',
   }[wizardStep];
@@ -435,7 +473,7 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
         const isBatch = isHttp && httpServers.length > 1;
         const addableCount = isBatch ? newHttpServers.length : (isHttp ? httpServers.length : 1);
         const isValid = isCodeSearch
-          ? !!mcpForm.name && mcpForm.directories.length > 0
+          ? mcpForm.directories.length > 0
           : isHttp
             ? isBatch ? addableCount > 0 : (httpServers.length > 0 && !!mcpForm.name)
             : !!mcpForm.name && !!mcpForm.commandOrUrl;
@@ -502,23 +540,31 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
             {sortedMcpServers.map((server) => (
               <div key={server.name} className="group/mcp relative p-3 rounded-lg border border-border bg-muted/30">
                 <div className="absolute top-1.5 right-1.5 opacity-0 group-hover/mcp:opacity-100 transition-opacity flex items-center gap-0.5 z-10">
-                  <button
-                    className="cursor-pointer p-1 rounded hover:bg-yellow-500/20 text-muted-foreground hover:text-yellow-500"
-                    title="Edit server"
-                    onClick={() => handleEditServer(server)}
-                  >
-                    <Pencil className="h-3.5 w-3.5" />
-                  </button>
+                  {/* The in-process code-search entry has no stdio/http config to
+                      edit — only enable/disable, so hide Edit for it. */}
+                  {!server.codeSearch && (
+                    <button
+                      className="cursor-pointer p-1 rounded hover:bg-yellow-500/20 text-muted-foreground hover:text-yellow-500"
+                      title="Edit server"
+                      onClick={() => handleEditServer(server)}
+                    >
+                      <Pencil className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                   <button
                     className="cursor-pointer p-1 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
-                    title="Remove server"
+                    title={server.codeSearch ? 'Disable code search' : 'Remove server'}
                     onClick={() => setDeleteTarget(server)}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
                 </div>
                 <div className="flex items-center gap-2">
-                  {server.status === 'connected' ? (
+                  {isServerFailed(server) ? (
+                    <span title="Failed to connect in the active session — its tools are unavailable">
+                      <AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" />
+                    </span>
+                  ) : server.status === 'connected' ? (
                     <span title={server.statusDetail}><Check className="h-4 w-4 text-green-500 flex-shrink-0" /></span>
                   ) : server.status === 'needs_auth' ? (
                     <span title={server.statusDetail}><AlertTriangle className="h-4 w-4 text-yellow-500 flex-shrink-0" /></span>
@@ -535,7 +581,12 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
                   {server.url}
                 </div>
                 <div className="mt-1 ml-6 flex items-center gap-2 text-xs text-muted-foreground">
-                  {server.transport && server.transport !== 'unknown' && (
+                  {server.codeSearch ? (
+                    <span className="flex items-center gap-1" title="In-process code search (runs inside Fury, no separate process)">
+                      <FolderOpen className="h-3 w-3" />
+                      local
+                    </span>
+                  ) : server.transport && server.transport !== 'unknown' && (
                     <span className="flex items-center gap-1" title={server.transport === 'http' ? 'Remote server (HTTP)' : 'Local process (stdio)'}>
                       {server.transport === 'http'
                         ? <Globe className="h-3 w-3" />
@@ -573,17 +624,30 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
           <div className="space-y-3">
             <p className="text-sm text-muted-foreground">What type of MCP server do you want to add?</p>
             <button
-              onClick={() => handleSelectType('codesearch')}
-              className="w-full flex items-center gap-3 p-4 rounded-lg border border-border bg-muted/30 hover:bg-muted/60 hover:border-foreground/20 transition-colors text-left group"
+              data-testid="wizard-codesearch"
+              disabled={codeSearchConfigured}
+              title={codeSearchConfigured ? 'Code search is already set up for this project' : undefined}
+              onClick={() => { if (!codeSearchConfigured) handleSelectType('codesearch'); }}
+              className={`w-full flex items-center gap-3 p-4 rounded-lg border border-border bg-muted/30 transition-colors text-left group ${
+                codeSearchConfigured
+                  ? 'opacity-50 cursor-not-allowed'
+                  : 'hover:bg-muted/60 hover:border-foreground/20'
+              }`}
             >
               <div className="h-10 w-10 rounded-lg bg-orange-500/10 flex items-center justify-center flex-shrink-0">
                 <Search className="h-5 w-5 text-orange-400" />
               </div>
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-foreground">This project</div>
-                <div className="text-xs text-muted-foreground mt-0.5">Index and search your project code locally</div>
+                <div className="text-xs text-muted-foreground mt-0.5">
+                  {codeSearchConfigured
+                    ? 'Code search is already set up for this project'
+                    : 'Index and search your project code locally'}
+                </div>
               </div>
-              <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors flex-shrink-0" />
+              {!codeSearchConfigured && (
+                <ChevronRight className="h-4 w-4 text-muted-foreground group-hover:text-foreground transition-colors flex-shrink-0" />
+              )}
             </button>
             <button
               onClick={() => handleSelectType('stdio')}
@@ -617,16 +681,6 @@ export default function McpPanel({ projectPath }: McpPanelProps) {
         {/* Step 2: Code Search details */}
         {wizardStep === 'details' && mcpForm.transport === 'codesearch' && (
           <div className="space-y-4">
-            <div>
-              <label className="text-sm font-medium text-foreground block mb-1">Name</label>
-              <input
-                type="text"
-                value={mcpForm.name}
-                onChange={(e) => setMcpForm(f => ({ ...f, name: e.target.value }))}
-                placeholder="my-project"
-                className={inputClass}
-              />
-            </div>
             <div>
               <label className="text-sm font-medium text-foreground block mb-1">Directories to index</label>
               <div className="space-y-1.5">

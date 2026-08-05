@@ -75,6 +75,7 @@ export default function Home() {
   // App settings (persisted to server)
   const [promptSuggestionsEnabled, setPromptSuggestionsEnabled] = useState(true);
   const [ttsEnabled, setTtsEnabled] = useState(false);
+  const [sdkSessionsEnabled, setSdkSessionsEnabled] = useState(true);
   const [localhostOnly, setLocalhostOnly] = useState(true);
   const [hasCredentials, setHasCredentials] = useState(false);
   const [authUsername, setAuthUsername] = useState('');
@@ -100,6 +101,7 @@ export default function Home() {
     fetch('/api/settings').then(r => r.json()).then(s => {
       if (s.promptSuggestionsEnabled !== undefined) setPromptSuggestionsEnabled(s.promptSuggestionsEnabled);
       if (s.ttsEnabled !== undefined) setTtsEnabled(s.ttsEnabled);
+      if (s.sdkSessionsEnabled !== undefined) setSdkSessionsEnabled(s.sdkSessionsEnabled);
       if (s.localhostOnly !== undefined) setLocalhostOnly(s.localhostOnly);
       if (s.hasCredentials !== undefined) setHasCredentials(s.hasCredentials);
       if (s.authUsername) setAuthUsername(s.authUsername);
@@ -162,6 +164,28 @@ export default function Home() {
   // Persisted workflow ID (loaded from UI state, saved on change)
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
 
+  // Deep link from the Stats sessions table into a Chat transcript. Stats can
+  // find the expensive/bloated session but has no way to open it, so the
+  // request is lifted here (the only common ancestor) and handed to ChatTab.
+  // A monotonic `nonce` makes re-opening the SAME session re-fire the effect —
+  // without it, clicking the same row twice after navigating away would be a
+  // no-op, since the payload would be referentially identical.
+  const [sessionToOpen, setSessionToOpen] = useState<
+    { sessionId: string; project: string; display: string; nonce: number } | null
+  >(null);
+  const openSessionNonce = useRef(0);
+
+  const handleOpenSessionFromStats = useCallback(
+    (sessionId: string, project: string, display: string) => {
+      openSessionNonce.current += 1;
+      setSessionToOpen({ sessionId, project, display, nonce: openSessionNonce.current });
+      // Same render as the state set: ChatTab's SSE/effects are gated on
+      // isActive, so the tab must already be 'chat' when the open fires.
+      setActiveTab('chat');
+    },
+    [],
+  );
+
   // Panel layout state
   const [chatHorizontalLayout, setChatHorizontalLayout] = useState<number[]>([20, 45, 35]);
   const [chatVerticalLayout, setChatVerticalLayout] = useState<number[]>([70, 30]);
@@ -177,7 +201,11 @@ export default function Home() {
         if (res.ok) {
           const { state } = await res.json();
           if (state) {
-            if (state.activeTab) setActiveTab(state.activeTab);
+            // activeTab is deliberately NOT restored — Chat is always the
+            // startup tab. Restoring it stranded people on whatever they last
+            // opened (typically Stats), and because this restore lands after
+            // mount it silently overrode the 'chat' initial state a moment
+            // later, which is unpleasant to debug from the outside.
             if (state.activeWorkflowId) setActiveWorkflowId(state.activeWorkflowId);
             if (state.chatHorizontalLayout) setChatHorizontalLayout(state.chatHorizontalLayout);
             if (state.chatVerticalLayout) setChatVerticalLayout(state.chatVerticalLayout);
@@ -193,21 +221,23 @@ export default function Home() {
     loadUIState();
   }, []);
 
-  // Save UI state when activeTab or activeWorkflowId changes
+  // Save UI state when activeWorkflowId changes. activeTab is not persisted:
+  // startup is always Chat, so storing it would be a write nobody reads. This
+  // also stops a POST firing on every tab switch.
   useEffect(() => {
     const saveUIState = async () => {
       try {
         await fetch('/api/ui-state', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ activeTab, activeWorkflowId }),
+          body: JSON.stringify({ activeWorkflowId }),
         });
       } catch (error) {
         console.error('[App] Failed to save UI state:', error);
       }
     };
     saveUIState();
-  }, [activeTab, activeWorkflowId]);
+  }, [activeWorkflowId]);
 
   // Debounced save for panel layout changes
   const saveLayoutState = useCallback((updates: Record<string, number[]>) => {
@@ -363,6 +393,8 @@ export default function Home() {
                 isActive={activeTab === 'chat'}
                 promptSuggestionsEnabled={promptSuggestionsEnabled}
                 ttsEnabled={ttsEnabled}
+                sdkSessionsEnabled={sdkSessionsEnabled}
+                openSessionRequest={sessionToOpen}
               />
             </div>
           )}
@@ -389,7 +421,10 @@ export default function Home() {
               className="absolute inset-0"
               style={activeTab !== 'stats' ? { visibility: 'hidden', pointerEvents: 'none' } : undefined}
             >
-              <StatsTab isActive={activeTab === 'stats'} />
+              <StatsTab
+                isActive={activeTab === 'stats'}
+                onOpenSession={handleOpenSessionFromStats}
+              />
             </div>
           )}
         </div>

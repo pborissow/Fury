@@ -18,6 +18,27 @@ export interface SessionStreamEvent {
   toolUse?: { name: string; status: string; input?: any };
   toolResult?: { preview: string };
   error?: string;
+  /**
+   * The model is parked in canUseTool awaiting an answer to AskUserQuestion.
+   * Carries its OWN toolUseID: the `toolUse` event above deliberately does not
+   * include one, so this is the only channel that can correlate a rendered
+   * dialog back to the parked tool call that /api/claude-sdk/answer resolves.
+   * `cleared` fires when the question was settled by someone else (abort,
+   * another tab, teardown) so open dialogs can close themselves.
+   */
+  askUserQuestion?: { toolUseID: string; questions: any[] } | { cleared: true };
+  /**
+   * MCP servers that FAILED to connect at session `system:init` (status
+   * "failed" — the server crashed/couldn't start). Emitted once per init so the
+   * UI can surface "codemogger failed to connect" instead of the MCP panel's
+   * config-derived healthy badge. Deliberately excludes benign non-connected
+   * states (needs-auth / pending) — those are log-only, so an un-authed claude.ai
+   * connector doesn't raise a false "failed" on every session. An explicit EMPTY
+   * array is a CLEAR signal (a previously-failed server recovered) — the client
+   * retracts its banner. The authoritative set is also on /api/stream-buffer
+   * (`mcpFailed`) for restore-on-open. (B4 in the ticket.)
+   */
+  mcpServers?: { name: string; status: string }[];
 }
 
 export interface SessionHealthEvent {
@@ -26,6 +47,18 @@ export interface SessionHealthEvent {
   isProcessing: boolean;
   isStuck: boolean;
   stuckReason?: string;
+  /** The in-flight turn's start (ms) — the strip anchor. Present while
+   *  isProcessing is true (sourced from the stream buffer, the SAME value
+   *  /api/stream-buffer returns). The client's latch-break slices partials
+   *  at/after it instead of falling back to the trailing-assistant heuristic,
+   *  which over-strips when a mid-turn prompt was folded into a tool_result. */
+  startedAt?: number;
+  /** True while the session has in-flight BACKGROUND work (a dispatched subagent/
+   *  Bash still running) even though its main turn is idle. The client shows the
+   *  bouncing dots on `isProcessing || backgroundActive`, and the events route
+   *  counts it toward the Live badge — so an orchestrator stays live across the
+   *  whole background window, not just its own main turns. */
+  backgroundActive?: boolean;
 }
 
 export interface SessionModelEvent {
@@ -41,6 +74,15 @@ export interface SessionUsageEvent {
    *  far in the in-flight turn, summed per unique assistant message id. The
    *  client adds this to the archived baseline (metadata.totalTokens). */
   turnTokens: number;
+  /** Current context occupancy in tokens — the prompt size of the latest API
+   *  call (input + cache write + cache read). Unlike turnTokens this is an
+   *  absolute level, not an increment: the client renders it directly and must
+   *  NOT add it to a baseline. */
+  contextTokens: number;
+  /** The model's context window, from the SDK's result.modelUsage. 0 until the
+   *  first result message of the session arrives (the window isn't known before
+   *  then), in which case the client shows size without a fill %. */
+  contextWindow: number;
 }
 
 export interface TranscriptUpdatedEvent {

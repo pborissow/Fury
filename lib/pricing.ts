@@ -32,9 +32,18 @@ export interface ModelRates {
   input: number;
   /** $/Mtok, output. */
   output: number;
-  /** $/Mtok, cache write with 5-minute TTL (the Claude Code default). */
+  /**
+   * $/Mtok, cache write with 5-minute TTL (1.25x input).
+   *
+   * NOT what Claude Code writes at — this comment used to claim it was, and a
+   * caller believed it and under-quoted cache costs by 1.6x. Verified against
+   * usage_events: of 1,026 events carrying a TTL split, 1,026 are 1h and 0 are
+   * 5m. The db.ts migration agrees ("attribute a legacy total to 1h"). Price
+   * observed usage from the per-event split; don't assume a TTL.
+   */
   cacheWrite5m: number;
-  /** $/Mtok, cache write with 1-hour TTL. */
+  /** $/Mtok, cache write with 1-hour TTL (2x input). This is what Claude Code
+   *  writes at — see the note on cacheWrite5m. */
   cacheWrite1h: number;
   /** $/Mtok, cache read. */
   cacheRead: number;
@@ -84,6 +93,14 @@ export const PRICING: Record<string, RatePeriod[]> = {
   'claude-opus-4-1': [period('', 15, 75)],
   'claude-opus-4-0': [period('', 15, 75)],
   // Sonnet tier — $3 / $15
+  // P9: Sonnet-5 has a published introductory rate ($2/$10 through 2026-08-31) below
+  // this sticker ($3/$15). It is INTENTIONALLY left at sticker here and NOT hardcoded
+  // as an intro period: the pricing poller (lib/pricingPoller.ts) owns runtime rate
+  // updates, and it deliberately treats the intro-vs-standard rows as *ambiguous* and
+  // skips them rather than guess which applies to this account (parsePricingMarkdown).
+  // So this git-versioned constant stays the reviewed source of truth; if an account
+  // is billed at intro, a human reconciles a dated override into this list. Do not
+  // re-flag without confirming the account's actual billed rate.
   'claude-sonnet-5': [period('', 3, 15)],
   'claude-sonnet-4-6': [period('', 3, 15)],
   'claude-sonnet-4-5': [period('', 3, 15)],
@@ -96,6 +113,61 @@ export const PRICING: Record<string, RatePeriod[]> = {
   'claude-3-5-haiku': [period('', 0.8, 4)],
   'claude-3-haiku': [period('', 0.25, 1.25)],
 };
+
+/**
+ * Context window per model, in tokens, as published (see PRICING_AS_OF).
+ *
+ * This has to be a table: the SDK's ModelInfo carries no context window, and the
+ * CLI catalog only mentions it in prose ("Opus 4.8 with 1M context") — which
+ * Haiku's description ("Fastest for quick answers") omits entirely, i.e. it's
+ * missing precisely for the one model whose window differs.
+ *
+ * Deliberately PARTIAL: only models with a published figure are listed, and
+ * contextWindowFor() returns null for anything else. Callers must treat null as
+ * "unknown" and stay silent — a confidently wrong window warning is worse than
+ * no warning at all.
+ */
+export const CONTEXT_WINDOWS: Record<string, number> = {
+  'claude-fable-5': 1_000_000,
+  'claude-mythos-5': 1_000_000,
+  'claude-opus-4-8': 1_000_000,
+  'claude-opus-4-7': 1_000_000,
+  'claude-opus-4-6': 1_000_000,
+  'claude-sonnet-5': 1_000_000,
+  'claude-sonnet-4-6': 1_000_000,
+  // The odd one out — every current non-Haiku model is 1M.
+  'claude-haiku-4-5': 200_000,
+};
+
+/**
+ * Display order for model pickers: most capable first.
+ *
+ * Ranked by FAMILY, not by price. They happen to correlate today (fable $10 >
+ * opus $5 > sonnet $3 > haiku $1) so sorting on rate would produce the same
+ * list — but capability is what the ordering means, and the two would diverge
+ * the moment a cheap-but-capable model ships. Unknown families sort last and
+ * keep their relative catalog order (Array.sort is stable).
+ */
+const MODEL_FAMILY_ORDER = ['fable', 'mythos', 'opus', 'sonnet', 'haiku'];
+
+/** Rank for MODEL_FAMILY_ORDER; lower sorts first. Unknown families sort last. */
+export function modelTierRank(model: string | null | undefined): number {
+  const id = normalizeModelId((model ?? '').replace(/\[[^\]]*\]/g, ''));
+  const i = MODEL_FAMILY_ORDER.findIndex(family => id.includes(family));
+  return i === -1 ? MODEL_FAMILY_ORDER.length : i;
+}
+
+/**
+ * The context window for a model id, or null when we have no published figure.
+ *
+ * Strips the catalog's context-variant suffix ('claude-opus-4-8[1m]') first:
+ * normalizeModelId doesn't handle brackets because it only ever sees bare ids
+ * from the JSONL, but catalog ids carry them.
+ */
+export function contextWindowFor(model: string | null | undefined): number | null {
+  if (!model) return null;
+  return CONTEXT_WINDOWS[normalizeModelId(model.replace(/\[[^\]]*\]/g, ''))] ?? null;
+}
 
 /**
  * Normalize a raw model id from the transcript to a canonical PRICING key.
@@ -163,10 +235,34 @@ export function latestRate(model: string | null | undefined): ModelRates | null 
   return periods && periods.length ? periods[periods.length - 1] : null;
 }
 
+/**
+ * What it costs to re-process `tokens` of conversation on `model` after a model
+ * switch invalidates the prompt cache (caches are per-model, and a model change
+ * invalidates the tools, system AND messages tiers).
+ *
+ * Prices at the 1-HOUR write rate — 2x input, not the 5m rate's 1.25x. Claude
+ * Code writes at the 1h TTL: every one of the 1,026 TTL-split rows in
+ * usage_events is 1h, and pricing.test.ts already calls the 5m assumption "the
+ * bug". This lives here, not in the caller, so that choice is unit-testable
+ * instead of buried in a dialog.
+ *
+ * Returns null when the model has no published rate (e.g. a Bedrock `us.`-prefixed
+ * id — see normalizeModelId) so callers omit the claim rather than quote $0.
+ */
+export function cacheRewriteCost(model: string | null | undefined, tokens: number): number | null {
+  const r = latestRate(model);
+  if (!r || !(tokens > 0)) return null;
+  return (tokens / 1_000_000) * r.cacheWrite1h;
+}
+
 export interface TokenUsage {
   input: number;
   output: number;
-  cacheWrite: number;
+  /** Cache-creation tokens with 5-minute TTL (bill at 1.25x input). */
+  cacheWrite5m: number;
+  /** Cache-creation tokens with 1-hour TTL (bill at 2x input). Claude Code's
+   *  default cache TTL, so this is where most cache-write spend lands. */
+  cacheWrite1h: number;
   cacheRead: number;
 }
 
@@ -181,9 +277,11 @@ export interface CostBreakdown {
  * Estimate the USD cost of a usage record. When `atDate` (ET "YYYY-MM-DD") is
  * given, the event is priced at the rate in effect that day — so historical
  * cost is stable across price changes. Omit `atDate` to use the current rate.
- * Cache writes bill at the 5-minute rate (Claude Code's default cache TTL).
- * Unknown models yield `{ cost: 0, priced: false }` so callers can flag
- * unpriced spend rather than baking in a wrong number.
+ * Cache writes are billed by their actual TTL: 5-minute at 1.25x input, 1-hour
+ * at 2x. (Pricing all cache writes at the 5m rate underestimated ~36% on cache-
+ * heavy sessions, since Claude Code writes 1h cache — verified against the SDK's
+ * total_cost_usd.) Unknown models yield `{ cost: 0, priced: false }` so callers
+ * can flag unpriced spend rather than baking in a wrong number.
  */
 export function costForUsage(
   model: string | null | undefined,
@@ -195,7 +293,8 @@ export function costForUsage(
   const cost =
     (usage.input * r.input +
       usage.output * r.output +
-      usage.cacheWrite * r.cacheWrite5m +
+      usage.cacheWrite5m * r.cacheWrite5m +
+      usage.cacheWrite1h * r.cacheWrite1h +
       usage.cacheRead * r.cacheRead) /
     1_000_000;
   return { cost, priced: true };

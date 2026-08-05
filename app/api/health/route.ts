@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { sessionManager } from '@/lib/sessionManager';
+import { sdkSessionManager } from '@/lib/sdkSessionManager';
 
 export async function GET(request: NextRequest) {
   try {
@@ -13,10 +14,19 @@ export async function GET(request: NextRequest) {
     }
 
     const health = sessionManager.getSessionHealth(sessionId);
+    // Persistent SDK-manager turns aren't tracked by the CLI sessionManager;
+    // OR in its processing state so the UI's restore/poll paths see a live SDK
+    // session as processing (keeps the dots + stream alive).
+    const isProcessing = health.isProcessing || sdkSessionManager.isSessionProcessing(sessionId);
+    // In-flight background work keeps the session live (dots) even with an idle
+    // main turn — see docs/ticket-live-badge-dark-during-background-subagent.md.
+    const backgroundActive = sdkSessionManager.isBackgroundActive(sessionId);
 
     return NextResponse.json({
       sessionId,
-      ...health
+      ...health,
+      isProcessing,
+      backgroundActive,
     });
   } catch (error) {
     console.error('[Health Check API] Error:', error);

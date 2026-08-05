@@ -1,13 +1,13 @@
 'use client';
 
 import { useEffect, useLayoutEffect, useRef } from 'react';
-import { AlertTriangle, ShieldAlert, Pencil, Trash2 } from 'lucide-react';
+import { AlertTriangle, ShieldAlert, Pencil, Archive } from 'lucide-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import HistoryTimestamp from '@/components/HistoryTimestamp';
 import type { HistoryEntry, PendingSession } from '@/lib/types';
 import SmartPath from '@/components/SmartPath';
 import FreshnessLeaf from '@/components/FreshnessLeaf';
-import AnimatedTokenCount from '@/components/AnimatedTokenCount';
+import AnimatedTokenCount, { formatContext } from '@/components/AnimatedTokenCount';
 
 interface SessionSidebarProps {
   pendingNewSessions: PendingSession[];
@@ -16,10 +16,11 @@ interface SessionSidebarProps {
   /** Per-session epoch-ms of the last turn completion, used to anchor the
    *  prompt-cache freshness leaf. Falls back to the entry timestamp. */
   sessionActivity: Record<string, number>;
-  /** Per-session live cumulative output tokens (archived baseline + in-flight
-   *  turn). Overlays the archived metadata so the count climbs as Claude
-   *  streams. Keyed by sessionId; absent when no turn is in flight. */
-  liveTokens: Record<string, number>;
+  /** Per-session live context occupancy + window, overlaying the archived
+   *  metadata so the reading tracks as Claude streams. An absolute level, not
+   *  an increment. Keyed by sessionId; absent when no turn is in flight.
+   *  `window` is 0 until the turn's result reports it. */
+  liveContext: Record<string, { tokens: number; window: number }>;
   viewingTranscriptId: string | null;
   transcriptLoading: boolean;
   isLoadingHistory: boolean;
@@ -29,7 +30,7 @@ interface SessionSidebarProps {
   onSelectSession: (sessionId: string, project: string, display: string) => void;
   onRestorePending: (pending: PendingSession) => void;
   onLabelEdit: (sessionId: string, currentLabel: string) => void;
-  onDeleteConfirm: (entry: { sessionId: string; project: string; display: string; isLive: boolean }) => void;
+  onArchiveConfirm: (entry: { sessionId: string; project: string; display: string; isLive: boolean }) => void;
   onContextMenu: (e: React.MouseEvent, entry: HistoryEntry & { isLive: boolean }) => void;
 }
 
@@ -38,7 +39,7 @@ export default function SessionSidebar({
   history,
   liveSessionIds,
   sessionActivity,
-  liveTokens,
+  liveContext,
   viewingTranscriptId,
   transcriptLoading,
   isLoadingHistory,
@@ -48,7 +49,7 @@ export default function SessionSidebar({
   onSelectSession,
   onRestorePending,
   onLabelEdit,
-  onDeleteConfirm,
+  onArchiveConfirm,
   onContextMenu,
 }: SessionSidebarProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -117,16 +118,28 @@ export default function SessionSidebar({
         return history.map((entry, index) => {
           const isLive = !!entry.sessionId && liveSessionIds.has(entry.sessionId);
           const numCompactions = (entry.metadata?.numCompactions as number) || 0;
-          // Total billed tokens (input+output+cache) — the cost-driving count,
-          // matching the Stats tab. Falls back to the legacy output-only field
-          // until the usage_events migration has populated totalTokens (which
-          // requires a full server restart, not just HMR), so the count never
-          // blanks out. Overlay the live in-flight tally; max() avoids both a
-          // backward dip and double-counting once the archived baseline catches up.
-          const baselineTokens = (entry.metadata?.totalTokens
-            ?? entry.metadata?.totalOutputTokens ?? 0) as number;
-          const liveTok = entry.sessionId ? liveTokens[entry.sessionId] : undefined;
-          const displayTokens = Math.max(baselineTokens, liveTok ?? 0);
+          // How much of the model's context window this conversation currently
+          // occupies. NOT the old cumulative token count: summing usage across a
+          // session re-counts the carried context once per API call, which read
+          // ~150x larger than the conversation actually is (a 600k-context
+          // session showed "89.6M tokens"). This is the latest call's prompt
+          // size — the number "how big is this conversation" actually means.
+          //
+          // Live overlay wins outright when present: it's the same measurement
+          // taken more recently, not an increment to reconcile.
+          const live = entry.sessionId ? liveContext[entry.sessionId] : undefined;
+          const contextTokens = live?.tokens ?? ((entry.metadata?.contextTokens ?? 0) as number);
+          // The window is unknowable for sessions archived before it was
+          // captured (the JSONL records the model id without the [1m] marker),
+          // and the backfill only recovers it where a call provably exceeded
+          // 200k. 0 => render the size but no fill % — never guess a denominator.
+          const contextWindow = (live?.window || (entry.metadata?.contextWindow ?? 0)) as number;
+          const fill = contextWindow > 0 ? contextTokens / contextWindow : 0;
+          // Breakpoint from 173 real sessions: median fill is 28% and only 13%
+          // ever exceed 70%, so this stays quiet by default and fires on genuine
+          // outliers. (Decay and raw size were both tried and rejected — each
+          // flagged >60% of sessions.)
+          const contextHigh = fill >= 0.7;
           const isClickable = !!entry.sessionId && !!entry.project;
           const isViewing = viewingTranscriptId === entry.sessionId;
           return (
@@ -158,11 +171,11 @@ export default function SessionSidebar({
                     <Pencil className="h-3.5 w-3.5" />
                   </button>
                   <button
-                    className="cursor-pointer p-1 rounded hover:bg-destructive/20 text-muted-foreground hover:text-destructive"
-                    title="Delete session"
+                    className="cursor-pointer p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+                    title="Archive session"
                     onClick={(e) => {
                       e.stopPropagation();
-                      onDeleteConfirm({
+                      onArchiveConfirm({
                         sessionId: entry.sessionId!,
                         project: entry.project,
                         display: entry.display,
@@ -170,7 +183,7 @@ export default function SessionSidebar({
                       });
                     }}
                   >
-                    <Trash2 className="h-3.5 w-3.5" />
+                    <Archive className="h-3.5 w-3.5" />
                   </button>
                 </div>
               )}
@@ -214,17 +227,50 @@ export default function SessionSidebar({
                 <div className="mt-1 text-xs text-muted-foreground flex items-center gap-1">
                   <span>
                     {entry.messageCount} message{entry.messageCount !== 1 ? 's' : ''}
-                    {displayTokens > 0 && <>, <AnimatedTokenCount value={displayTokens} /></>}
+                    {contextTokens > 0 && (
+                      <>
+                        {', '}
+                        <AnimatedTokenCount value={contextTokens} format={formatContext} />
+                        {contextWindow > 0 && (
+                          <span className={contextHigh ? 'text-yellow-500' : undefined}>
+                            {' '}({Math.round(fill * 100)}%)
+                          </span>
+                        )}
+                      </>
+                    )}
                   </span>
-                  {numCompactions > 0 ? (
-                    <span title={`Context compacted ${numCompactions} time${numCompactions !== 1 ? 's' : ''} — consider starting a new session`}>
+                  {/* Two distinct failure modes, not two severities of one.
+                      Orange (compacted): detail was summarised away — a fidelity
+                      loss a restart avoids. Compaction already fixed the *cost*,
+                      so it isn't a "too expensive" warning; measured across 173
+                      sessions, compacted ones are 4x longer yet carry less
+                      context per unit of work than uncompacted ones.
+                      Yellow (>=70% full): approaching the wall — act now. */}
+                  {/* Rendered independently, not as a ternary chain: these are
+                      orthogonal failure modes and a session can be in both at
+                      once (already compacted AND back near the wall) — the worst
+                      state, where chaining would show only the shield and
+                      silently drop the "act now" signal. */}
+                  {numCompactions > 0 && (
+                    <span
+                      title={
+                        `Context was auto-summarised ${numCompactions} time${numCompactions !== 1 ? 's' : ''} — ` +
+                        `earlier detail may be lost. Start a new session if you need it.`
+                      }
+                    >
                       <ShieldAlert className="h-3 w-3 text-orange-500" />
                     </span>
-                  ) : entry.messageCount >= 50 ? (
-                    <span title="Long session">
+                  )}
+                  {contextHigh && (
+                    <span
+                      title={
+                        `Context ${Math.round(fill * 100)}% full — start a new session to avoid ` +
+                        `losing detail when it is auto-summarised.`
+                      }
+                    >
                       <AlertTriangle className="h-3 w-3 text-yellow-500" />
                     </span>
-                  ) : null}
+                  )}
                 </div>
               )}
               <SmartPath

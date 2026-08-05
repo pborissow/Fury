@@ -77,7 +77,7 @@ export default function StreamEventsPanel({
           );
           if (hasComplete) return null;
           return (
-            <div key={i} className="px-3 py-1.5 border-b border-border/50 flex items-center gap-2">
+            <div key={i} data-testid="stream-event" className="px-3 py-1.5 border-b border-border/50 flex items-center gap-2">
               {transcriptLoading ? (
                 <span className="text-yellow-500 animate-pulse">{'▶'}</span>
               ) : (
@@ -110,7 +110,7 @@ export default function StreamEventsPanel({
             detail = `/${input.pattern}/`;
           }
           return (
-            <div key={i} className="px-3 py-1.5 border-b border-border/50">
+            <div key={i} data-testid="stream-event" className="px-3 py-1.5 border-b border-border/50">
               <div className="flex items-center gap-2">
                 <span className="text-green-500">{'✓'}</span>
                 <span className="text-primary font-semibold">{evt.name}</span>

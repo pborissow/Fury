@@ -22,7 +22,7 @@ interface TranscriptRendererProps {
   transcriptOverlayMessages: { role: 'user' | 'assistant'; content: string }[];
   overlayInsertPoint: number | null;
   transcriptLoading: boolean;
-  onRewindConfirm: (info: { turnIndex: number; userMessage: string; fullMessage: string; timestamp: string }) => void;
+  onRewindConfirm: (info: { turnIndex: number; userMessage: string; fullMessage: string; timestamp: string; uuid?: string }) => void;
   onIntermediaryView: (messages: TranscriptMsg[]) => void;
   ttsEnabled?: boolean;
   ttsPlaying?: 'loading' | 'playing' | 'paused' | 'idle';
@@ -93,6 +93,7 @@ export default function TranscriptRenderer({
             <div className="flex justify-end items-center group/rewind">
               {i > 0 && !transcriptLoading && (
                 <button
+                  data-testid={`rewind-turn-${i}`}
                   onClick={() => onRewindConfirm({
                     turnIndex: i,
                     userMessage: turn.user!.content.length > 80
@@ -100,6 +101,7 @@ export default function TranscriptRenderer({
                       : turn.user!.content,
                     fullMessage: turn.user!.content,
                     timestamp: turn.user!.timestamp,
+                    uuid: turn.user!.uuid,
                   })}
                   className="opacity-0 group-hover/rewind:opacity-100 transition-opacity mr-2 p-1 rounded hover:bg-muted"
                   title="Rewind to before this message"
@@ -121,7 +123,7 @@ export default function TranscriptRenderer({
             </div>
           )}
           {turn.assistant && (
-            <div className="flex justify-start" ref={i === lastAssistantTurnIndex ? lastAssistantRef : undefined}>
+            <div className="flex justify-start" data-testid="claude-turn" ref={i === lastAssistantTurnIndex ? lastAssistantRef : undefined}>
               <ChatBubble
                 label="Claude"
                 className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border transition-colors"

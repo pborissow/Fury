@@ -23,6 +23,9 @@ export interface TranscriptMessage {
   content: string;
   timestamp: string;
   turnMeta?: TurnMeta;
+  /** JSONL entry uuid — surfaced for user messages so the UI can target a
+   *  turn for the SDK's native rewindFiles(messageUuid). */
+  uuid?: string;
 }
 
 /**
@@ -46,10 +49,26 @@ export interface UsageEvent {
   input: number;
   /** Generated output tokens (usage.output_tokens). */
   output: number;
-  /** Cache-creation input tokens (usage.cache_creation_input_tokens). */
+  /** Total cache-creation input tokens (5m + 1h). Kept for token counts. */
   cacheWrite: number;
+  /** 5-minute-TTL cache-creation tokens (cache_creation.ephemeral_5m_input_tokens). */
+  cacheWrite5m: number;
+  /** 1-hour-TTL cache-creation tokens (cache_creation.ephemeral_1h_input_tokens).
+   *  When the split object is absent (older transcripts) the flat
+   *  cache_creation_input_tokens total is attributed here — Claude Code writes
+   *  1h cache by default (verified against the SDK's total_cost_usd). */
+  cacheWrite1h: number;
   /** Cache-read input tokens (usage.cache_read_input_tokens). */
   cacheRead: number;
+  /** True when this call belongs to a subagent (JSONL `isSidechain`). Its tokens
+   *  are still billed — cost aggregation must keep them — but it runs its own
+   *  context with its own (possibly different) model, so anything reasoning
+   *  about the MAIN thread's context or window must exclude it. */
+  isSidechain: boolean;
+  /** The subagent id this event came from (the `agent-<id>.jsonl` sidecar), or
+   *  null/undefined for a main-thread event. Set by parseSubagentUsageEvents;
+   *  persisted to usage_events.agent_id for per-subagent cost drill-down. */
+  agentId?: string | null;
 }
 
 const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
@@ -99,16 +118,29 @@ export function parseTranscriptJsonl(content: string): {
    *  timestamp, deduped by message id. Feeds the Stats tab's cost analytics.
    *  See {@link UsageEvent}. */
   usageEvents: UsageEvent[];
+  /** Size of the conversation's CURRENT context window occupancy, in tokens:
+   *  the prompt size of the most recent main-thread assistant call
+   *  (input + cache write + cache read; output is not part of the next prompt).
+   *
+   *  This is deliberately NOT cumulative. Summing usage across a session counts
+   *  the same carried context once per API call — a 600k-context session over
+   *  200 calls totals ~90M, which is real for billing but ~150x what a user
+   *  means by "how big is this conversation". Sidechain (subagent) calls are
+   *  excluded: they run in their own throwaway context and never occupy the
+   *  main thread's window. 0 when no real assistant call was made. */
+  contextTokens: number;
 } {
   const messages: TranscriptMessage[] = [];
   const rawEntries: any[] = [];
   const rawLines = content.split('\n').filter(line => line.trim());
 
   let pendingAssistant: TranscriptMessage | null = null;
-  let inInternalExchange = false;
   let planSlug: string | null = null;
   let planWriteTimestamp: string | null = null;
   let numCompactions = 0;
+  // Prompt size of the most recent main-thread assistant call. See the
+  // contextTokens field doc on the return type.
+  let contextTokens = 0;
   // Output tokens per unique assistant message id. Streaming writes the same
   // API message's cumulative usage on multiple JSONL lines, so we key by id
   // (last value wins = the final usage for that message) and sum at the end.
@@ -161,26 +193,20 @@ export function parseTranscriptJsonl(content: string): {
       if (!msg) continue;
 
       if (entry.type === 'user') {
-        const isToolResult = Array.isArray(msg.content);
         const isInternalString = typeof msg.content === 'string' && isInternalContent(msg.content);
-        const isTaskNotification = typeof msg.content === 'string' &&
-          msg.content.trim().startsWith('<task-notification>');
 
-        if (isTaskNotification) {
-          inInternalExchange = true;
-          continue;
-        }
-
+        // Internal user strings — slash-command markers, system reminders, and
+        // the synthetic <task-notification> injected when a background task
+        // finishes — are hidden and must NOT act as a turn boundary. A
+        // task-notification is a mid-turn internal event, not a new prompt: the
+        // assistant's real reply to it flows through the pendingAssistant path
+        // below and renders as the turn's completion, exactly like any other
+        // assistant message. (Any synthetic stub it emits — e.g. "No response
+        // requested." — is dropped by provenance in the assistant branch.)
         if (isInternalString) continue;
 
         // Tool results are arrays (never displayed as user messages) but must
-        // still flow through so inInternalExchange gets cleared below.  The
-        // old `if (isToolResult && inInternalExchange) continue;` caused the
-        // flag to stick permanently after a <task-notification>, hiding every
-        // subsequent message for the rest of the transcript.
-
-        inInternalExchange = false;
-
+        // still flow through to flush the pending assistant turn below.
         if (pendingAssistant) {
           pendingAssistant.turnMeta = snapshotTurnMeta();
           messages.push(pendingAssistant);
@@ -204,6 +230,7 @@ export function parseTranscriptJsonl(content: string): {
             role: 'user',
             content: msg.content,
             timestamp: entry.timestamp,
+            uuid: entry.uuid,
           });
           // New turn starting — drop any tool counts accumulated during
           // the previous turn.
@@ -229,18 +256,47 @@ export function parseTranscriptJsonl(content: string): {
           if (id) {
             const u = msg.usage;
             const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
+            // Split cache writes by TTL for accurate pricing (5m = 1.25x input,
+            // 1h = 2x). The CLI emits the breakdown in cache_creation; older
+            // transcripts have only the flat cache_creation_input_tokens, which
+            // we attribute to 1h (Claude Code's default TTL).
+            const cc = u.cache_creation;
+            const hasSplit = cc && (typeof cc.ephemeral_5m_input_tokens === 'number' ||
+              typeof cc.ephemeral_1h_input_tokens === 'number');
+            const cwFlat = num(u.cache_creation_input_tokens);
+            const cw5m = hasSplit ? num(cc.ephemeral_5m_input_tokens) : 0;
+            const cw1h = hasSplit ? num(cc.ephemeral_1h_input_tokens) : cwFlat;
             usageByMsgId.set(id, {
               messageId: id,
               model: typeof msg.model === 'string' ? msg.model : null,
               timestamp: typeof entry.timestamp === 'string' ? entry.timestamp : '',
               input: num(u.input_tokens),
               output: num(u.output_tokens),
-              cacheWrite: num(u.cache_creation_input_tokens),
+              cacheWrite: hasSplit ? cw5m + cw1h : cwFlat,
+              cacheWrite5m: cw5m,
+              cacheWrite1h: cw1h,
               cacheRead: num(u.cache_read_input_tokens),
+              isSidechain: !!entry.isSidechain,
             });
+            // Current context occupancy = this call's prompt size. Last main-
+            // thread call wins, so after the loop this holds the live context.
+            // Sidechains (subagents) get their own context and are skipped.
+            if (!entry.isSidechain) {
+              contextTokens =
+                num(u.input_tokens) +
+                (hasSplit ? cw5m + cw1h : cwFlat) +
+                num(u.cache_read_input_tokens);
+            }
           }
         }
-        if (inInternalExchange) continue;
+        // Suppress by provenance, not by a post-notification window: only
+        // synthetic CLI-injected assistant messages (e.g. the "No response
+        // requested." stub emitted when a <task-notification> needs no reply,
+        // usage-limit notices, compaction stubs) are hidden. Real assistant
+        // text — including a terminal answer synthesized in reply to a
+        // task-notification — must render. (Belt-and-suspenders: the
+        // "No response requested." text guard below also catches the stub.)
+        if (msg.model === '<synthetic>') continue;
         if (!Array.isArray(msg.content)) continue;
 
         // Track the most recent real model id for this session — skipping
@@ -328,5 +384,5 @@ export function parseTranscriptJsonl(content: string): {
 
   const usageEvents = Array.from(usageByMsgId.values());
 
-  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion, currentModel, totalOutputTokens, usageEvents };
+  return { messages, rawLines, rawEntries, planSlug, planInsertAfter, numCompactions, pendingAskUserQuestion, currentModel, totalOutputTokens, usageEvents, contextTokens };
 }

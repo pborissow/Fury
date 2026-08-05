@@ -6,6 +6,12 @@ import remarkGfm from 'remark-gfm';
 import Dialog from '@/components/Dialog';
 import CopyableCodeBlock from '@/components/CopyableCodeBlock';
 import { Input } from '@/components/ui/input';
+import {
+  buildProseAnswer,
+  buildStructuredAnswers,
+  type AskQuestion,
+  type AskQuestionOption,
+} from '@/lib/askUserQuestion';
 
 const ExternalLink = ({ node: _node, ...props }: any) => (
   <a {...props} target="_blank" rel="noopener noreferrer" />
@@ -16,17 +22,8 @@ const assistantMarkdownComponents = {
   a: ExternalLink,
 };
 
-interface QuestionOption {
-  label: string;
-  description?: string;
-}
-
-interface Question {
-  question: string;
-  header?: string;
-  multiSelect: boolean;
-  options: QuestionOption[];
-}
+type QuestionOption = AskQuestionOption;
+type Question = AskQuestion;
 
 interface AskUserQuestionDialogProps {
   open: boolean;
@@ -35,7 +32,23 @@ interface AskUserQuestionDialogProps {
    *  of the dialog so the user can read the context Claude's question refers
    *  to without the modal obstructing the (unscrollable) chat panel. */
   context?: string;
+  /**
+   * The CLI path's callback: the answer as English prose, which the caller
+   * re-sends as a brand-new user turn (the CLI cannot answer the tool itself).
+   */
   onSubmit: (formattedAnswer: string) => void;
+  /**
+   * The SDK path's callback: the answer as the tool's own structured input,
+   * keyed by question text. When provided this WINS over onSubmit — the parked
+   * tool call is resolved in place and no new turn is sent.
+   *
+   * Both props exist because both backends ship simultaneously; the caller
+   * chooses by passing one or the other, not by a flag in here.
+   */
+  onSubmitStructured?: (result: {
+    answers: Record<string, string>;
+    annotations?: Record<string, { notes?: string }>;
+  }) => void;
   onSkip: () => void;
 }
 
@@ -44,6 +57,7 @@ export default function AskUserQuestionDialog({
   questions,
   context,
   onSubmit,
+  onSubmitStructured,
   onSkip,
 }: AskUserQuestionDialogProps) {
   // Per-question state: selected option indices
@@ -108,37 +122,20 @@ export default function AskUserQuestionDialog({
   });
 
   const handleSubmit = () => {
-    const parts: string[] = [];
+    // Both serializers read the same three Maps; only the output shape differs.
+    // They live in lib/askUserQuestion.ts so they're unit-testable (vitest runs
+    // node, not jsdom, so nothing in this file can be tested directly).
+    const state = { selections, useOther, otherText };
 
-    for (let i = 0; i < questions.length; i++) {
-      const q = questions[i];
-      const selected = selections.get(i) || new Set();
-      const isOther = useOther.get(i) || false;
-      const custom = (otherText.get(i) || '').trim();
-
-      const selectedLabels = Array.from(selected).map(idx => q.options[idx]?.label).filter(Boolean);
-      let answer = '';
-
-      if (isOther && custom) {
-        if (selectedLabels.length > 0) {
-          answer = `I choose: ${selectedLabels.join(', ')}. Additional input: ${custom}`;
-        } else {
-          answer = `My answer: ${custom}`;
-        }
-      } else if (selectedLabels.length > 0) {
-        answer = `I choose: ${selectedLabels.join(', ')}`;
-      }
-
-      if (answer) {
-        if (questions.length > 1 && q.header) {
-          parts.push(`For "${q.header}": ${answer}`);
-        } else {
-          parts.push(answer);
-        }
-      }
+    // Structured wins when the caller offers it: it resolves the parked tool
+    // call in place. Falling through to prose would ALSO send a new turn, and
+    // the model would get the answer twice.
+    if (onSubmitStructured) {
+      onSubmitStructured(buildStructuredAnswers(questions, state));
+      return;
     }
 
-    onSubmit(parts.join('\n'));
+    onSubmit(buildProseAnswer(questions, state));
   };
 
   return (

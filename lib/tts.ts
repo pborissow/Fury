@@ -1,5 +1,12 @@
-import { KokoroTTS, TextSplitterStream } from 'kokoro-js';
+// kokoro-js is loaded DYNAMICALLY (see loadKokoro below), never statically —
+// its transitive `phonemizer` dependency arms a fatal `uncaughtException`
+// handler the moment the module evaluates, and this file is reachable from
+// app/api/settings/route.ts, which every page load hits. A static import here
+// armed that handler on first page view, turning any aborted request into a
+// whole-server crash. docs/ticket-server-crash-on-aborted-request.md.
+import type { KokoroTTS } from 'kokoro-js';
 import Anthropic from '@anthropic-ai/sdk';
+import { importWithoutProcessHandlers } from './processGuards';
 import type { AppSettings } from '@/lib/settingsPersistence';
 import type { TurnMeta } from '@/lib/transcriptParser';
 
@@ -96,6 +103,20 @@ async function selectOllamaModel(host: string, port: string): Promise<string> {
 
 let ttsInstance: KokoroTTS | null = null;
 let ttsLoading: Promise<KokoroTTS> | null = null;
+let kokoroLoading: Promise<typeof import('kokoro-js')> | null = null;
+
+/**
+ * Import kokoro-js on first actual use, with the process-handler quarantine so
+ * phonemizer's rethrowing `uncaughtException` handler never survives the load.
+ * The promise is cached so concurrent callers share one (snapshot-safe) import.
+ */
+function loadKokoro(): Promise<typeof import('kokoro-js')> {
+  if (!kokoroLoading) {
+    kokoroLoading = importWithoutProcessHandlers('kokoro-js', () => import('kokoro-js'))
+      .catch(err => { kokoroLoading = null; throw err; });
+  }
+  return kokoroLoading;
+}
 
 export async function getTTS(): Promise<KokoroTTS> {
   if (ttsInstance) return ttsInstance;
@@ -103,7 +124,9 @@ export async function getTTS(): Promise<KokoroTTS> {
 
   let timer: ReturnType<typeof setTimeout>;
   ttsLoading = Promise.race([
-    KokoroTTS.from_pretrained(MODEL_ID, { dtype: 'q8', device: 'cpu' }),
+    // The module load is inside the race on purpose — a hung/failed import of
+    // the ~100MB transformers stack should surface as the same timeout.
+    loadKokoro().then(mod => mod.KokoroTTS.from_pretrained(MODEL_ID, { dtype: 'q8', device: 'cpu' })),
     new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error('TTS model loading timed out')), MODEL_LOAD_TIMEOUT_MS);
     }),
@@ -375,6 +398,7 @@ async function summarizeText(clean: string, settings: AppSettings, turnMeta?: Tu
 }
 
 async function generateLocalAudio(spoken: string, signal?: AbortSignal): Promise<Buffer> {
+  const { TextSplitterStream } = await loadKokoro();
   const tts = await getTTS();
   const genStart = Date.now();
   const chunks: Float32Array[] = [];
@@ -440,6 +464,8 @@ export async function generateSpeech(text: string, signal?: AbortSignal, setting
     bedrockSmallFastModel: '', bedrockAuthRefreshCmd: '',
     bedrockClaudeFailoverEnabled: false,
     pricingPollEnabled: true, pricingPollIntervalDays: 7,
+    modelCatalogPollEnabled: true, modelCatalogPollIntervalDays: 7,
+    sdkSessionsEnabled: true,
   };
   const s = settings || defaultSettings;
 
