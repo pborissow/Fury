@@ -171,7 +171,7 @@ export function parseModel(m: {
   // VERSION-first shape ('Claude 3.5 Sonnet' / 'claude-3-5-sonnet-20241022'). The
   // version-first id form is tried BEFORE the family-first one, otherwise
   // 'claude-3-5-sonnet-20241022' would capture the dated snapshot '20241022' as the
-  // version and the model would sort to the top of its family (F4).
+  // version and the model would sort to the top of its family.
   let family: string;
   let versionLabel: string;
   const nameMatch = displayName.match(FAMILY_RE);

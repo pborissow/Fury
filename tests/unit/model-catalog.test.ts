@@ -24,7 +24,7 @@ const API_SAMPLE = [
   { id: 'claude-opus-4-1-20250805', display_name: 'Claude Opus 4.1', created_at: '2025-08-05T00:00:00Z', max_input_tokens: 200_000, max_tokens: 32_000, capabilities: {} },
 ];
 
-describe('parseModel — legacy 3.x version-first shapes (F4)', () => {
+describe('parseModel — legacy 3.x version-first shapes', () => {
   it('parses a version-first display name ("Claude 3.5 Sonnet")', () => {
     const e = parseModel({ id: 'claude-3-5-sonnet-20241022', display_name: 'Claude 3.5 Sonnet', created_at: '2024-10-22T00:00:00Z' })!;
     expect(e).toMatchObject({ family: 'sonnet', versionLabel: '3.5', id: 'claude-3-5-sonnet-20241022' });
@@ -37,13 +37,13 @@ describe('parseModel — legacy 3.x version-first shapes (F4)', () => {
     const e = parseModel({ id: 'claude-3-opus-20240229', display_name: 'Claude 3 Opus' })!;
     expect(e).toMatchObject({ family: 'opus', versionLabel: '3' });
   });
-  it('does NOT capture the dated snapshot as the version (the F4 bug)', () => {
+  it('does NOT capture the dated snapshot as the version', () => {
     const e = parseModel({ id: 'claude-3-5-sonnet-20241022', display_name: 'Claude 3.5 Sonnet' })!;
     expect(e.versionLabel).not.toBe('20241022');
   });
 });
 
-describe('groupByFamily — legacy 3.x sorts BELOW current models (F4)', () => {
+describe('groupByFamily — legacy 3.x sorts BELOW current models', () => {
   it('places Sonnet 3.5 last in the family, below 5 / 4.6 / 4.5', () => {
     const sample = [
       { id: 'claude-sonnet-5', display_name: 'Claude Sonnet 5', created_at: '2026-06-29T00:00:00Z' },

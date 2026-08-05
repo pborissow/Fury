@@ -67,9 +67,9 @@ export async function DELETE(request: NextRequest) {
   //    and flips status to 'archived' — so Stats keeps counting it and the transcript
   //    has a durable copy. It returns whether a durable row now exists; step 3 unlinks
   //    the JSONL ONLY when it does, so a session with no prior DB row (deleted inside
-  //    the fire-and-forget startup-archive window) can never lose its only copy (F1).
+  //    the fire-and-forget startup-archive window) can never lose its only copy.
   //    Archiving-first also prevents a reactive re-archive from resurrecting it as
-  //    'active' (F1b), since a row now exists and the ON CONFLICT upsert never writes
+  //    'active', since a row now exists and the ON CONFLICT upsert never writes
   //    status. The 'archived' flag — not the file cleanup in steps 3/4 — is what hides
   //    the session (/api/history filters BOTH its history.jsonl list and its DB merge
   //    against it). See docs/delete-to-archive.md.

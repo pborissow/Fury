@@ -440,7 +440,7 @@ class SdkSessionManager {
       throw new Error('Claude is waiting for an answer to its question. Answer or dismiss it first.');
     }
 
-    // Re-entrancy guard (F3): reject a second send while a turn is already in flight.
+    // Re-entrancy guard: reject a second send while a turn is already in flight.
     // Both awaits below yield before startQuery, so without this a double-send
     // (double-click, retry, or first-send race) would replace s.streamBuffer and clear
     // s.usageByMsg mid-turn — discarding turn 1's stream buffer and token tally. Claim
@@ -1239,7 +1239,7 @@ class SdkSessionManager {
     // map (and is rehydrated across a singleton reload), so consult it too — otherwise
     // a warm process whose session entry is gone falls through to OS ancestry, which
     // can't prove ownership after a re-parent and wrongly reports Fury's own process
-    // as an external owner (spurious takeover dialog) (F12).
+    // as an external owner (spurious takeover dialog).
     if (this.spawnedProcs.get(pid) === sessionId) return true;
     return (await parentPidOf(pid)) === process.pid;
   }
@@ -1987,7 +1987,7 @@ class SdkSessionManager {
     // signal, so signal.aborted is the reliable "was this an intentional teardown?"
     // test. (The SDK's abort rejection is a plain Error 'Operation aborted', NOT a
     // named AbortError, so matching by name alone missed it and delete/shutdown got
-    // logged as a crash — F2.)
+    // logged as a crash.)
     const signal = s.abortController?.signal;
     try {
       for await (const msg of s.q!) {
@@ -2721,7 +2721,7 @@ class SdkSessionManager {
 //     not only at enable/migrate time (review follow-up). Without this bump a stale
 //     instance could let a surviving stdio entry spawn a 2nd DB writer.
 // 35: consume() captures the abort SIGNAL up front and uses signal.aborted to detect
-//     an intentional teardown (F2 pre-merge review). killSession/stop null
+//     an intentional teardown. killSession/stop null
 //     s.abortController before the for-await rejection lands, and the SDK's abort
 //     rejection is a plain Error 'Operation aborted' (not a named AbortError), so
 //     neither the nulled-controller signal check nor an err.name check caught it — a

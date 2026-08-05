@@ -1842,7 +1842,7 @@ export default function ChatTab({
         // A 409 with code 'no_pending' means the question really is already settled
         // (answered/superseded) — don't restore. But a 409 'sdk_disabled' means the
         // answer never landed and the turn is still parked, so restore the dialog so
-        // the user isn't stranded with a locked composer and no dialog (F6). Any other
+        // the user isn't stranded with a locked composer and no dialog. Any other
         // status also restores.
         if (res.status !== 409 || data.code === 'sdk_disabled') restore();
       }
@@ -2311,7 +2311,7 @@ export default function ChatTab({
       <AskUserQuestionDialog
         // Remount on question identity so an in-place question swap (server supersede
         // / applyPendingAskFromBuffer on reconnect) resets the selection state — else
-        // question Y renders with question X's stale pre-checked answers (F5).
+        // question Y renders with question X's stale pre-checked answers.
         key={askUserQuestion.toolUseID ?? 'cli'}
         open={true}
         questions={askUserQuestion.input.questions}

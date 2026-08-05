@@ -88,7 +88,7 @@ export async function isCurrentlyArchived(
  * UPSERTs the session, then deletes + re-inserts all messages and raw lines, handling
  * both new sessions and updates (a session that grew or was rewound).
  *
- * NOT a single transaction across the whole write (F9): the preamble + first 500 rows
+ * NOT a single transaction across the whole write: the preamble + first 500 rows
  * commit in one db.batch, and each additional 500-row chunk commits separately, so a
  * concurrent reader between chunks (loadTranscript / restoreJsonlFromArchive) can see a
  * truncated prefix. It self-heals — the content hash is stamped only on the FINAL chunk,
@@ -748,11 +748,11 @@ async function sessionRowExists(sessionId: string): Promise<boolean> {
  * The delete route MUST NOT unlink the JSONL unless this returns true — otherwise a
  * session with no prior DB row (deleted inside the fire-and-forget startup-archive
  * window, db.ts, or a history entry that never archived) loses its ONLY copy, and its
- * usage vanishes from Stats even though the confirm dialog promised otherwise (F1).
+ * usage vanishes from Stats even though the confirm dialog promised otherwise.
  *
  * Because a row now exists with status 'archived' when we return true, a reactive
  * re-archive racing the delete can only UPDATE (the ON CONFLICT upsert never writes
- * `status`), so it can't resurrect the session as 'active' (F1b). The status flip runs
+ * `status`), so it can't resurrect the session as 'active'. The status flip runs
  * under the per-session meta lock so it serializes with those reactive archives.
  * archiveSessionFromDisk is called OUTSIDE the lock because it acquires the lock
  * itself (via archiveTranscript) — nesting would deadlock.

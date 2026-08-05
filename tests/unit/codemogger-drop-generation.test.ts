@@ -1,5 +1,5 @@
 /**
- * F10 — a drop (code search disabled / DELETE) that lands mid-reindex must stop the
+ * A drop (code search disabled / DELETE) that lands mid-reindex must stop the
  * reindex loop, and must never let it re-open a CodeIndex into the just-disabled
  * project's DB.
  *
@@ -82,7 +82,7 @@ afterEach(async () => {
   for (const d of tmpDirs.splice(0)) await rm(d, { recursive: true, force: true });
 });
 
-describe('drop mid-reindex (F10)', () => {
+describe('drop mid-reindex', () => {
   it('a DEFERRED drop still stops the loop (hole 1 + hole 2)', async () => {
     const { path, db } = await project();
 

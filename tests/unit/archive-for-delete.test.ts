@@ -1,5 +1,5 @@
 /**
- * F1 (docs/ticket-sdk-pivot-premerge-review.md): the delete route must ARCHIVE a
+ * The delete route must ARCHIVE a
  * session to SQLite before it unlinks the JSONL, so a session with no prior DB row
  * (deleted inside the fire-and-forget startup-archive window) doesn't lose its only
  * copy. `archiveForDelete` is that guard: it persists the row + usage from disk and
@@ -49,7 +49,7 @@ async function statusOf(sessionId: string): Promise<string | null> {
   return r.rows.length ? (r.rows[0].status as string) : null;
 }
 
-describe('archiveForDelete (F1: archive before unlink)', () => {
+describe('archiveForDelete (archive before unlink)', () => {
   afterAll(async () => {
     try { const { getDb } = await import('../../lib/db'); (await getDb()).close(); } catch { /* ignore */ }
     try { rmSync(TEMP_HOME, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -62,7 +62,7 @@ describe('archiveForDelete (F1: archive before unlink)', () => {
 
     expect(await statusOf(SID), 'no row before').toBeNull();
 
-    // The core F1 fix: even with no prior row, archiving from disk creates one.
+    // The core fix: even with no prior row, archiving from disk creates one.
     const durable = await archiveForDelete(SID, PROJECT);
     expect(durable, 'a durable copy now exists → route may unlink').toBe(true);
     expect(await statusOf(SID), 'flipped to archived').toBe('archived');
@@ -95,7 +95,7 @@ describe('archiveForDelete (F1: archive before unlink)', () => {
     expect(await statusOf(SID)).toBe('archived');
   });
 
-  it('F1b: a reactive re-archive after delete does NOT resurrect it as active', async () => {
+  it('a reactive re-archive after delete does NOT resurrect it as active', async () => {
     const SID = 'no-resurrect';
     const lines = convo();
     await writeJsonl(SID, lines);

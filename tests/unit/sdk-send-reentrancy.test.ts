@@ -1,5 +1,5 @@
 /**
- * F3 (docs/ticket-sdk-pivot-premerge-review.md): sendMessage must not start a second
+ * sendMessage must not start a second
  * turn while one is in flight. Before the guard, a double-send (double-click / retry)
  * replaced s.streamBuffer and cleared s.usageByMsg mid-turn, silently losing turn 1's
  * stream buffer and token tally. White-box test: seed a session as "turn 1 in flight"
@@ -8,7 +8,7 @@
 import { describe, it, expect } from 'vitest';
 import { sdkSessionManager } from '../../lib/sdkSessionManager';
 
-describe('sendMessage re-entrancy guard (F3)', () => {
+describe('sendMessage re-entrancy guard', () => {
   it('rejects a second send while a turn is in flight, without clobbering turn 1', async () => {
     const mgr = sdkSessionManager as unknown as {
       getOrCreate(id: string): {

@@ -62,7 +62,7 @@ export async function POST(req: NextRequest) {
       return Response.json({ error: 'toolUseID is required' }, { status: 400 });
     }
     if (!(await sdkEnabled())) {
-      // Distinct from the "no pending question" 409 below (F6): here the answer never
+      // Distinct from the "no pending question" 409 below: here the answer never
       // had a chance to land, so the client must RESTORE the dialog rather than treat
       // it as settled and strand the parked turn.
       return Response.json(

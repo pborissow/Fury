@@ -112,7 +112,7 @@ export async function approveProjectServer(
         const enabled = projects[key].enabledMcpjsonServers || [];
         const disabled = projects[key].disabledMcpjsonServers || [];
         // Idempotent no-op: already enabled and not on the disabled list → nothing to
-        // change. Return without rewriting the large, hot ~/.claude.json (F13).
+        // change. Return without rewriting the large, hot ~/.claude.json.
         if (enabled.includes(serverName) && !disabled.includes(serverName)) return true;
         if (!enabled.includes(serverName)) enabled.push(serverName);
         projects[key].enabledMcpjsonServers = enabled;

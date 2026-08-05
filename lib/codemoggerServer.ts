@@ -81,7 +81,7 @@ const usage = new Map<string, Usage>();
 // disabled for this project — stop". It is checked twice: between directories (a cheap
 // fast path) and again inside withEngine under the per-project lock (authoritative).
 // Without it, a DELETE/disable landing mid-reindex would keep indexing into the
-// now-disabled project, and could re-open a CodeIndex against its orphaned DB (F10).
+// now-disabled project, and could re-open a CodeIndex against its orphaned DB.
 const generations = new Map<string, number>();
 const norm = (p: string) => p.replace(/\\/g, '/');
 
@@ -115,7 +115,7 @@ export class ProjectDroppedError extends Error {
  * directories, but that check is only safe because nothing awaits between it and this
  * call — an invariant a future refactor could quietly break, after which a drop that
  * interleaved would re-open a CodeIndex into the just-disabled project's DB. Checking
- * under the lock does not depend on that invariant (F10).
+ * under the lock does not depend on that invariant.
  */
 function withEngine<T>(
   key: string,
@@ -252,7 +252,7 @@ export async function reindexProject(projectPath: string, dbPath: string, dirs: 
   for (const dir of dirs) {
     // Bail if the project was dropped (code search disabled) between directories —
     // else the withEngine below would re-open a CodeIndex for a now-disabled project
-    // and index into its orphaned DB, leaving a handle until idle eviction (F10).
+    // and index into its orphaned DB, leaving a handle until idle eviction.
     // Fast path: skip even enqueueing onto the lock chain. withEngine re-tests the
     // same generation under the lock, which is the authoritative check.
     if ((generations.get(key) ?? 0) !== startGen) {
@@ -308,7 +308,7 @@ export async function dropProject(projectPath: string): Promise<void> {
   const key = norm(projectPath);
   await withLock(key, async () => {
     // Signal any in-flight reindex loop that this project was dropped, so it aborts
-    // instead of indexing further directories into a now-disabled project (F10).
+    // instead of indexing further directories into a now-disabled project.
     //
     // Bumped BEFORE the deferral check below, and unconditionally: the generation's
     // job is to tell the reindex loop to stop, which is true regardless of whether

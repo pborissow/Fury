@@ -47,7 +47,7 @@ export function familyVersionFromId(id: string): { family: string; version: stri
   const s = stripCtx(id);
   // Legacy 3.x ids are VERSION-first ('claude-3-5-sonnet-20241022'). Match that shape
   // FIRST — otherwise the family-first pattern below captures the dated snapshot
-  // ('20241022') as the version and the model sorts to the top of its family (F4).
+  // ('20241022') as the version and the model sorts to the top of its family.
   const vf = s.match(/(\d+)(?:-(\d+))?-(fable|mythos|opus|sonnet|haiku)/i);
   if (vf) return { family: vf[3].toLowerCase(), version: vf[2] ? `${vf[1]}.${vf[2]}` : vf[1] };
   const m = s.match(/(fable|mythos|opus|sonnet|haiku)-(\d+)(?:-(\d+))?/i);

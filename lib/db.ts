@@ -525,7 +525,7 @@ async function initDb(client: Client): Promise<void> {
         await client.execute({
           // is_sidechain = 0: subagent rows are written with context_window = 0 on
           // purpose (they don't have the main thread's window); don't backfill them
-          // with the inferred main-thread window (F8).
+          // with the inferred main-thread window.
           sql: 'UPDATE usage_events SET context_window = ? WHERE session_id = ? AND context_window = 0 AND is_sidechain = 0',
           args: [inferredWindow, sid],
         });
