@@ -131,13 +131,24 @@ export default function Dialog({
       setMaximized(false);
     } else {
       restoreRef.current = { size, position };
-      const maxW = typeof window !== 'undefined' ? window.innerWidth : size.width;
-      const maxH = typeof window !== 'undefined' ? window.innerHeight : size.height;
+      // Maximize fills the ANCHOR, not the viewport. When contained, the dialog
+      // is centered inside portalContainer (a single panel), so sizing to
+      // window.innerWidth/Height overflows it — and `max-height: 100%` can't
+      // claw it back, because a percentage max-height against the absolutely-
+      // positioned, auto-height Radix Content resolves to `none`. Measure the
+      // container instead; centered at its 50%/50% with this size, the card
+      // fills it exactly.
+      const maxW = contained && portalContainer
+        ? portalContainer.clientWidth
+        : (typeof window !== 'undefined' ? window.innerWidth : size.width);
+      const maxH = contained && portalContainer
+        ? portalContainer.clientHeight
+        : (typeof window !== 'undefined' ? window.innerHeight : size.height);
       setSize({ width: maxW, height: maxH });
       setPosition({ x: 0, y: 0 });
       setMaximized(true);
     }
-  }, [maximizable, maximized, size, position]);
+  }, [maximizable, maximized, size, position, contained, portalContainer]);
 
   const handleDragStart = useCallback((e: React.PointerEvent) => {
     // A maximized window fills the viewport and isn't draggable.
@@ -206,12 +217,17 @@ export default function Dialog({
     if (dir.includes('s')) newH = startH + dy;
     else if (dir.includes('n')) newH = startH - dy;
 
-    // Clamp both ends. The maximum mirrors the CSS max-w/h on the panel
-    // (95vw/95vh) so the underlying size state can't drift past what's
-    // actually rendered — otherwise dragging beyond the viewport
-    // accumulates "phantom" size that pops on the next resize.
-    const maxW = typeof window !== 'undefined' ? window.innerWidth * 0.95 : Infinity;
-    const maxH = typeof window !== 'undefined' ? window.innerHeight * 0.95 : Infinity;
+    // Clamp both ends. The maximum mirrors what's actually renderable so the
+    // underlying size state can't drift past it — otherwise dragging beyond the
+    // bound accumulates "phantom" size that pops on the next resize. When
+    // contained the bound is the anchor panel (its `max-height: 100%` can't
+    // clamp height — see handleHeaderDoubleClick); otherwise it's 95vw/95vh.
+    const maxW = contained && portalContainer
+      ? portalContainer.clientWidth
+      : (typeof window !== 'undefined' ? window.innerWidth * 0.95 : Infinity);
+    const maxH = contained && portalContainer
+      ? portalContainer.clientHeight
+      : (typeof window !== 'undefined' ? window.innerHeight * 0.95 : Infinity);
     newW = Math.min(maxW, Math.max(minWidth, newW));
     newH = Math.min(maxH, Math.max(minHeight, newH));
 
@@ -226,7 +242,7 @@ export default function Dialog({
 
     setSize({ width: newW, height: newH });
     setPosition({ x: newX, y: newY });
-  }, [minWidth, minHeight]);
+  }, [minWidth, minHeight, contained, portalContainer]);
 
   const handleResizeEnd = useCallback(() => {
     if (resizeRef.current) {

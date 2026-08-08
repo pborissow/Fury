@@ -2,6 +2,7 @@
 
 import React, { useState } from 'react';
 import Dialog from '@/components/Dialog';
+import PricingDialog from '@/components/PricingDialog';
 import { norm, type UseModelCatalog } from '@/components/useModelCatalog';
 
 /** Local calendar day (YYYY-MM-DD) for the "Index updated" label. */
@@ -48,6 +49,7 @@ export default function ModelFamilyRows({
   } = catalog;
 
   const [refreshOpen, setRefreshOpen] = useState(false);
+  const [pricingOpen, setPricingOpen] = useState(false);
 
   return (
     <>
@@ -171,6 +173,15 @@ export default function ModelFamilyRows({
             . The list is refreshed automatically on a weekly schedule but you have the option to update it now.
           </div>
           <div>Click Refresh to update the list of models.</div>
+          <div>
+            <button
+              type="button"
+              onClick={() => setPricingOpen(true)}
+              className="underline decoration-dotted underline-offset-2 hover:text-foreground"
+            >
+              View model pricing
+            </button>
+          </div>
           {refreshNote && (
             <div className="text-xs px-3 py-2 rounded-md bg-accent/40 border border-border text-foreground">
               {refreshNote}
@@ -178,6 +189,8 @@ export default function ModelFamilyRows({
           )}
         </div>
       </Dialog>
+
+      <PricingDialog open={pricingOpen} onOpenChange={setPricingOpen} />
     </>
   );
 }

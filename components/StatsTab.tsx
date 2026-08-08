@@ -32,6 +32,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as echarts from 'echarts';
 import { RefreshCw, TriangleAlert, ShieldAlert, AlertTriangle } from 'lucide-react';
 import { formatTokens } from './AnimatedTokenCount';
+import PricingDialog from './PricingDialog';
 
 // ---- types (mirror /api/stats) ----
 interface DailyRow {
@@ -242,30 +243,81 @@ function Segmented<T extends string>({ options, value, onChange }: {
   );
 }
 
+/** The user's restorable view: date range, $/tokens framing, table sort, and
+ *  the flagged-only filter. Persisted via /api/ui-state (see page.tsx). */
+export interface StatsPrefs {
+  measure: Measure;
+  range: Range;
+  sortKey: string;
+  sortDir: 1 | -1;
+  onlyFlagged: boolean;
+}
+
+/** Every column the sessions table can sort by. A restored `sortKey` is checked
+ *  against this so a stale/renamed column from an old saved state can't leave
+ *  the table sorting by a field that no longer exists. */
+const SORTABLE_KEYS = new Set<keyof SessionRow>([
+  'day', 'projectName', 'display', 'messages', 'peakContext',
+  'costPerMsg', 'tokensPerMsg', 'tokens', 'cost',
+]);
+
 interface StatsTabProps {
   isActive: boolean;
   /** Open a session's transcript in the Chat tab. */
   onOpenSession: (sessionId: string, project: string, display: string) => void;
+  /** Last-saved view, restored on mount. Absent fields fall back to defaults.
+   *  Read once at mount (StatsTab only mounts after page.tsx has loaded UI
+   *  state), so no live-sync effect is needed. */
+  initialPrefs?: Partial<StatsPrefs>;
+  /** Fired when the user changes any restorable control, for page.tsx to
+   *  persist. Not called for the initial restore. */
+  onPrefsChange?: (prefs: StatsPrefs) => void;
 }
 
-export default function StatsTab({ isActive, onOpenSession }: StatsTabProps) {
+export default function StatsTab({ isActive, onOpenSession, initialPrefs, onPrefsChange }: StatsTabProps) {
   const [data, setData] = useState<StatsData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // Deliberately NOT persisted and NOT tied to a plan/billing mode: both
-  // framings are always reachable, and the KPI row shows spend AND tokens at
-  // once regardless of this toggle. `measure` only re-scales the charts — a
-  // single plot cannot carry dollars and tokens at once without a second y-axis,
-  // which is the one thing a chart must never do.
-  const [measure, setMeasure] = useState<Measure>('cost');
-  const [range, setRange] = useState<Range>('all');
+  // Measure ($/tokens) only re-scales the charts — a single plot cannot carry
+  // dollars and tokens at once without a second y-axis, which is the one thing a
+  // chart must never do. The KPI row shows both framings regardless. This and
+  // the other view controls are restored from the last visit (see initialPrefs).
+  const [measure, setMeasure] = useState<Measure>(() => initialPrefs?.measure ?? 'cost');
+  const [range, setRange] = useState<Range>(() => initialPrefs?.range ?? 'all');
   // Lazy-init from the live theme to avoid a one-frame flash for light-mode users.
   const [dark, setDark] = useState(() =>
     typeof document !== 'undefined' && document.documentElement.classList.contains('dark'));
-  const [sort, setSort] = useState<{ key: keyof SessionRow; dir: 1 | -1 }>({ key: 'cost', dir: -1 });
+  const [sort, setSort] = useState<{ key: keyof SessionRow; dir: 1 | -1 }>(() => {
+    // Default: newest first. `day` is a "YYYY-MM-DD" string that sorts
+    // chronologically, and dir -1 puts the most recent session on top;
+    // same-day sessions keep the API's lastMs-desc order. A saved sort
+    // preference overrides this.
+    const k = initialPrefs?.sortKey;
+    const key = (k && SORTABLE_KEYS.has(k as keyof SessionRow) ? k : 'day') as keyof SessionRow;
+    return { key, dir: initialPrefs?.sortDir === 1 ? 1 : -1 };
+  });
   // Narrow the table to sessions that ran hot or were compacted.
-  const [onlyFlagged, setOnlyFlagged] = useState(false);
+  const [onlyFlagged, setOnlyFlagged] = useState(() => initialPrefs?.onlyFlagged ?? false);
+  const [pricingOpen, setPricingOpen] = useState(false);
   const wasActive = useRef(false);
+
+  // Persist the view in the control handlers, not via a [measure, range, …]
+  // effect. An effect firing on every value change looks tidy but (a) fires a
+  // spurious write on mount that a ref-guard can't reliably suppress — React
+  // StrictMode double-invokes effects and the ref survives the pair — and (b)
+  // can't tell a user edit from the initial restore. Emitting from the handler
+  // writes only on genuine interaction, and reverting a control back to its
+  // default still writes (the change IS the signal), so the stored view never
+  // lies about what's on screen. Mirrors saveLayoutState's handler-based save.
+  //
+  // Each control changes independently, so the unchanged fields are read from
+  // the current render's state and `next` overrides just the one that moved.
+  const emitPrefs = (next: Partial<StatsPrefs>) =>
+    onPrefsChange?.({ measure, range, sortKey: sort.key, sortDir: sort.dir, onlyFlagged, ...next });
+
+  const changeMeasure = (m: Measure) => { setMeasure(m); emitPrefs({ measure: m }); };
+  const changeRange = (r: Range) => { setRange(r); emitPrefs({ range: r }); };
+  const changeOnlyFlagged = (v: boolean) => { setOnlyFlagged(v); emitPrefs({ onlyFlagged: v }); };
 
   // Track theme (globals.css toggles `.dark` on <html>).
   useEffect(() => {
@@ -560,8 +612,14 @@ export default function StatsTab({ isActive, onOpenSession }: StatsTabProps) {
     return s;
   }, [sessions, sort, onlyFlagged, flagged]);
 
-  const toggleSort = (key: keyof SessionRow) =>
-    setSort(prev => (prev.key === key ? { key, dir: (prev.dir * -1) as 1 | -1 } : { key, dir: -1 }));
+  const toggleSort = (key: keyof SessionRow) => {
+    // Compute the next sort from the current render's value (not a functional
+    // updater) so we can persist the same object we set.
+    const next: { key: keyof SessionRow; dir: 1 | -1 } =
+      sort.key === key ? { key, dir: (sort.dir * -1) as 1 | -1 } : { key, dir: -1 };
+    setSort(next);
+    emitPrefs({ sortKey: next.key, sortDir: next.dir });
+  };
 
   const measureOpts: { value: Measure; label: string }[] = [{ value: 'cost', label: '$' }, { value: 'tokens', label: 'Tokens' }];
   const rangeOpts: { value: Range; label: string }[] = [
@@ -580,12 +638,24 @@ export default function StatsTab({ isActive, onOpenSession }: StatsTabProps) {
             <h1 className="text-lg font-semibold text-foreground">Stats</h1>
             <p className="text-xs text-muted-foreground">
               Token usage &amp; estimated cost · {data ? `daily by ${data.timezone.split('/').pop()?.replace(/_/g, ' ')} time` : '…'}
-              {data && <> · pricing as of {data.pricingAsOf}</>}
+              {data && (
+                <>
+                  {' · '}
+                  <button
+                    type="button"
+                    onClick={() => setPricingOpen(true)}
+                    className="underline decoration-dotted underline-offset-2 hover:text-foreground"
+                    title="View model pricing"
+                  >
+                    pricing as of {data.pricingAsOf}
+                  </button>
+                </>
+              )}
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <Segmented options={rangeOpts} value={range} onChange={setRange} />
-            <Segmented options={measureOpts} value={measure} onChange={setMeasure} />
+            <Segmented options={rangeOpts} value={range} onChange={changeRange} />
+            <Segmented options={measureOpts} value={measure} onChange={changeMeasure} />
             <button
               onClick={fetchData}
               className="p-1.5 rounded-md border border-border text-muted-foreground hover:text-foreground"
@@ -694,7 +764,7 @@ export default function StatsTab({ isActive, onOpenSession }: StatsTabProps) {
                     type="checkbox"
                     className="accent-current"
                     checked={onlyFlagged}
-                    onChange={e => setOnlyFlagged(e.target.checked)}
+                    onChange={e => changeOnlyFlagged(e.target.checked)}
                   />
                   Only ran hot or compacted ({flagged.length})
                 </label>
@@ -807,6 +877,7 @@ export default function StatsTab({ isActive, onOpenSession }: StatsTabProps) {
           </>
         )}
       </div>
+      <PricingDialog open={pricingOpen} onOpenChange={setPricingOpen} />
     </div>
   );
 }

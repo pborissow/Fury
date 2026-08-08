@@ -157,6 +157,27 @@ export function modelTierRank(model: string | null | undefined): number {
   return i === -1 ? MODEL_FAMILY_ORDER.length : i;
 }
 
+const FAMILY_LABEL: Record<string, string> = {
+  fable: 'Fable', mythos: 'Mythos', opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku',
+};
+
+/**
+ * A human label for a canonical id, e.g. 'claude-opus-4-8' -> "Claude Opus 4.8",
+ * 'claude-3-5-sonnet' -> "Claude Sonnet 3.5". Finds the family token wherever it
+ * sits (modern ids lead with it, legacy 3.x trail it) and joins the remaining
+ * numeric parts with dots. Falls back to the raw id if no family is recognized.
+ */
+export function modelDisplayName(id: string): string {
+  const parts = id.replace(/^claude-/, '').split('-');
+  // hasOwn, not `in`: `in` walks the prototype chain, so an id segment like
+  // "constructor" or "toString" would false-match a non-own property.
+  const famIdx = parts.findIndex(p => Object.hasOwn(FAMILY_LABEL, p));
+  if (famIdx === -1) return id;
+  const version = parts.filter((_, i) => i !== famIdx).join('.');
+  const fam = FAMILY_LABEL[parts[famIdx]];
+  return version ? `Claude ${fam} ${version}` : `Claude ${fam}`;
+}
+
 /**
  * The context window for a model id, or null when we have no published figure.
  *
@@ -233,6 +254,54 @@ export function rateFor(model: string | null | undefined, atDate: string): Model
 export function latestRate(model: string | null | undefined): ModelRates | null {
   const periods = periodsFor(model);
   return periods && periods.length ? periods[periods.length - 1] : null;
+}
+
+/** True if the pricing poller has installed any runtime rate override. */
+export function hasPricingOverrides(): boolean {
+  return Object.keys(overrides).length > 0;
+}
+
+/** One model's row in the pricing reference: identity and its effective dated
+ *  rate periods (base constant + any runtime overrides, ascending).
+ *
+ *  Deliberately NO context window. CONTEXT_WINDOWS stores each model's MAXIMUM
+ *  capability (the 1M ceiling behind the opt-in `[1m]` variant), not the window
+ *  the app actually serves — surfacing it here would promise a window the
+ *  runtime never delivers (see docs/ticket-model-context-size-variant.md). When
+ *  that ticket lands and the served window becomes per-variant, context can
+ *  return here as (200k standard / 1M premium) rows, which is genuinely
+ *  pricing-relevant since the 1M tier bills at a premium. */
+export interface ModelPricing {
+  id: string;
+  displayName: string;
+  periods: RatePeriod[];
+  /** The current (latest) period — what a new event is priced at today. */
+  current: RatePeriod;
+}
+
+/**
+ * The full pricing reference for display: every known model (PRICING ∪ active
+ * overrides), each with its effective periods, ordered by capability tier then
+ * newest id first. This is exactly what costForUsage charges from, so the
+ * surfaced table can never drift from the numbers on the Stats tab.
+ */
+export function getPricingTable(): ModelPricing[] {
+  const ids = Array.from(new Set([...Object.keys(PRICING), ...Object.keys(overrides)]));
+  const table: ModelPricing[] = [];
+  for (const id of ids) {
+    const periods = periodsFor(id);
+    if (!periods || periods.length === 0) continue;
+    table.push({
+      id,
+      displayName: modelDisplayName(id),
+      periods,
+      current: periods[periods.length - 1],
+    });
+  }
+  // Group by family (capability), newest id first within a family so e.g.
+  // Opus 4.8 sits above 4.7 … above the legacy 3.x at the tail.
+  return table.sort((a, b) =>
+    modelTierRank(a.id) - modelTierRank(b.id) || b.id.localeCompare(a.id));
 }
 
 /**

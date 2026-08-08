@@ -1,8 +1,14 @@
 import { createServer } from 'node:http';
 import { parse } from 'node:url';
 import next from 'next';
+import { assertRealCwd } from './lib/checkSymlink';
 import { installProcessGuards, isBenignClientAbort } from './lib/processGuards';
 import { log } from './lib/logger';
+
+// Preflight: abort with a helpful message if cwd is a symlink/junction, before
+// next() builds any .next path (was the scripts/check-symlink.js predev/prestart
+// hook — now core startup, so nothing in scripts/ is required to run).
+assertRealCwd();
 
 // Armed before anything else loads: an aborted client request used to reach the
 // process as an uncaughtException and kill every live session with it.

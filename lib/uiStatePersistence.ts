@@ -11,6 +11,20 @@ interface UIState {
   chatHorizontalLayout: number[] | null;
   chatVerticalLayout: number[] | null;
   canvasHorizontalLayout: number[] | null;
+  // Stats tab view preferences — the last-used filters, restored on return so a
+  // "$ / 30d / sorted by cost" view survives a reload. Each is null until the
+  // user first touches that control; the Stats tab falls back to its own default
+  // (all-time range, cost measure, sorted by date descending). Unlike activeTab
+  // (deliberately not restored),
+  // these ARE worth restoring: they're the analyst's working view, not a
+  // navigation position.
+  statsMeasure: 'cost' | 'tokens' | null;
+  statsRange: 'all' | 'mtd' | '7d' | '30d' | '90d' | null;
+  /** A sessions-table column key. Validated against the live column set on
+   *  restore, so a renamed/removed column can't wedge sorting. */
+  statsSortKey: string | null;
+  statsSortDir: 1 | -1 | null;
+  statsOnlyFlagged: boolean | null;
   lastUpdated: number;
 }
 
@@ -94,6 +108,14 @@ class UIStatePersistence {
         chatHorizontalLayout: state.chatHorizontalLayout ?? existingState?.chatHorizontalLayout ?? null,
         chatVerticalLayout: state.chatVerticalLayout ?? existingState?.chatVerticalLayout ?? null,
         canvasHorizontalLayout: state.canvasHorizontalLayout ?? existingState?.canvasHorizontalLayout ?? null,
+        // `??` (not `||`) so statsOnlyFlagged: false persists correctly rather
+        // than collapsing to the existing value. Each field merges independently,
+        // so a layout-only or workflow-only POST leaves these untouched.
+        statsMeasure: state.statsMeasure ?? existingState?.statsMeasure ?? null,
+        statsRange: state.statsRange ?? existingState?.statsRange ?? null,
+        statsSortKey: state.statsSortKey ?? existingState?.statsSortKey ?? null,
+        statsSortDir: state.statsSortDir ?? existingState?.statsSortDir ?? null,
+        statsOnlyFlagged: state.statsOnlyFlagged ?? existingState?.statsOnlyFlagged ?? null,
         lastUpdated: Date.now(),
       };
 

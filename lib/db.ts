@@ -14,6 +14,7 @@ import { join } from 'path';
 import { readdir, readFile, stat } from 'fs/promises';
 import { parseTranscriptJsonl } from './transcriptParser';
 import { PRICING, PRICING_AS_OF } from './pricing';
+import { hasAnyConfirmedWindow } from './modelWindows';
 
 const GLOBAL_KEY = '__fury_db__';
 const PROMISE_KEY = '__fury_db_promise__';
@@ -547,6 +548,49 @@ async function initDb(client: Client): Promise<void> {
     }
   } catch (err) {
     console.error('[DB] contextTokens backfill error:', err);
+  }
+
+  // Migration: give a base context window to sessions that have NONE recorded.
+  //
+  // The contextTokens backfill above only recovered a window where a call
+  // provably exceeded 200k (⇒ inferred 1M); sessions that stayed under 200k were
+  // left at contextWindow 0 = unknown, so the sidebar/Stats showed a size but no
+  // fill %. Now that lib/model-windows.json holds empirically-CONFIRMED base
+  // windows (probe-seeded), those sessions get an honest denominator: one that
+  // never exceeded its model's base fit within the base, so window = base.
+  //
+  // Strictly ADDITIVE and safe:
+  //   - only touches sessions whose window is still 0 (never overwrites a
+  //     runtime capture or the >200k inference — those are more specific);
+  //   - only acts where the model's base is CONFIRMED (baseWindowFor non-null),
+  //     so we never assert a guessed window.
+  //
+  // "Learns over time" without a permanent opt-out. A session is stamped DONE
+  // (baseWindowFilled) only when we actually fill it, or when it has nothing to
+  // fill (no parseable main-thread call). A session whose model exists but isn't
+  // window-confirmed YET is NOT stamped — it stays in the target set so a later
+  // boot fills it once a probe learns the window. To keep that retry cheap (the
+  // whole re-parse is the costly part) we leave a breadcrumb — the resolved
+  // model + max prompt — so the retry skips straight to the lookup, no re-parse.
+  // Skip under test (mirrors the startup-scan gate above): this fire-and-forget
+  // per-session re-parse adds DB-write contention that flakes the parallel suite
+  // at its 5s timeout, and no suite test covers it (it's verified via isolated
+  // scripts). Also skip when nothing is window-confirmed yet (empty seed /
+  // pre-probe) — we could fill nothing and would only park every session, so
+  // don't scan the archive at all; sessions stay unstamped and get processed
+  // once a probe confirms a window.
+  try {
+    if (!IN_TEST && hasAnyConfirmedWindow()) {
+      // Branching lives in lib/baseWindowBackfill (unit-tested there against a
+      // fake client, since IN_TEST keeps this path out of the suite).
+      const { backfillBaseWindows } = await import('./baseWindowBackfill');
+      const { filled } = await backfillBaseWindows(client);
+      if (filled > 0) {
+        console.log(`[DB] Filled a base context window for ${filled} previously-unknown sessions`);
+      }
+    }
+  } catch (err) {
+    console.error('[DB] base-window backfill error:', err);
   }
 
   // Migration: populate is_sidechain on existing usage_events rows.

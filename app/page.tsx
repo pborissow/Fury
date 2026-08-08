@@ -4,7 +4,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import ChatTab from '@/components/ChatTab';
 import CanvasTab from '@/components/CanvasTab';
-import StatsTab from '@/components/StatsTab';
+import StatsTab, { type StatsPrefs } from '@/components/StatsTab';
 import { Sun, Moon, EllipsisVertical, CircleUserRound, LogOut } from 'lucide-react';
 import Dialog from '@/components/Dialog';
 import SettingsPanel, { type ServiceSettings } from '@/components/SettingsPanel';
@@ -193,6 +193,11 @@ export default function Home() {
   const [layoutsLoaded, setLayoutsLoaded] = useState(false);
   const layoutSaveTimerRef = useRef<NodeJS.Timeout | null>(null);
 
+  // Restored Stats view prefs, populated from UI state during load and handed to
+  // StatsTab as initialPrefs. `undefined` until loaded; StatsTab only mounts
+  // after layoutsLoaded, so it always reads the restored value (or defaults).
+  const [statsPrefs, setStatsPrefs] = useState<Partial<StatsPrefs>>();
+
   // Load UI state on mount
   useEffect(() => {
     const loadUIState = async () => {
@@ -210,6 +215,16 @@ export default function Home() {
             if (state.chatHorizontalLayout) setChatHorizontalLayout(state.chatHorizontalLayout);
             if (state.chatVerticalLayout) setChatVerticalLayout(state.chatVerticalLayout);
             if (state.canvasHorizontalLayout) setCanvasHorizontalLayout(state.canvasHorizontalLayout);
+            // Stats view prefs — passed to StatsTab as initialPrefs. Set here,
+            // before setLayoutsLoaded(true) below, so they're in place by the
+            // time StatsTab first mounts (its mount is gated on layoutsLoaded).
+            setStatsPrefs({
+              measure: state.statsMeasure ?? undefined,
+              range: state.statsRange ?? undefined,
+              sortKey: state.statsSortKey ?? undefined,
+              sortDir: state.statsSortDir ?? undefined,
+              onlyFlagged: state.statsOnlyFlagged ?? undefined,
+            });
           }
         }
       } catch (error) {
@@ -238,6 +253,23 @@ export default function Home() {
     };
     saveUIState();
   }, [activeWorkflowId]);
+
+  // Persist Stats view prefs on change. No debounce: unlike panel resizes these
+  // change on discrete clicks, not a continuous drag. Reuses the same UI-state
+  // mechanism as everything else; the server merges each field independently.
+  const persistStatsPrefs = useCallback((p: StatsPrefs) => {
+    fetch('/api/ui-state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        statsMeasure: p.measure,
+        statsRange: p.range,
+        statsSortKey: p.sortKey,
+        statsSortDir: p.sortDir,
+        statsOnlyFlagged: p.onlyFlagged,
+      }),
+    }).catch(error => console.error('[App] Failed to save stats prefs:', error));
+  }, []);
 
   // Debounced save for panel layout changes
   const saveLayoutState = useCallback((updates: Record<string, number[]>) => {
@@ -424,6 +456,8 @@ export default function Home() {
               <StatsTab
                 isActive={activeTab === 'stats'}
                 onOpenSession={handleOpenSessionFromStats}
+                initialPrefs={statsPrefs}
+                onPrefsChange={persistStatsPrefs}
               />
             </div>
           )}

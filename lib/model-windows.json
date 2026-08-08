@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "note": "Model context windows learned empirically from real SDK captures (confirmed-only) and enriched at runtime. Deterministically sorted so commits stay reviewable. See lib/modelWindows.ts.",
+  "models": {
+    "claude-fable-5": {
+      "base": 1000000,
+      "ceiling": 1000000,
+      "source": "probe",
+      "at": "2026-08-07"
+    },
+    "claude-haiku-4-5": {
+      "base": 200000,
+      "ceiling": 200000,
+      "source": "probe",
+      "at": "2026-08-07"
+    },
+    "claude-opus-4-6": {
+      "base": 200000,
+      "ceiling": 200000,
+      "source": "probe",
+      "at": "2026-08-07"
+    },
+    "claude-opus-4-8": {
+      "base": 1000000,
+      "ceiling": 1000000,
+      "source": "probe",
+      "at": "2026-08-07"
+    },
+    "claude-sonnet-5": {
+      "base": 1000000,
+      "ceiling": 1000000,
+      "source": "probe",
+      "at": "2026-08-07"
+    }
+  }
+}
