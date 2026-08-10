@@ -24,6 +24,7 @@ import { uiLog } from '@/lib/clientTelemetry';
 import { stripInFlightPartials } from '@/lib/transcriptStrip';
 import type { Message, TranscriptMsg, HistoryEntry, PendingSession, AskUserQuestionState } from '@/lib/types';
 import type { TurnMeta } from '@/lib/transcriptParser';
+import type { Liveness } from '@/lib/eventBus';
 
 // Generate a UUID v4
 const generateUUID = () => {
@@ -127,6 +128,19 @@ export default function ChatTab({
   // orthogonal so background liveness never touches the fragile in-flight-partials
   // logic. See docs/ticket-live-badge-dark-during-background-subagent.md.
   const [backgroundWorking, setBackgroundWorking] = useState(false);
+  // SSOT liveness projection (docs/design-liveness-single-source-of-truth.md, step 2b).
+  // The single authoritative "is Claude working?" level, held verbatim from the server
+  // (session:health PUSH, seq-gated; /api/health PULL, unconditional). When the flag is
+  // on, the dots render off `live.phase` instead of the legacy `transcriptLoading ||
+  // backgroundWorking` OR-of-proxies; the legacy machinery stays intact as the fallback
+  // (and reseeds the dots when `live` is null / flag off). Reset to null on session switch.
+  const [live, setLive] = useState<Liveness | null>(null);
+  const liveRef = useRef<Liveness | null>(null);
+  // Opt-in for the projection-driven dots (localStorage `fury.livenessDots`). Off by
+  // default so the legacy path is untouched until this is proven in the app; flip it in
+  // the browser console to verify. Step 3 makes it the default and deletes the legacy path.
+  const [livenessDotsEnabled, setLivenessDotsEnabled] = useState(false);
+  const livenessDotsEnabledRef = useRef(false);
   const [providerSource, setProviderSource] = useState<'Anthropic' | 'Bedrock' | null>(null);
   const [providerConfiguredModel, setProviderConfiguredModel] = useState<string | null>(null);
   const [currentModel, setCurrentModel] = useState<string | null>(null);
@@ -361,6 +375,23 @@ export default function ChatTab({
   useEffect(() => {
     backgroundWorkingRef.current = backgroundWorking;
   }, [backgroundWorking]);
+
+  useEffect(() => {
+    liveRef.current = live;
+  }, [live]);
+
+  // Read the projection-dots setting once (client-only; localStorage is undefined in
+  // SSR). DEFAULT-ON as of step 3 (scenario 1+2 closed and verified live); set
+  // `fury.livenessDots='0'` to fall back to the legacy path. The legacy compensators
+  // remain in the tree as that fallback until a soak proves the projection, then step-3
+  // cleanup deletes them.
+  useEffect(() => {
+    let on = true;
+    try { on = localStorage.getItem('fury.livenessDots') !== '0'; }
+    catch { on = true; /* no localStorage (private mode) — default to the projection */ }
+    livenessDotsEnabledRef.current = on;
+    setLivenessDotsEnabled(on);
+  }, []);
 
   useEffect(() => {
     transcriptStreamingRef.current = transcriptStreaming;
@@ -777,6 +808,23 @@ export default function ChatTab({
     // when isActive flips back to true (see effect below).
     const shouldProcess = () => isStillActive() && isActiveRef.current;
 
+    // --- SSOT liveness projection (step 2b) ---
+    // Reset on session switch so a prior session's phase can't leak into this view.
+    setLive(null);
+    liveRef.current = null;
+    // Apply an incoming liveness LEVEL. An SSE beat (PUSH) advances state only when its
+    // seq is NEWER — a late/duplicate beat can't move the level backward. A PULL
+    // (/api/health, reconnect/poll) is an authoritative snapshot applied
+    // UNCONDITIONALLY: state can move without a push (a wedge self-heal), so a fresh
+    // pull may legitimately carry the SAME seq as the last push (design §3 seq contract).
+    const applyLiveness = (next: Liveness | undefined | null, fromPull: boolean) => {
+      if (!next || typeof next.seq !== 'number') return;
+      const cur = liveRef.current;
+      if (!fromPull && cur && next.seq <= cur.seq) return;
+      liveRef.current = next;
+      setLive(next);
+    };
+
     // On SSE connect, re-fetch the stream buffer to close the gap between the
     // initial restore in fetchTranscript and when the EventSource connected.
     // Events emitted during that window would otherwise be lost.
@@ -981,6 +1029,10 @@ export default function ChatTab({
       setIsStuck(data.isStuck);
       setStuckReason(data.stuckReason);
 
+      // SSOT: adopt the pushed liveness level (seq-gated). The heartbeat re-sends this
+      // every few seconds while non-idle, so `live.phase` is self-correcting.
+      applyLiveness(data.liveness, false);
+
       // Background-work dots: independent of the in-flight-turn machinery below.
       // A session driving a background subagent between its own turns keeps the
       // dots on even though its main turn is idle (data.isProcessing false).
@@ -1170,11 +1222,24 @@ export default function ChatTab({
     // completion events. Also skips when tab is hidden to avoid unnecessary
     // network requests.
     const healthPoll = setInterval(() => {
-      if (!shouldProcess() || (!transcriptLoadingRef.current && !backgroundWorkingRef.current)) return;
+      if (!shouldProcess()) return;
+      // Under the projection (flag on) the poll is also the fallback for a dead SSE
+      // while `live.phase` is non-idle; otherwise the legacy gate is unchanged.
+      const projNonIdle = livenessDotsEnabledRef.current && !!liveRef.current && liveRef.current.phase !== 'idle';
+      if (!transcriptLoadingRef.current && !backgroundWorkingRef.current && !projNonIdle) return;
       fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`)
         .then(res => res.json())
         .then(data => {
           if (!shouldProcess()) return;
+          // SSOT: a PULL is an authoritative snapshot — apply it unconditionally.
+          applyLiveness(data.liveness, true);
+          // Under the projection, the PULL above IS this poll's whole job — it is the
+          // dead-SSE fallback that keeps `live` fresh. The legacy teardown / 2-strike
+          // debounce / raw-commit below is bypassed: the projection + heartbeat own
+          // liveness and the render-strip owns the partials, so inventing "done" from a
+          // bare isProcessing:false here is exactly the drift we're removing (step 3).
+          // The machinery stays intact as the flag-off / CLI-session fallback.
+          if (livenessDotsEnabledRef.current) return;
           // Keep the independent background-work dots in sync even if the SSE
           // health event that would clear them was missed (fail toward not-live).
           setBackgroundWorking(!!data.backgroundActive);
@@ -1193,6 +1258,18 @@ export default function ChatTab({
             return;
           }
           if (!transcriptLoadingRef.current) return;
+          // Never tear down an in-flight MAIN turn while background work is still
+          // live. `backgroundActive` means a background task (subagent / Monitor /
+          // Bash) is running and a task-notification turn may be imminent — the same
+          // guard the SSE idle-commit uses at :1017. Committing the on-disk partials
+          // now would drop the dots mid-turn and paint an intermediary bubble over a
+          // turn that is not actually finished (Defect B / docs/ticket-dots-desync-
+          // subagent-heavy-session.md). Reset the streak so a transient main-turn
+          // idle during background work doesn't accrue toward the 2-strike teardown.
+          if (data.backgroundActive) {
+            healthFalseStreakRef.current = 0;
+            return;
+          }
           // Debounce: this poll is only a safety net for a dead SSE stream. A
           // single false is untrustworthy (HMR singleton swap can momentarily
           // report a live SDK session as idle), so require TWO consecutive false
@@ -1216,7 +1293,22 @@ export default function ChatTab({
           fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
             .then(res => res.json())
             .then(refreshData => {
-              if (refreshData.messages && shouldProcess()) {
+              // Re-check loading: a real session:health event may have re-lit the
+              // dots via the latch-break (:997) between this teardown and the refetch
+              // resolving. If so the turn is live — let the live path own the
+              // transcript instead of clobbering it here (mirrors the SSE completion
+              // refetch guard at :1050). This IS a genuine improvement over the old
+              // bare-shouldProcess() commit and is kept.
+              if (refreshData.messages && shouldProcess() && !transcriptLoadingRef.current) {
+                // Commit RAW. This poll teardown is the safety net for a GENUINE
+                // completion whose SSE idle event was missed, so the on-disk messages
+                // ARE the final answer — stripping on the turn's startedAt would delete
+                // it, and the transcript-updated restore rides the same (dead) SSE that
+                // forced the poll fallback in the first place (review-dots-desync-fix
+                // Finding 2). The proper fix removes this whole teardown: the client
+                // renders the single liveness projection and strips on
+                // `liveness.startedAt` (null when idle) — see
+                // docs/design-liveness-single-source-of-truth.md, step 2.
                 setHistoryTranscript(refreshData.messages);
                 setTranscriptOverlayMessages([]);
                 setOverlayInsertPoint(null);
@@ -2044,7 +2136,20 @@ export default function ChatTab({
                             </div>
                           )}
                           <TranscriptRenderer
-                            historyTranscript={historyTranscript}
+                            // SSOT strip (step 3): under the flag, the DISPLAYED
+                            // transcript is a pure function of (historyTranscript, live)
+                            // — while the main turn streams (`live.startedAt` set), slice
+                            // off this turn's in-flight partials so a raw-committed
+                            // partial can't render as a bubble above the dots (scenario
+                            // 1). Non-main-turn (startedAt null) shows the raw final
+                            // answer. This anchors on the SAME `live.startedAt` the design
+                            // built in step 1 (null unless main-turn), replacing the
+                            // legacy latch/teardown strip for the projection path.
+                            historyTranscript={
+                              (livenessDotsEnabled && live && typeof live.startedAt === 'number')
+                                ? stripInFlightPartials(historyTranscript, live.startedAt)
+                                : historyTranscript
+                            }
                             transcriptOverlayMessages={transcriptOverlayMessages}
                             overlayInsertPoint={overlayInsertPoint}
                             transcriptLoading={transcriptLoading}
@@ -2118,7 +2223,13 @@ export default function ChatTab({
                             }}
                             onTtsCancel={() => ttsCleanup()}
                           />
-                          {(transcriptLoading || backgroundWorking) && (
+                          {/* SSOT dots (step 2b): when opted in and the projection has
+                              arrived, the dots track `live.phase` (self-corrected by the
+                              heartbeat) instead of the legacy OR-of-proxies. Falls back to
+                              legacy while `live` is null or the flag is off. */}
+                          {((livenessDotsEnabled && live)
+                            ? live.phase !== 'idle'
+                            : (transcriptLoading || backgroundWorking)) && (
                             <div className="flex justify-start">
                               {/*
                                 While parked on a question the turn IS live and

@@ -15,7 +15,7 @@ import {
   contextTokensFromMeta,
   refreshSubagentUsage,
 } from './transcriptArchiver';
-import { eventBus } from './eventBus';
+import { eventBus, type Liveness } from './eventBus';
 import { codemoggerReindexer } from './codemoggerReindex';
 import { codemoggerSdkServer } from './codemoggerServer';
 import { isCodeSearchEnabled, codeSearchDbPath, stripStdioCodemogger } from './codeSearchConfig';
@@ -182,6 +182,21 @@ interface SdkSession {
   // treats a non-empty set with an idle main turn, no subagent activity, and no
   // signal within WEDGED_BG_GRACE_MS as stale and drops it.
   lastBgActivityAt?: number;
+  // Whether the CURRENT `backgroundTasks` set contains at least one AGENTIC task
+  // (a Claude subagent / monitor / workflow) as opposed to only detached shells
+  // (`run_in_background` Bash: a dev server, a long test, a tail). Recomputed on
+  // each `background_tasks_changed` LEVEL signal from each task's `task_type`.
+  // Load-bearing in computeBackgroundActive: a set of ONLY detached shells must
+  // NOT sustain the "Claude is working" dots via the 120s wedge grace once the
+  // main turn is idle — a backgrounded shell outliving the turn is not Claude
+  // work (docs/ticket-dots-desync-subagent-heavy-session.md, Defect A). A genuine
+  // background Task keeps the intended v24 behaviour.
+  backgroundHasAgentic?: boolean;
+  // Monotonic liveness sequence for the single-source-of-truth projection
+  // (docs/design-liveness-single-source-of-truth.md). Bumped on every emitted
+  // level (emitHealth) so the client can ignore an out-of-order/duplicate beat.
+  // A PULL (/api/health) reads the current value without bumping it.
+  livenessSeq?: number;
   // The user's chosen model for this session, or undefined for the CLI default.
   // Load-bearing in TWO places, because the query object comes and goes:
   //   1. Pushed live via Query.setModel() when a query is open (no restart).
@@ -252,6 +267,19 @@ const execFileP = promisify(execFile);
 // an unref'd interval would still keep re-scanning the real ~/.claude during tests.
 const IN_TEST = !!process.env.VITEST || process.env.NODE_ENV === 'test';
 
+/** Liveness heartbeat interval (ms) — the SSOT design's §2 "levels, not edges": while
+ *  a session is NON-IDLE, re-emit the current liveness LEVEL every beat so a dropped
+ *  edge or a wrong client teardown self-corrects within one beat instead of staying
+ *  dark until the next turn (the Finding-1 amplifier — a single continuous turn emits
+ *  `processing` only once). 0 (or an invalid value) disables it. Kept modest: a handful
+ *  of live sessions × one emit per beat is negligible, and idle sessions stay quiet. */
+const LIVENESS_HEARTBEAT_MS = (() => {
+  const raw = process.env.FURY_LIVENESS_HEARTBEAT_MS;
+  if (raw === undefined) return 4_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+})();
+
 /** A subagent transcript written within this window is treated as "still running".
  *  Past it we fail toward NOT-live, so a crashed/stalled subagent can't pin a
  *  session green forever (docs ticket "Additional fix required"). */
@@ -269,6 +297,20 @@ const SUBAGENT_RUNNING_WINDOW_MS = 120_000;
  *  clock via task_* edges / subagent writes well inside this, so only a truly
  *  silent (wedged) set reaches it. */
 const WEDGED_BG_GRACE_MS = SUBAGENT_RUNNING_WINDOW_MS;
+
+/** Raw `task_type` discriminants (from `background_tasks_changed`) that denote a
+ *  DETACHED SHELL — a `run_in_background` Bash task (dev server, long test, tail):
+ *  work the harness backgrounds, NOT Claude reasoning/subagent work. Everything
+ *  else (subagent / monitor / workflow / unknown) is treated as AGENTIC so we fail
+ *  toward showing liveness for anything genuinely Claude-driven. Matching is
+ *  case-insensitive and lenient (substring) so minor label drift ('shell' vs
+ *  'bash_shell') still classifies. See docs/ticket-dots-desync-subagent-heavy-
+ *  session.md, Defect A. */
+function isDetachedShellTaskType(taskType: unknown): boolean {
+  if (typeof taskType !== 'string') return false;
+  const t = taskType.toLowerCase();
+  return t.includes('shell') || t === 'bash';
+}
 
 /** Liveness probe: signal 0 throws iff the pid is gone (or not ours to signal). */
 function pidAlive(pid: number): boolean {
@@ -373,6 +415,8 @@ class SdkSessionManager {
   private readonly STUCK_AFTER_MS = 3 * 60 * 1000;
   /** The background-reconcile heartbeat (see startReconcile). */
   private reconcileTimer: NodeJS.Timeout | null = null;
+  /** The liveness heartbeat that re-emits the level while non-idle (see startHeartbeat). */
+  private heartbeatTimer: NodeJS.Timeout | null = null;
   /** Last catalog any session reported, for sessions with no live query to ask.
    *  See listModels() for why this is served with live:false. */
   private lastKnownModels: ModelInfo[] | null = null;
@@ -404,6 +448,7 @@ class SdkSessionManager {
         lastEmittedModel: null,
         spawnedPids: new Set<number>(),
         backgroundTasks: new Set<string>(),
+        livenessSeq: 0,
       };
       this.sessions.set(sessionId, s);
     }
@@ -1420,6 +1465,16 @@ class SdkSessionManager {
     return !!(s && s.q && this.computeBackgroundActive(s));
   }
 
+  /** The current/last turn's start timestamp (ms), or undefined if unknown.
+   *  Mirrors the `startedAt` the session:health SSE carries (s.streamBuffer.
+   *  startedAt) so /api/health's poll-teardown path can anchor its
+   *  stripInFlightPartials on the SAME value the SSE latch-break uses, instead of
+   *  falling back to the trailing-assistant heuristic that over-strips a prior
+   *  completed turn. See docs/ticket-dots-desync-subagent-heavy-session.md, Defect B. */
+  getTurnStartedAt(sessionId: string): number | undefined {
+    return this.sessions.get(sessionId)?.streamBuffer?.startedAt;
+  }
+
   /**
    * Is the session doing background work right now? Two sources:
    *   1. The live-observed set (background_tasks_changed) — authoritative once the
@@ -1432,23 +1487,34 @@ class SdkSessionManager {
    */
   private computeBackgroundActive(s: SdkSession): boolean {
     if (s.backgroundTasks.size > 0) {
-      // A non-empty set is authoritative WHILE the main turn is processing, while
-      // a subagent is still writing its transcript, or while background signals
-      // are still arriving (any task_* edge / level payload refreshes
-      // lastBgActivityAt). Beyond that — idle main turn, no subagent activity, no
-      // signal for WEDGED_BG_GRACE_MS — the terminal clearing `background_tasks_
-      // changed` was lost (dropped stream / crash mid-task) and the set would
-      // otherwise wedge the dots on forever. Drop it so it self-heals.
-      const staleForMs = Date.now() - (s.lastBgActivityAt ?? 0);
-      if (s.isProcessing || this.hasRecentSubagentActivity(s) || staleForMs < WEDGED_BG_GRACE_MS) {
-        return true;
+      // A non-empty set is authoritative WHILE the main turn is processing or while
+      // a subagent is still writing its transcript — either way, Claude is working.
+      if (s.isProcessing || this.hasRecentSubagentActivity(s)) return true;
+      // Main turn idle, no live subagent transcript. What remains?
+      //
+      //  - AGENTIC tasks (subagent/monitor/workflow): keep the dots lit while
+      //    background signals are still arriving (any task_* edge / level payload
+      //    refreshes lastBgActivityAt) — this is the intended v24 cross-turn liveness.
+      //    Beyond WEDGED_BG_GRACE_MS with NO signal, the terminal clearing
+      //    `background_tasks_changed` was lost (dropped stream / crash mid-task) and
+      //    the set would wedge the dots on forever, so drop it to self-heal.
+      //
+      //  - DETACHED SHELLS ONLY (`run_in_background` Bash outliving the turn): NOT
+      //    Claude work. Do not light "Claude is working" via the grace — fall through
+      //    to return false so a finished turn's dots clear promptly (Defect A). Leave
+      //    the set intact: the shell is still live and a later membership-level signal
+      //    (its exit) will REPLACE the set cleanly; clearing here would just churn.
+      if (s.backgroundHasAgentic) {
+        const staleForMs = Date.now() - (s.lastBgActivityAt ?? 0);
+        if (staleForMs < WEDGED_BG_GRACE_MS) return true;
+        log.info('sdk.bg', 'cleared wedged background tasks (idle, no activity)', {
+          sessionId: s.sessionId,
+          corrId: s.sessionId,
+          data: { count: s.backgroundTasks.size, staleForMs },
+        });
+        s.backgroundTasks.clear();
+        s.backgroundHasAgentic = false;
       }
-      log.info('sdk.bg', 'cleared wedged background tasks (idle, no activity)', {
-        sessionId: s.sessionId,
-        corrId: s.sessionId,
-        data: { count: s.backgroundTasks.size, staleForMs },
-      });
-      s.backgroundTasks.clear();
     }
     if (s.sawBackgroundLevelSignal) return false;
     return this.hasRecentSubagentActivity(s);
@@ -1508,6 +1574,39 @@ class SdkSessionManager {
    *  don't accumulate across reloads. */
   stopReconcile(): void {
     if (this.reconcileTimer) { clearInterval(this.reconcileTimer); this.reconcileTimer = null; }
+  }
+
+  /**
+   * The LIVENESS HEARTBEAT (SSOT design §2, step 2). Distinct from the reconcile tick:
+   * reconcile emits only on a TRANSITION (bg-active / stuck flip); the heartbeat re-
+   * emits the CURRENT level on a fixed cadence while the session is non-idle. That is
+   * what makes the level self-correcting — a dropped edge or a wrong client teardown is
+   * repaired by the next beat rather than persisting for the rest of the turn.
+   *
+   * Safe for the un-migrated client: a processing/background beat only ever RE-LIGHTS
+   * the dots (the session-health latch-break re-strips + sets loading when it had been
+   * wrongly torn down); it can never wrongly COMMIT, because the client's idle-commit
+   * path requires `!isProcessing && !backgroundActive`, which a non-idle beat never
+   * carries. The migrated client (step 2b) gates beats on `liveness.seq`. Idle sessions
+   * emit nothing. unref'd; off under tests and when the interval is disabled.
+   */
+  startHeartbeat(): void {
+    if (this.heartbeatTimer || IN_TEST || LIVENESS_HEARTBEAT_MS <= 0) return;
+    this.heartbeatTimer = setInterval(() => this.heartbeatTick(), LIVENESS_HEARTBEAT_MS);
+    this.heartbeatTimer.unref();
+  }
+
+  /** Stop the liveness heartbeat — paired with startHeartbeat on the HMR swap. */
+  stopHeartbeat(): void {
+    if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+  }
+
+  /** One heartbeat: re-emit the level for every non-idle session with a live query. */
+  private heartbeatTick(): void {
+    for (const [, s] of this.sessions) {
+      if (!s.q) continue;
+      if (s.isProcessing || this.computeBackgroundActive(s)) this.emitHealth(s, s.isProcessing);
+    }
   }
 
   private reconcileBackgroundActivity(): void {
@@ -1573,6 +1672,20 @@ class SdkSessionManager {
       else this.spawnedProcs.delete(pid);
     }
     return [...ids];
+  }
+
+  /** Is a CLI process alive for this session — the liveness projection's badge
+   *  source (deriveLiveness.processAlive). A live query is definitive; otherwise
+   *  fall back to the same warm-pid record getFuryWarmSessionIds scans, so a
+   *  warm-but-idle session (query nulled, process alive) still reads processAlive.
+   *  Read-only: unlike getFuryWarmSessionIds it does NOT prune dead pids (that
+   *  runs on its own cadence), so a hot per-request projection stays cheap/pure. */
+  private isProcessAlive(s: SdkSession): boolean {
+    if (s.q) return true;
+    for (const [pid, sid] of this.spawnedProcs) {
+      if (sid === s.sessionId && pidAlive(pid)) return true;
+    }
+    return false;
   }
 
   /**
@@ -1872,6 +1985,7 @@ class SdkSessionManager {
     // process would pin the session "live" until the next membership change.
     s.backgroundTasks.clear();
     s.sawBackgroundLevelSignal = false;
+    s.backgroundHasAgentic = false;
 
     const cwd = s.projectPath || process.cwd();
     const existing = findSessionJsonlDir(s.sessionId, cwd) !== null;
@@ -2060,6 +2174,13 @@ class SdkSessionManager {
           s.backgroundTasks = new Set<string>(
             tasks.map((t: { task_id?: unknown }) => t?.task_id).filter((id: unknown): id is string => typeof id === 'string'),
           );
+          // Classify the set: does it hold any AGENTIC task (subagent/monitor/
+          // workflow) or only detached `run_in_background` shells? A shell-only set
+          // must not pin the dots on past the main turn (Defect A) — computeBackground
+          // Active gates the wedge grace on this.
+          s.backgroundHasAgentic = tasks.some(
+            (t: { task_type?: unknown }) => !isDetachedShellTaskType(t?.task_type),
+          );
           // The live level is now authoritative for this process; stop using the
           // durable disk fallback (it would otherwise linger for the staleness window
           // after the last task completes).
@@ -2069,7 +2190,15 @@ class SdkSessionManager {
           log.info('sdk.bg', 'background tasks changed', {
             sessionId: s.sessionId,
             corrId: s.sessionId,
-            data: { count: s.backgroundTasks.size },
+            // Log the RAW `task_type`s (review Finding 3): the classifier assumes a
+            // 'shell'/'bash' wire value for detached bash, but the emitter is the
+            // compiled CLI and the value is unverified. Logging it lets us pin the
+            // real discriminant from a live run and confirm Defect A actually fires.
+            data: {
+              count: s.backgroundTasks.size,
+              hasAgentic: s.backgroundHasAgentic,
+              types: tasks.map((t: { task_type?: unknown }) => t?.task_type),
+            },
           });
           // Re-emit health so the events route recomputes the live set and the
           // client toggles the background-work dots. Pass the real main-turn state
@@ -2528,32 +2657,99 @@ class SdkSessionManager {
     return { isStuck: false };
   }
 
+  /**
+   * THE single liveness computation (docs/design-liveness-single-source-of-truth.md).
+   * Every surface — the `session:health` SSE (PUSH) and `/api/health` (PULL) —
+   * projects from this one function, so "is Claude working?" has exactly one owner
+   * instead of three drifting derivations. Migration step 1: exposed additively; the
+   * client still reads the legacy fields until step 2.
+   *
+   * `mainTurnActive` is supplied by the caller (emitHealth forwards the isProcessing
+   * it is emitting; the pull route forwards its computed isProcessing) so the
+   * projection agrees with the legacy field in the SAME payload; it defaults to the
+   * session flag. TRANSITIONAL: the design endgame is a param-less `deriveLiveness(s)`
+   * with the main-turn fact derived from `s` (stream epoch) alone. The param is a shim
+   * while the route still ORs the CLI sessionManager's isProcessing. CRUCIAL: this
+   * unifies the COMPUTATION but NOT the input, so it does NOT by itself close push/pull
+   * phase drift — that was a transiently-WRONG input (a fresh-singleton isProcessing:
+   * false vs the last PUSH's main-turn), and closing it needs the heartbeat + the
+   * client rendering the last authoritative PUSH (step 2), not this projection alone.
+   *
+   * SEQ CONTRACT: this READS `s.livenessSeq` and never bumps it — emitHealth bumps
+   * before calling, so a PUSH carries a fresh seq while a PULL returns the last-
+   * emitted one. Because state can move WITHOUT a push (a wedge-grace expiry, a
+   * self-heal), a PULL snapshot may be fresher than its seq implies; the client MUST
+   * therefore apply a PULL unconditionally and only gate SSE beats on `seq > current`
+   * (design doc §3). Not otherwise side-effect-free: `computeBackgroundActive` may
+   * self-heal a wedged task set (an idempotent maintenance write that already fired
+   * on every isBackgroundActive pull — unchanged by this projection).
+   */
+  private deriveLiveness(s: SdkSession, mainTurnActive: boolean = s.isProcessing): Liveness {
+    // The ONE place the "does a detached shell count?" question is answered — reused
+    // from computeBackgroundActive (agentic-only since Defect A), so no surface can
+    // re-litigate it. Phase gives the main turn precedence over background.
+    const backgroundAgentic = this.computeBackgroundActive(s);
+    const phase: Liveness['phase'] = mainTurnActive
+      ? 'main-turn'
+      : backgroundAgentic
+        ? 'background'
+        : 'idle';
+    // The anchor is the CURRENTLY-STREAMING turn's start, so it is non-null ONLY in
+    // the main-turn phase. In `background` the main turn is FINISHED and the buffer
+    // still holds its start — anchoring a strip there would delete the completed
+    // answer (review-dots-desync-fix Finding 2 reborn); in `idle` there is no turn.
+    // Gating on mainTurnActive (not just !idle) keeps the anchor off a finished turn.
+    const startedAt = mainTurnActive ? (s.streamBuffer?.startedAt ?? null) : null;
+    const { isStuck, stuckReason } = this.computeStuck(s, mainTurnActive, backgroundAgentic);
+    return {
+      phase,
+      startedAt,
+      mainTurnActive,
+      backgroundAgentic,
+      // The sidebar LIVE badge's source is PID-liveness, NOT the query object: `s.q`
+      // is transiently nulled between/around turns (consume()'s finally, interrupts)
+      // while the CLI process stays warm, so `!!s.q` would read dark for a warm-idle
+      // session the PID scanner still shows live — the exact badge/dots disagreement
+      // this projection exists to kill. Mirror getFuryWarmSessionIds' warm-pid check.
+      processAlive: this.isProcessAlive(s),
+      isStuck,
+      stuckReason,
+      seq: s.livenessSeq ?? 0,
+      at: Date.now(),
+    };
+  }
+
+  /** PULL accessor for the liveness projection — `/api/health` returns it verbatim.
+   *  `mainTurnActive` lets the route pass its own isProcessing (which ORs the CLI
+   *  manager); it defaults to this session's flag. Null for an unknown id (a
+   *  CLI-only session with no SDK record) — the client falls back to legacy fields. */
+  getLiveness(sessionId: string, mainTurnActive?: boolean): Liveness | null {
+    const s = this.sessions.get(sessionId);
+    if (!s) return null;
+    return this.deriveLiveness(s, mainTurnActive ?? s.isProcessing);
+  }
+
   private emitHealth(s: SdkSession, isProcessing: boolean): void {
-    // Carry the turn's start so the client's latch-break can anchor its re-strip
-    // on the SAME timestamp the initial restore uses (/api/stream-buffer returns
-    // this exact buffer.startedAt). Without it the latch-break anchored on 0 and
-    // fell back to the trailing-assistant heuristic, which over-strips a prior
-    // completed turn when a mid-turn prompt was folded into a tool_result — the
-    // regression the anchor exists to prevent. Only load-bearing on the
-    // isProcessing:true branch; harmless (and still correct) on idle, where the
-    // buffer is closed-but-retained so startedAt is still present.
+    // Advance the level sequence, then project ONCE through deriveLiveness — the
+    // single source of truth. The legacy fields below are read off that same
+    // projection so the PUSH payload and the projection can never disagree.
+    s.livenessSeq = (s.livenessSeq ?? 0) + 1;
+    const liveness = this.deriveLiveness(s, isProcessing);
+    // Legacy startedAt kept as the RAW buffer start (present even when idle) so the
+    // not-yet-migrated client's idle-commit/latch-break paths are unchanged; the
+    // projection's null-when-idle anchor lives on `liveness.startedAt` (step 2 uses it).
     const startedAt = s.streamBuffer?.startedAt;
-    // Live iff the main turn is processing OR a background task is still running.
-    // The client shows the dots on either, and the events route counts this toward
-    // the Live badge — closing the dark gap between the orchestrator's turns.
-    // computeBackgroundActive includes the durable disk fallback for tasks in flight
-    // across a code reload.
-    const backgroundActive = this.computeBackgroundActive(s);
-    const { isStuck, stuckReason } = this.computeStuck(s, isProcessing, backgroundActive);
+    const backgroundActive = liveness.backgroundAgentic;
+    const { isStuck, stuckReason } = liveness;
     // Keep the reconcile tick's transition tracking in step with what we emit, so
     // it only re-emits on a real stuck-state flip (P7).
     this.lastStuck.set(s.sessionId, isStuck);
     log.debug('sdk.health', isProcessing ? 'processing' : 'idle', {
       sessionId: s.sessionId,
       corrId: s.sessionId,
-      data: { startedAt, backgroundActive, isStuck },
+      data: { startedAt, backgroundActive, isStuck, phase: liveness.phase, seq: liveness.seq },
     });
-    eventBus.emitApp({ type: 'session:health', sessionId: s.sessionId, isProcessing, isStuck, stuckReason, startedAt, backgroundActive });
+    eventBus.emitApp({ type: 'session:health', sessionId: s.sessionId, isProcessing, isStuck, stuckReason, startedAt, backgroundActive, liveness });
   }
 
   // NOTE (cost accounting): we emit TOKEN COUNTS only, matching the shipping
@@ -2727,18 +2923,27 @@ class SdkSessionManager {
 //     neither the nulled-controller signal check nor an err.name check caught it — a
 //     normal delete/shutdown logged a spurious sdk.turn 'query threw'. Without this
 //     bump the live instance keeps mislogging teardowns.
-const SINGLETON_VERSION = 35;
+// 36: liveness heartbeat (SSOT design §2, step 2). A new unref'd timer re-emits the
+//     current liveness LEVEL (session:health) every FURY_LIVENESS_HEARTBEAT_MS while a
+//     session is non-idle, so a dropped edge or a wrong client teardown self-corrects
+//     within one beat instead of persisting for the rest of the turn (the Finding-1
+//     amplifier). startHeartbeat/stopHeartbeat are wired into the HMR swap alongside
+//     reconcile; without this bump the live instance keeps only the transition-only
+//     emits and the mid-turn dark gap (screenshot3) never self-heals.
+const SINGLETON_VERSION = 36;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;
 };
 if (!globalForSdk.__sdkSessionManager || globalForSdk.__sdkSessionManagerV !== SINGLETON_VERSION) {
   const previous = globalForSdk.__sdkSessionManager;
-  // Stop the OLD instance's reconcile heartbeat so timers don't pile up across HMR.
+  // Stop the OLD instance's timers so they don't pile up across HMR.
   try { previous?.stopReconcile(); } catch { /* older instance without the method */ }
+  try { previous?.stopHeartbeat(); } catch { /* older instance without the method */ }
   const replacement = new SdkSessionManager();
   if (previous) replacement.adoptSessionsFrom(previous);
   replacement.startReconcile();
+  replacement.startHeartbeat();
   globalForSdk.__sdkSessionManager = replacement;
   globalForSdk.__sdkSessionManagerV = SINGLETON_VERSION;
 }

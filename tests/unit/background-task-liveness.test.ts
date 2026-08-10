@@ -39,6 +39,12 @@ const bgChanged = (taskIds: string[]) => ({
   tasks: taskIds.map((id) => ({ task_id: id, task_type: 'Task', description: 'work' })),
 });
 
+const bgChangedTyped = (tasks: Array<{ id: string; type: string }>) => ({
+  type: 'system',
+  subtype: 'background_tasks_changed',
+  tasks: tasks.map((t) => ({ task_id: t.id, task_type: t.type, description: 'work' })),
+});
+
 afterEach(() => {
   const sessions = (sdkSessionManager as unknown as { sessions: Map<string, unknown> }).sessions;
   for (const id of createdIds.splice(0)) sessions.delete(id);
@@ -140,6 +146,74 @@ describe('background_tasks_changed → liveness', () => {
       tasks: [{ task_type: 'Task' }, { task_id: 'good' }, { task_id: 42 }],
     });
     expect([...s.backgroundTasks]).toEqual(['good']);
+  });
+});
+
+/**
+ * Defect A (docs/ticket-dots-desync-subagent-heavy-session.md): a detached
+ * `run_in_background` Bash task (`task_type: 'shell'`/'bash') is NOT Claude work,
+ * so once the main turn is idle it must not keep the dots lit via the 120s wedge
+ * grace — the phantom-dots-over-a-finished-bubble symptom. A genuine background
+ * subagent/monitor/workflow keeps its intended v24 cross-turn liveness.
+ */
+describe('background_tasks_changed → detached shells vs Claude subagents (Defect A)', () => {
+  it('a detached-shell-only set keeps dots lit WHILE the main turn processes', () => {
+    const s = newSession('bg-shell-proc');
+    mgr.handle(s, bgChangedTyped([{ id: 'sh1', type: 'shell' }]));
+    expect(s.backgroundHasAgentic).toBe(false);
+    s.isProcessing = true;
+    expect(mgr.isBackgroundActive('bg-shell-proc')).toBe(true); // main turn covers it
+  });
+
+  it('a detached-shell-only set does NOT sustain dots once the main turn is idle (no phantom dots)', () => {
+    const s = newSession('bg-shell-idle');
+    mgr.handle(s, bgChangedTyped([{ id: 'sh1', type: 'shell' }]));
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now(); // FRESH — well within the grace
+    // Pre-fix this returned true for the full grace (phantom dots over a finished
+    // bubble). A detached run_in_background shell is not "Claude is working".
+    expect(mgr.isBackgroundActive('bg-shell-idle')).toBe(false);
+    // The set is left INTACT (the shell is still live; a later level signal — its
+    // exit — REPLACES the set cleanly). Clearing here would only churn.
+    expect(s.backgroundTasks.size).toBe(1);
+  });
+
+  it('classifies a bash task as a detached shell too', () => {
+    const s = newSession('bg-bash');
+    mgr.handle(s, bgChangedTyped([{ id: 'b1', type: 'bash' }]));
+    expect(s.backgroundHasAgentic).toBe(false);
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now();
+    expect(mgr.isBackgroundActive('bg-bash')).toBe(false);
+  });
+
+  it('a MIXED set (subagent + shell) still sustains via the grace while idle', () => {
+    const s = newSession('bg-mixed');
+    mgr.handle(s, bgChangedTyped([{ id: 'sub1', type: 'subagent' }, { id: 'sh1', type: 'shell' }]));
+    expect(s.backgroundHasAgentic).toBe(true);
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now() - 10_000; // within grace
+    expect(mgr.isBackgroundActive('bg-mixed')).toBe(true);
+    expect(s.backgroundTasks.size).toBe(2);
+  });
+
+  it('unknown/agentic task types (e.g. monitor) fail toward showing liveness via the grace', () => {
+    const s = newSession('bg-monitor');
+    mgr.handle(s, bgChangedTyped([{ id: 'm1', type: 'monitor' }]));
+    expect(s.backgroundHasAgentic).toBe(true);
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now() - 10_000;
+    expect(mgr.isBackgroundActive('bg-monitor')).toBe(true);
+  });
+
+  it('a genuine agentic set STILL self-heals when wedged (idle + stale + no activity)', () => {
+    const s = newSession('bg-agentic-wedge');
+    mgr.handle(s, bgChangedTyped([{ id: 'sub1', type: 'subagent' }]));
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now() - 4 * 60_000; // past WEDGED_BG_GRACE_MS
+    expect(mgr.isBackgroundActive('bg-agentic-wedge')).toBe(false);
+    expect(s.backgroundTasks.size).toBe(0); // wedged agentic set dropped
+    expect(s.backgroundHasAgentic).toBe(false);
   });
 });
 

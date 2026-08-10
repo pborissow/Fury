@@ -41,12 +41,52 @@ export interface SessionStreamEvent {
   mcpServers?: { name: string; status: string }[];
 }
 
+/**
+ * The single authoritative liveness projection for a session — "is Claude working
+ * right now, and how?" (docs/design-liveness-single-source-of-truth.md).
+ *
+ * Exactly one function computes this (`sdkSessionManager.deriveLiveness`); PUSH
+ * (`session:health` SSE) and PULL (`/api/health`) both ship the SAME object. The
+ * client is meant to store this one value and render it, instead of re-deriving
+ * liveness from an OR of proxies. Introduced additively — existing fields on
+ * SessionHealthEvent remain until the client is migrated (design doc, step 2).
+ */
+export type LivenessPhase = 'idle' | 'main-turn' | 'background';
+
+export interface Liveness {
+  /** The one dot-driving fact. `idle` → no dots; anything else → dots. */
+  phase: LivenessPhase;
+  /** The CURRENT turn's start (ms), or null when idle. The strip anchor — null
+   *  when idle so it can never point at a finished turn (review Finding 2). */
+  startedAt: number | null;
+  /** Main thread is emitting this session's own turn (not a subagent's). */
+  mainTurnActive: boolean;
+  /** A Claude subagent / monitor / workflow is running between/around the main
+   *  turn. Detached `run_in_background` shells are excluded (Defect A). */
+  backgroundAgentic: boolean;
+  /** The CLI process is alive — the sidebar LIVE badge's source, kept distinct
+   *  from the dots so a busy process can't imply the turn is emitting. */
+  processAlive: boolean;
+  /** Hung-turn watchdog (unchanged semantics from the legacy fields). */
+  isStuck: boolean;
+  stuckReason?: string;
+  /** Monotonic per session — the client ignores any level with seq ≤ its current,
+   *  so a late/duplicated beat can't move state backward. */
+  seq: number;
+  /** Server clock at derivation, for staleness (a missing heartbeat past ~2×
+   *  interval means "reconnect", never "declare done"). */
+  at: number;
+}
+
 export interface SessionHealthEvent {
   type: 'session:health';
   sessionId: string;
   isProcessing: boolean;
   isStuck: boolean;
   stuckReason?: string;
+  /** The single-source-of-truth liveness projection (design doc). Additive: the
+   *  legacy fields below stay until the client renders `liveness` directly. */
+  liveness?: Liveness;
   /** The in-flight turn's start (ms) — the strip anchor. Present while
    *  isProcessing is true (sourced from the stream buffer, the SAME value
    *  /api/stream-buffer returns). The client's latch-break slices partials

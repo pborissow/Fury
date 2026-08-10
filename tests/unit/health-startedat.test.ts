@@ -78,3 +78,20 @@ describe('emitHealth carries the turn startedAt', () => {
     expect(ev!.startedAt).toBeUndefined();
   });
 });
+
+describe('getTurnStartedAt (the /api/health poll-teardown anchor)', () => {
+  it('returns the same buffer.startedAt the session:health SSE carries', () => {
+    const s = newSession('health-poll-1');
+    s.streamBuffer = makeBuffer(1_720_000_099_999);
+    // The poll teardown in ChatTab strips its refetch on this value; it must equal
+    // the SSE latch-break anchor or the two paths would strip on different cuts.
+    expect(sdkSessionManager.getTurnStartedAt('health-poll-1')).toBe(1_720_000_099_999);
+  });
+
+  it('is undefined for an unknown session or one with no buffer', () => {
+    expect(sdkSessionManager.getTurnStartedAt('no-such-session')).toBeUndefined();
+    const s = newSession('health-poll-2');
+    s.streamBuffer = undefined;
+    expect(sdkSessionManager.getTurnStartedAt('health-poll-2')).toBeUndefined();
+  });
+});
