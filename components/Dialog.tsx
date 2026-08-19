@@ -4,6 +4,7 @@ import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { XIcon } from 'lucide-react';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { Button } from '@/components/ui/button';
+import { Mask, maskClassName } from '@/components/ui/mask';
 
 type ResizeDir = 'n' | 's' | 'e' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 
@@ -267,9 +268,22 @@ export default function Dialog({
   ] : [];
 
   return (
-    <DialogPrimitive.Root open={open} onOpenChange={handleOpenChange}>
+    // Anchored (contained) dialogs run NON-modal: a modal Radix Content sets
+    // `pointer-events: none` on the whole document (plus focus-trap + aria-hidden),
+    // which would freeze the sibling panels even though the dim mask only covers
+    // this container. Non-modal keeps the rest of the app interactive.
+    <DialogPrimitive.Root open={open} onOpenChange={handleOpenChange} modal={!contained}>
       <DialogPrimitive.Portal container={portalContainer ?? undefined}>
-        <DialogPrimitive.Overlay className={`${contained ? 'absolute' : 'fixed'} inset-0 z-50 bg-black/50`} onClick={(e) => e.stopPropagation()} />
+        {contained ? (
+          // Radix's <Dialog.Overlay> renders null when non-modal, so provide our
+          // own mask. It covers (and blocks pointer input to) only this container;
+          // clicks are swallowed here but don't dismiss (see onInteractOutside below).
+          <Mask contained onPointerDown={(e) => e.stopPropagation()} onClick={(e) => e.stopPropagation()} />
+        ) : (
+          // Radix owns this node (presence/animation) so it can't be <Mask>, but it
+          // shares the same scrim tokens via maskClassName.
+          <DialogPrimitive.Overlay className={`fixed inset-0 ${maskClassName}`} onClick={(e) => e.stopPropagation()} />
+        )}
         <DialogPrimitive.Content
           className={`${contained ? 'absolute' : 'fixed'} z-50 focus:outline-none`}
           style={{
