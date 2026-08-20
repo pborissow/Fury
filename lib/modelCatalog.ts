@@ -365,6 +365,54 @@ export async function lastSuccessfulCheckAt(): Promise<number | null> {
 
 // ---- scheduler ----
 
+export interface ScheduleInputs {
+  now: number;
+  /** Last check of ANY kind (ok or failed), ms; 0 if never checked. */
+  lastAt: number;
+  /** Last SUCCESSFUL check, ms; 0 if never succeeded. */
+  lastOkAt: number;
+  /** Whether the most recent attempt failed. */
+  lastFailed: boolean;
+  /** Poll interval in ms (days × DAY_MS, floored at 1 day). */
+  intervalMs: number;
+}
+
+/**
+ * Decide when the next refresh should run. Pure, so the cadence/backoff logic is
+ * unit-tested directly (see model-catalog-schedule.test.ts).
+ *
+ * Anchor the normal cadence on the last SUCCESSFUL check, not the last check of
+ * any kind (P13): every attempt writes a model_checks row, so keying the schedule
+ * off MAX(checked_at) let a single transient failure push the next auto-attempt a
+ * full interval (≤7d) out, and kept the scheduling clock out of step with the
+ * "Index updated" label (successes only).
+ *
+ * After a FAILURE, back off a FIXED interval from the last attempt — full stop.
+ * The previous code clamped this with `Math.min(lastAt + backoff, lastOkAt +
+ * interval)`, intending "don't retry later than the regular cadence." But once
+ * the catalog is overdue (lastOkAt + interval is in the past — the normal state
+ * for a catalog that has been failing), that clamp selected the past timestamp,
+ * which is ≤ now, so the delay collapsed to the MIN_DELAY_MS floor. The result
+ * was a 5-second hot loop hammering the Models API on every failure — e.g. it
+ * turned the brief window while the Claude CLI rotates the on-disk OAuth token
+ * into a storm of ~12 failed 401 requests per minute until rotation finished.
+ * The backoff must not depend on overdue-ness: a failure means wait, period.
+ */
+export function computeNextRun(inputs: ScheduleInputs): { nextAt: number; delayMs: number; overdue: boolean } {
+  const { now, lastAt, lastOkAt, lastFailed, intervalMs } = inputs;
+  let nextAt: number;
+  if (!lastAt) {
+    nextAt = now; // never checked → check now (subject to the MIN_DELAY floor)
+  } else if (lastFailed) {
+    nextAt = lastAt + FAILURE_BACKOFF_MS; // recover within the hour, but never hammer
+  } else {
+    nextAt = lastOkAt + intervalMs;
+  }
+  const overdue = nextAt <= now;
+  const delayMs = Math.max(MIN_DELAY_MS, nextAt - now);
+  return { nextAt, delayMs, overdue };
+}
+
 /**
  * (Re)schedule the next refresh, calibrated from the last recorded check so a
  * restart continues the cadence instead of resetting it. Re-reads the interval
@@ -382,31 +430,13 @@ async function scheduleNext(): Promise<void> {
   const intervalMs = Math.max(1, settings.modelCatalogPollIntervalDays) * DAY_MS;
 
   const db = await getDb();
-  // Anchor the cadence on the last SUCCESSFUL check, not the last check of any kind
-  // (P13). Every attempt — ok OR failed — writes a model_checks row, so keying off
-  // MAX(checked_at) let a single transient failure push the next auto-attempt a full
-  // interval (≤7d) into the future. It also kept the scheduling clock (all attempts)
-  // out of step with the "Index updated" label (successes only). Now: schedule from
-  // the last success normally, and from a SHORT backoff when the most recent attempt
-  // failed, so a transient failure recovers within the hour.
   const okRow = await db.execute("SELECT MAX(checked_at) AS m FROM model_checks WHERE status = 'ok'");
   const lastOkAt = Number(okRow.rows[0]?.m) || 0;
   const lastRow = await db.execute('SELECT checked_at, status FROM model_checks ORDER BY checked_at DESC LIMIT 1');
   const lastAt = Number(lastRow.rows[0]?.checked_at) || 0;
   const lastFailed = lastAt > 0 && lastRow.rows[0]?.status !== 'ok';
 
-  let nextAt: number;
-  if (!lastAt) {
-    nextAt = Date.now(); // never checked → check now
-  } else if (lastFailed) {
-    // Retry soon on the failure backoff, but never later than the normal cadence
-    // would already fire (so an already-overdue catalog still checks now).
-    nextAt = Math.min(lastAt + FAILURE_BACKOFF_MS, (lastOkAt || Date.now()) + intervalMs);
-  } else {
-    nextAt = lastOkAt + intervalMs;
-  }
-  const overdue = nextAt <= Date.now();
-  const delay = Math.max(MIN_DELAY_MS, nextAt - Date.now());
+  const { delayMs: delay, overdue } = computeNextRun({ now: Date.now(), lastAt, lastOkAt, lastFailed, intervalMs });
 
   st.timer = setTimeout(async () => {
     await runModelCatalogCheck(overdue && lastAt ? 'scheduled-overdue' : 'scheduled').catch(e =>
