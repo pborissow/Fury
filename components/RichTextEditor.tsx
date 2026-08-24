@@ -8,14 +8,8 @@ import { Table } from '@tiptap/extension-table';
 import { TableRow } from '@tiptap/extension-table-row';
 import { TableCell } from '@tiptap/extension-table-cell';
 import { TableHeader } from '@tiptap/extension-table-header';
-import TurndownService from 'turndown';
 import { Button } from '@/components/ui/button';
-
-const turndown = new TurndownService({
-  headingStyle: 'atx',
-  bulletListMarker: '-',
-  codeBlockStyle: 'fenced',
-});
+import { htmlToMarkdown } from '@/lib/htmlToMarkdown';
 import { Bold, Code, List, ListOrdered, Type, Send, Mic, MicOff, Square } from 'lucide-react';
 
 interface RichTextEditorProps {
@@ -31,6 +25,7 @@ interface RichTextEditorProps {
   showButtonBar?: boolean; // If true, show mic and send buttons
   debounceMs?: number; // Debounce delay for onChange callback (default: 300ms)
   statusBar?: React.ReactNode; // Optional status bar rendered below the editor
+  autoFocus?: boolean; // If true, focus the editor once it's ready
 }
 
 export interface RichTextEditorHandle {
@@ -53,6 +48,7 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
   showButtonBar = true,
   debounceMs = 300,
   statusBar,
+  autoFocus = false,
 }, ref) {
   const [isRecording, setIsRecording] = useState(false);
   const [isSupported, setIsSupported] = useState(true);
@@ -276,42 +272,9 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
     const plainText = editor.getText().trim();
     if (!plainText) return;
 
-    // Convert HTML to markdown so formatting (bold, lists, code blocks)
-    // is preserved in prompts sent to Claude.
-    // Convert <table> elements to markdown pipe tables via DOM traversal.
-    // Tables are replaced with unique markers before Turndown runs, then
-    // swapped back after — this avoids Turndown collapsing newlines or
-    // escaping pipe characters.
-    const rawHtml = editor.getHTML();
-    const div = document.createElement('div');
-    div.innerHTML = rawHtml;
-    const tableMdMap = new Map<string, string>();
-    div.querySelectorAll('table').forEach((table, idx) => {
-      const rows = table.querySelectorAll('tr');
-      const mdRows: string[] = [];
-
-      rows.forEach((row, i) => {
-        const cells = row.querySelectorAll('th, td');
-        const values = Array.from(cells).map(cell => (cell.textContent || '').trim());
-        mdRows.push('| ' + values.join(' | ') + ' |');
-        if (i === 0) {
-          mdRows.push('| ' + values.map(() => '---').join(' | ') + ' |');
-        }
-      });
-
-      const marker = `FURYTABLE${idx}FURYTABLE`;
-      tableMdMap.set(marker, mdRows.join('\n'));
-      const placeholder = document.createElement('p');
-      placeholder.textContent = marker;
-      table.replaceWith(placeholder);
-    });
-
-    let markdown = turndown.turndown(div.innerHTML).trim();
-
-    // Swap markers back with the raw table markdown
-    for (const [marker, md] of tableMdMap) {
-      markdown = markdown.replace(marker, md);
-    }
+    // Convert HTML to markdown so formatting (bold, lists, code blocks, and
+    // tables) is preserved in prompts sent to Claude.
+    const markdown = htmlToMarkdown(editor.getHTML());
 
     // Stop mic recording on send
     if (isRecording && recognitionRef.current) {
@@ -426,6 +389,15 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
       editor.setEditable(!disabled);
     }
   }, [editor, disabled]);
+
+  // Focus the editor once it's ready when autoFocus is requested. Mirrors the
+  // native input's autoFocus (e.g. the AskUserQuestion dialog focuses the
+  // free-text answer the moment "Other" is chosen).
+  useEffect(() => {
+    if (editor && autoFocus && !disabled) {
+      editor.commands.focus('end');
+    }
+  }, [editor, autoFocus, disabled]);
 
   // Flush any pending debounced save on unmount (e.g. when switching sessions)
   useEffect(() => {

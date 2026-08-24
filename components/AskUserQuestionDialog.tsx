@@ -5,7 +5,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import Dialog from '@/components/Dialog';
 import CopyableCodeBlock from '@/components/CopyableCodeBlock';
-import { Textarea } from '@/components/ui/textarea';
+import RichTextEditor from '@/components/RichTextEditor';
+import { htmlToMarkdown } from '@/lib/htmlToMarkdown';
 import {
   buildProseAnswer,
   buildStructuredAnswers,
@@ -68,8 +69,13 @@ export default function AskUserQuestionDialog({
   const [selections, setSelections] = useState<Map<number, Set<number>>>(new Map());
   // Per-question: whether "Other" is active
   const [useOther, setUseOther] = useState<Map<number, boolean>>(new Map());
-  // Per-question: custom "Other" text
+  // Per-question: custom "Other" answer as clean markdown. This is what gets
+  // sent to Claude (via lib/askUserQuestion serializers) and what drives
+  // validation, so it must stay a plain string — never raw editor HTML.
   const [otherText, setOtherText] = useState<Map<number, string>>(new Map());
+  // Per-question: the editor's raw HTML, kept only to re-seed the RichTextEditor
+  // if "Other" is toggled off and back on (the editor unmounts in between).
+  const [otherHtml, setOtherHtml] = useState<Map<number, string>>(new Map());
 
   const toggleOption = (qIndex: number, oIndex: number, multiSelect: boolean) => {
     setSelections(prev => {
@@ -109,10 +115,17 @@ export default function AskUserQuestionDialog({
     });
   };
 
-  const setOtherTextForQuestion = (qIndex: number, text: string) => {
+  // The RichTextEditor reports HTML on change; store the HTML for re-seeding and
+  // the markdown equivalent as the actual answer.
+  const setOtherContentForQuestion = (qIndex: number, html: string) => {
+    setOtherHtml(prev => {
+      const next = new Map(prev);
+      next.set(qIndex, html);
+      return next;
+    });
     setOtherText(prev => {
       const next = new Map(prev);
-      next.set(qIndex, text);
+      next.set(qIndex, htmlToMarkdown(html));
       return next;
     });
   };
@@ -239,14 +252,14 @@ export default function AskUserQuestionDialog({
                 <div className="flex-1">
                   <div className="text-sm font-medium">Other</div>
                   {useOther.get(qIndex) && (
-                    <Textarea
-                      value={otherText.get(qIndex) || ''}
-                      onChange={(e) => setOtherTextForQuestion(qIndex, e.target.value)}
-                      placeholder="Type your answer..."
-                      rows={2}
-                      className="mt-2"
-                      autoFocus
+                    <div
+                      className="mt-2 h-40"
+                      // The editor lives inside the option's <label>. Without
+                      // stopping propagation, a click or mousedown inside it
+                      // would activate the label and toggle "Other" back off,
+                      // unmounting the editor mid-interaction.
                       onClick={(e) => e.stopPropagation()}
+                      onMouseDown={(e) => e.stopPropagation()}
                       onKeyDown={(e) => {
                         // Plain Enter inserts a newline for longer responses;
                         // Cmd/Ctrl+Enter submits.
@@ -255,7 +268,17 @@ export default function AskUserQuestionDialog({
                           handleSubmit();
                         }
                       }}
-                    />
+                    >
+                      <RichTextEditor
+                        initialContent={otherHtml.get(qIndex) || ''}
+                        onChange={(html) => setOtherContentForQuestion(qIndex, html)}
+                        onSubmit={() => {}}
+                        placeholder="Type your answer..."
+                        showButtonBar={false}
+                        debounceMs={150}
+                        autoFocus
+                      />
+                    </div>
                   )}
                 </div>
               </label>
