@@ -63,7 +63,7 @@ export interface Liveness {
   mainTurnActive: boolean;
   /** A Claude subagent / monitor / workflow is running between/around the main
    *  turn. Detached `run_in_background` shells are excluded (Defect A). */
-  backgroundAgentic: boolean;
+  backgroundActive: boolean;
   /** The CLI process is alive — the sidebar LIVE badge's source, kept distinct
    *  from the dots so a busy process can't imply the turn is emitting. */
   processAlive: boolean;

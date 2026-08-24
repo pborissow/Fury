@@ -174,24 +174,28 @@ interface SdkSession {
   // so the disk fallback is disabled to avoid a stale-window over-report. Reset with
   // backgroundTasks on a new process (startQuery).
   sawBackgroundLevelSignal?: boolean;
-  // Wall-clock of the last background-task SIGNAL (a `background_tasks_changed`
-  // LEVEL payload or any `task_*` EDGE). Used to self-heal a wedged set: the set
-  // is only ever emptied by a clearing LEVEL signal, so if that terminal signal
-  // is lost (a dropped stream, a crash/restart mid-task) a non-empty set pins
-  // backgroundActive TRUE forever and the dots never stop. computeBackgroundActive
-  // treats a non-empty set with an idle main turn, no subagent activity, and no
-  // signal within WEDGED_BG_GRACE_MS as stale and drops it.
+  // Wall-clock anchor for the wedge-heal grace. Used to self-heal a wedged set:
+  // the set is only ever emptied by a clearing LEVEL signal, so if that terminal
+  // signal is lost (a dropped stream, a crash/restart mid-task) a non-empty set
+  // pins backgroundActive TRUE forever and the dots never stop.
+  // computeBackgroundActive treats a non-empty set with an idle main turn, no
+  // subagent activity, and no signal within WEDGED_BG_GRACE_MS as stale, and
+  // drops it.
+  //
+  // Refreshed at FOUR sites — the last two exist so the grace measures silence
+  // from when it actually needs to start counting, not from a dispatch edge:
+  //   1. a `background_tasks_changed` LEVEL payload,
+  //   2. any `task_*` EDGE,
+  //   3. the processing→idle transition — i.e. the START of the background
+  //      phase. Without this the clock is anchored at a mid-turn dispatch and
+  //      ages while the main turn is still processing, pre-spending part of the
+  //      grace and clearing a still-live quiet task early (the flicker in
+  //      docs/ticket-live-badge-flicker-quiet-background-task.md),
+  //   4. sidechain messages (`parent_tool_use_id != null`) while a set exists —
+  //      a streaming subagent is proof-of-life.
+  // NOT refreshed by arbitrary inbound messages: idle-process noise must never
+  // keep a genuinely dead set lit.
   lastBgActivityAt?: number;
-  // Whether the CURRENT `backgroundTasks` set contains at least one AGENTIC task
-  // (a Claude subagent / monitor / workflow) as opposed to only detached shells
-  // (`run_in_background` Bash: a dev server, a long test, a tail). Recomputed on
-  // each `background_tasks_changed` LEVEL signal from each task's `task_type`.
-  // Load-bearing in computeBackgroundActive: a set of ONLY detached shells must
-  // NOT sustain the "Claude is working" dots via the 120s wedge grace once the
-  // main turn is idle — a backgrounded shell outliving the turn is not Claude
-  // work (docs/ticket-dots-desync-subagent-heavy-session.md, Defect A). A genuine
-  // background Task keeps the intended v24 behaviour.
-  backgroundHasAgentic?: boolean;
   // Monotonic liveness sequence for the single-source-of-truth projection
   // (docs/design-liveness-single-source-of-truth.md). Bumped on every emitted
   // level (emitHealth) so the client can ignore an out-of-order/duplicate beat.
@@ -297,20 +301,6 @@ const SUBAGENT_RUNNING_WINDOW_MS = 120_000;
  *  clock via task_* edges / subagent writes well inside this, so only a truly
  *  silent (wedged) set reaches it. */
 const WEDGED_BG_GRACE_MS = SUBAGENT_RUNNING_WINDOW_MS;
-
-/** Raw `task_type` discriminants (from `background_tasks_changed`) that denote a
- *  DETACHED SHELL — a `run_in_background` Bash task (dev server, long test, tail):
- *  work the harness backgrounds, NOT Claude reasoning/subagent work. Everything
- *  else (subagent / monitor / workflow / unknown) is treated as AGENTIC so we fail
- *  toward showing liveness for anything genuinely Claude-driven. Matching is
- *  case-insensitive and lenient (substring) so minor label drift ('shell' vs
- *  'bash_shell') still classifies. See docs/ticket-dots-desync-subagent-heavy-
- *  session.md, Defect A. */
-function isDetachedShellTaskType(taskType: unknown): boolean {
-  if (typeof taskType !== 'string') return false;
-  const t = taskType.toLowerCase();
-  return t.includes('shell') || t === 'bash';
-}
 
 /** Liveness probe: signal 0 throws iff the pid is gone (or not ours to signal). */
 function pidAlive(pid: number): boolean {
@@ -1490,31 +1480,37 @@ class SdkSessionManager {
       // A non-empty set is authoritative WHILE the main turn is processing or while
       // a subagent is still writing its transcript — either way, Claude is working.
       if (s.isProcessing || this.hasRecentSubagentActivity(s)) return true;
-      // Main turn idle, no live subagent transcript. What remains?
+      // Main turn idle, no live subagent transcript. EVERY kind of background task
+      // — agentic (subagent/monitor/workflow) AND detached `run_in_background`
+      // shells — keeps the session lit while background signals are still arriving
+      // (a task_* edge, a level payload, or a sidechain message refreshes
+      // lastBgActivityAt). Beyond WEDGED_BG_GRACE_MS with NO signal the terminal
+      // clearing `background_tasks_changed` was lost (dropped stream / crash
+      // mid-task) and the set would wedge the dots on forever, so drop it to
+      // self-heal.
       //
-      //  - AGENTIC tasks (subagent/monitor/workflow): keep the dots lit while
-      //    background signals are still arriving (any task_* edge / level payload
-      //    refreshes lastBgActivityAt) — this is the intended v24 cross-turn liveness.
-      //    Beyond WEDGED_BG_GRACE_MS with NO signal, the terminal clearing
-      //    `background_tasks_changed` was lost (dropped stream / crash mid-task) and
-      //    the set would wedge the dots on forever, so drop it to self-heal.
+      // NOTE — this DELIBERATELY REVERSES Defect A (docs/ticket-dots-desync-
+      // subagent-heavy-session.md), which held that a shell-only set must go dark
+      // as soon as the main turn is idle. Product decision of 2026-08-21
+      // (docs/ticket-live-badge-flicker-quiet-background-task.md): a backgrounded
+      // build / dev server / test run IS work the user wants to see as live.
       //
-      //  - DETACHED SHELLS ONLY (`run_in_background` Bash outliving the turn): NOT
-      //    Claude work. Do not light "Claude is working" via the grace — fall through
-      //    to return false so a finished turn's dots clear promptly (Defect A). Leave
-      //    the set intact: the shell is still live and a later membership-level signal
-      //    (its exit) will REPLACE the set cleanly; clearing here would just churn.
-      if (s.backgroundHasAgentic) {
-        const staleForMs = Date.now() - (s.lastBgActivityAt ?? 0);
-        if (staleForMs < WEDGED_BG_GRACE_MS) return true;
-        log.info('sdk.bg', 'cleared wedged background tasks (idle, no activity)', {
-          sessionId: s.sessionId,
-          corrId: s.sessionId,
-          data: { count: s.backgroundTasks.size, staleForMs },
-        });
-        s.backgroundTasks.clear();
-        s.backgroundHasAgentic = false;
-      }
+      // The old `if (s.backgroundHasAgentic)` gate that implemented Defect A is
+      // gone rather than merely left unsatisfied, because it had become BOTH inert
+      // and a trap: it keyed on `isDetachedShellTaskType`, which tested for
+      // 'shell'/'bash' — but the real CLI emits `local_bash` for a backgrounded
+      // Bash, so the gate never actually fired in production. Keeping it would mean
+      // a future CLI rename to any value containing 'shell' would silently send
+      // every background shell dark again. There is now ONE rule: a non-empty set
+      // is live until the grace expires.
+      const staleForMs = Date.now() - (s.lastBgActivityAt ?? 0);
+      if (staleForMs < WEDGED_BG_GRACE_MS) return true;
+      log.info('sdk.bg', 'cleared wedged background tasks (idle, no activity)', {
+        sessionId: s.sessionId,
+        corrId: s.sessionId,
+        data: { count: s.backgroundTasks.size, staleForMs },
+      });
+      s.backgroundTasks.clear();
     }
     if (s.sawBackgroundLevelSignal) return false;
     return this.hasRecentSubagentActivity(s);
@@ -1985,7 +1981,6 @@ class SdkSessionManager {
     // process would pin the session "live" until the next membership change.
     s.backgroundTasks.clear();
     s.sawBackgroundLevelSignal = false;
-    s.backgroundHasAgentic = false;
 
     const cwd = s.projectPath || process.cwd();
     const existing = findSessionJsonlDir(s.sessionId, cwd) !== null;
@@ -2141,6 +2136,25 @@ class SdkSessionManager {
     s.lastActivity = Date.now();
     const anyMsg = msg as any;
 
+    // SIDECHAIN PROOF-OF-LIFE for the wedge-heal clock (complementary to the
+    // processing→idle anchor at the `result` case). A background subagent streams
+    // its work back to the parent with `parent_tool_use_id` set; those messages are
+    // direct evidence the task is alive even when it emits no task_* edge and no
+    // membership-level signal — the exact silent-task shape that tripped the early
+    // clear in docs/ticket-live-badge-flicker-quiet-background-task.md.
+    //
+    // DELIBERATELY NARROW on two axes, because over-refreshing would defeat the
+    // self-heal this clock exists for:
+    //   1. Sidechain only (`parent_tool_use_id != null`) — NOT every inbound
+    //      message. While the main turn is idle a warm SDK process can still emit
+    //      system/keepalive noise, and refreshing on that would keep a genuinely
+    //      DEAD set lit forever.
+    //   2. Only when a background set actually exists — an idle session with no
+    //      live background task never has its clock touched at all.
+    if (anyMsg.parent_tool_use_id != null && s.backgroundTasks.size > 0) {
+      s.lastBgActivityAt = Date.now();
+    }
+
     switch (msg.type) {
       case 'system':
         if (anyMsg.subtype === 'init') {
@@ -2174,13 +2188,6 @@ class SdkSessionManager {
           s.backgroundTasks = new Set<string>(
             tasks.map((t: { task_id?: unknown }) => t?.task_id).filter((id: unknown): id is string => typeof id === 'string'),
           );
-          // Classify the set: does it hold any AGENTIC task (subagent/monitor/
-          // workflow) or only detached `run_in_background` shells? A shell-only set
-          // must not pin the dots on past the main turn (Defect A) — computeBackground
-          // Active gates the wedge grace on this.
-          s.backgroundHasAgentic = tasks.some(
-            (t: { task_type?: unknown }) => !isDetachedShellTaskType(t?.task_type),
-          );
           // The live level is now authoritative for this process; stop using the
           // durable disk fallback (it would otherwise linger for the staleness window
           // after the last task completes).
@@ -2190,13 +2197,17 @@ class SdkSessionManager {
           log.info('sdk.bg', 'background tasks changed', {
             sessionId: s.sessionId,
             corrId: s.sessionId,
-            // Log the RAW `task_type`s (review Finding 3): the classifier assumes a
-            // 'shell'/'bash' wire value for detached bash, but the emitter is the
-            // compiled CLI and the value is unverified. Logging it lets us pin the
-            // real discriminant from a live run and confirm Defect A actually fires.
+            // Log the RAW `task_type`s. This started as review Finding 3 (pin the
+            // real wire discriminant, which the old shell classifier only assumed)
+            // and it paid off: it proved a `run_in_background` Bash arrives as
+            // `local_bash`, matching neither 'shell' nor 'bash', which is how a
+            // detached shell was misclassified as agentic in the 2026-08-20
+            // incident. Liveness no longer branches on task_type at all, so this is
+            // now pure observability — keep it: it is the ONLY record of what the
+            // compiled CLI actually emits, and the next behaviour question about
+            // task kinds will be answered from these lines.
             data: {
               count: s.backgroundTasks.size,
-              hasAgentic: s.backgroundHasAgentic,
               types: tasks.map((t: { task_type?: unknown }) => t?.task_type),
             },
           });
@@ -2534,7 +2545,32 @@ class SdkSessionManager {
         // cycle instead of a burst of redundant idle events (each of which would
         // otherwise race the next turn's re-assert). The startedAt-anchored strip
         // means a brief result→message_start→result flap still re-strips cleanly.
-        if (wasProcessing) this.emitHealth(s, false);
+        if (wasProcessing) {
+          // ANCHOR THE WEDGE GRACE AT THE START OF THE BACKGROUND PHASE.
+          //
+          // `lastBgActivityAt` is otherwise only refreshed by background SIGNALS
+          // (a level payload at :2188, a task_* edge at :2219). A task dispatched
+          // mid-turn stamps the clock at DISPATCH, and it then ages while the main
+          // turn keeps processing — so by the time the turn ends and the background
+          // phase actually begins, part of the WEDGED_BG_GRACE_MS budget is already
+          // spent. A quiet task whose true idle-silent window is UNDER the grace
+          // could still be cleared as "wedged", flickering the Live badge dark while
+          // the session was genuinely still working
+          // (docs/ticket-live-badge-flicker-quiet-background-task.md).
+          //
+          // Re-stamping here makes the grace measure silence from the moment it
+          // actually needs to start counting — main-turn idle — rather than from a
+          // mid-processing dispatch edge. Self-heal is preserved, just correctly
+          // anchored: a set whose terminal signal is genuinely lost still clears one
+          // full grace after the turn ends.
+          //
+          // Unconditional (not gated on a non-empty set) because the value is only
+          // ever READ when the set is non-empty and agentic; stamping on a turn
+          // boundary is a real liveness event, not the idle-noise that criterion 3
+          // guards against.
+          s.lastBgActivityAt = Date.now();
+          this.emitHealth(s, false);
+        }
         break;
       }
     }
@@ -2688,10 +2724,10 @@ class SdkSessionManager {
     // The ONE place the "does a detached shell count?" question is answered — reused
     // from computeBackgroundActive (agentic-only since Defect A), so no surface can
     // re-litigate it. Phase gives the main turn precedence over background.
-    const backgroundAgentic = this.computeBackgroundActive(s);
+    const backgroundActive = this.computeBackgroundActive(s);
     const phase: Liveness['phase'] = mainTurnActive
       ? 'main-turn'
-      : backgroundAgentic
+      : backgroundActive
         ? 'background'
         : 'idle';
     // The anchor is the CURRENTLY-STREAMING turn's start, so it is non-null ONLY in
@@ -2700,12 +2736,12 @@ class SdkSessionManager {
     // answer (review-dots-desync-fix Finding 2 reborn); in `idle` there is no turn.
     // Gating on mainTurnActive (not just !idle) keeps the anchor off a finished turn.
     const startedAt = mainTurnActive ? (s.streamBuffer?.startedAt ?? null) : null;
-    const { isStuck, stuckReason } = this.computeStuck(s, mainTurnActive, backgroundAgentic);
+    const { isStuck, stuckReason } = this.computeStuck(s, mainTurnActive, backgroundActive);
     return {
       phase,
       startedAt,
       mainTurnActive,
-      backgroundAgentic,
+      backgroundActive,
       // The sidebar LIVE badge's source is PID-liveness, NOT the query object: `s.q`
       // is transiently nulled between/around turns (consume()'s finally, interrupts)
       // while the CLI process stays warm, so `!!s.q` would read dark for a warm-idle
@@ -2739,7 +2775,7 @@ class SdkSessionManager {
     // not-yet-migrated client's idle-commit/latch-break paths are unchanged; the
     // projection's null-when-idle anchor lives on `liveness.startedAt` (step 2 uses it).
     const startedAt = s.streamBuffer?.startedAt;
-    const backgroundActive = liveness.backgroundAgentic;
+    const backgroundActive = liveness.backgroundActive;
     const { isStuck, stuckReason } = liveness;
     // Keep the reconcile tick's transition tracking in step with what we emit, so
     // it only re-emits on a real stuck-state flip (P7).

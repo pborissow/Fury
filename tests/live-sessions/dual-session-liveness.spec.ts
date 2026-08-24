@@ -7,8 +7,10 @@
  * we actually hit (reproduced organically in `f407574a`) is a property of the PAIR:
  *
  *   - OWNER session O launches a drive as a `run_in_background` Bash and ENDS its
- *     turn — its Defect-A surface: a detached shell that outlives the turn must NOT
- *     count as "Claude is working" (no phantom dots / no non-idle phase).
+ *     turn — its cross-turn-liveness surface: a detached shell that outlives the turn
+ *     MUST keep reading as live for the grace window. (This was the inverse — Defect A,
+ *     "a shell is not Claude work" — until the 2026-08-21 decision in
+ *     docs/ticket-live-badge-flicker-quiet-background-task.md reversed it.)
  *   - DRIVEN session T fans out PARALLEL FOREGROUND scouts against real Gypsy — its
  *     scenario-2 surface: the dots/phase must not go dark mid-turn.
  *
@@ -29,9 +31,12 @@
  *     `liveness` yet, so DOM still follows the legacy path. It is recorded always and
  *     asserted only under STEP2=1, so this suite stays green pre-step-2 and becomes
  *     the gate once the client switch lands.
- *   - Assertion 1 also PINS Finding 3: it records the raw `task_type` a
- *     `run_in_background` Bash actually arrives as, and fails if a shell-only set is
- *     classified agentic (the wire value the classifier assumes was never verified).
+ *   - Assertion 1 records the raw `task_type` a `run_in_background` Bash arrives as,
+ *     and asserts such a set reads as LIVE once the main turn is idle. It formerly
+ *     asserted the opposite (Defect A) and formerly failed if the set was classified
+ *     agentic; that Finding-3 check is what pinned the real wire value as
+ *     `local_bash`, and both were reversed by the 2026-08-21 decision in
+ *     docs/ticket-live-badge-flicker-quiet-background-task.md.
  *
  * COST/TIME: two real multi-minute turns (a planning fan-out + a background bash).
  * Budget ~12 min and a few dollars. Lives in tests/live-sessions (costly), gated on
@@ -152,7 +157,7 @@ function pushHealth(sessionId: string): Array<{ ts: number; phase?: string; seq?
 type Sample = {
   t: number; wall: number;
   phase?: string; seq?: number; startedAt?: number | null;
-  mainTurnActive?: boolean; backgroundAgentic?: boolean; processAlive?: boolean;
+  mainTurnActive?: boolean; backgroundActive?: boolean; processAlive?: boolean;
   proc: boolean; bg: boolean;
   dots?: boolean; bubbles?: number; // T only (focused DOM)
 };
@@ -162,7 +167,7 @@ function record(h: any, tSec: number): Sample {
   return {
     t: tSec, wall: Date.now(),
     phase: lv.phase, seq: lv.seq, startedAt: lv.startedAt,
-    mainTurnActive: lv.mainTurnActive, backgroundAgentic: lv.backgroundAgentic, processAlive: lv.processAlive,
+    mainTurnActive: lv.mainTurnActive, backgroundActive: lv.backgroundActive, processAlive: lv.processAlive,
     proc: !!h?.isProcessing, bg: !!h?.backgroundActive,
   };
 }
@@ -274,34 +279,46 @@ test('dual-session liveness: owner-idle-with-bash + driven-scout-planning stay h
 
   console.log('\n[E2E] ===== SUMMARY =====');
   console.log(`   owner bg task_type(s):     ${JSON.stringify(observedShellTypes)}`);
-  console.log(`   owner bg sets (count>=1):  ${oBgActive.length}  hasAgentic=${JSON.stringify(oBgActive.map((e) => e.data?.hasAgentic))}`);
+  console.log(`   owner bg sets (count>=1):  ${oBgActive.length}`);
   console.log(`   owner samples:             ${samplesO.length}`);
   console.log(`   driven samples:            ${samplesT.length}  sawWork=${tSawWork}`);
   console.log(`   driven push phases:        ${pushT.map((p) => p.phase ?? p.msg).join(' → ')}`);
 
   // ---------------------------------------------------------------------------
-  // Assertion 1 — OWNER / Defect A (+ Finding 3): a detached bash is not "working".
+  // Assertion 1 — OWNER: a detached bash outliving its turn IS "working".
+  //
+  // REVERSED on 2026-08-21 (docs/ticket-live-badge-flicker-quiet-background-task.md).
+  // This assertion used to enforce Defect A — owner phase must be 'idle' while only a
+  // detached bash ran — and to fail if such a set was classified agentic. Both are
+  // now inverted: a backgrounded build / dev server / test run is work the user wants
+  // shown as live, liveness no longer branches on task_type at all, and the
+  // `hasAgentic` field this once asserted on no longer exists.
+  //
+  // The old Finding-3 check did its job before being retired: it is what pinned
+  // `local_bash` as the real wire value for a `run_in_background` Bash — matching
+  // neither 'shell' nor 'bash', hence the misclassification behind the 2026-08-20
+  // incident. We still RECORD the observed types (the only live evidence of what the
+  // compiled CLI emits) and now assert the opposite behaviour.
   // ---------------------------------------------------------------------------
   if (ownerReady && oBgActive.length) {
-    // Finding 3: the raw wire value is now captured — fail if a shell-only set was
-    // classified agentic (the assumed 'shell'/'bash' discriminant didn't match).
-    const misclassified = oBgActive.filter((e) => e.data?.hasAgentic === true);
+    // The owner's phase must be NON-idle for essentially the whole bash window while
+    // its main turn is idle — that is the cross-turn liveness the decision bought.
+    //
+    // Tolerance: the wedge grace (WEDGED_BG_GRACE_MS, 120s) still self-heals a set
+    // whose terminal signal is lost, and a bash that outlives the grace legitimately
+    // goes dark at that point (a known, accepted gap — see the ticket). So require
+    // the badge lit at the START of the idle-bash window rather than throughout.
+    const idleBash = samplesO.filter((s) => inBashWindow(s.wall) && s.mainTurnActive === false);
+    const early = idleBash.filter((s) => s.wall < bgStart + 60_000);
+    const dark = early.filter((s) => s.phase === 'idle');
     expect(
-      misclassified.length,
-      `Finding 3: owner's detached run_in_background bash was classified AGENTIC ` +
-        `(task_type(s)=${JSON.stringify(observedShellTypes)}) — isDetachedShellTaskType did not match the real wire value`,
-    ).toBe(0);
-
-    // Defect A: while the owner's main turn is idle and only the detached bash runs,
-    // its projection phase must be 'idle' — never phantom-lit.
-    const phantom = samplesO.filter((s) => inBashWindow(s.wall) && s.mainTurnActive === false && s.phase && s.phase !== 'idle');
-    expect(
-      phantom.length,
-      `Defect A: owner phase was non-idle while only a detached bash ran ` +
-        `(first at ${phantom[0]?.t}s, phase=${phantom[0]?.phase})`,
+      dark.length,
+      `owner phase went idle while its detached bash was still running ` +
+        `(task_type(s)=${JSON.stringify(observedShellTypes)}, first at ${dark[0]?.t}s) — ` +
+        `a backgrounded shell must read as live for at least the grace window`,
     ).toBe(0);
   } else {
-    console.warn('[E2E] SKIP assertion 1 (Defect A / Finding 3): owner never produced an idle-with-bash window');
+    console.warn('[E2E] SKIP assertion 1 (detached-bash liveness): owner never produced an idle-with-bash window');
   }
 
   // ---------------------------------------------------------------------------
@@ -368,8 +385,14 @@ test('dual-session liveness: owner-idle-with-bash + driven-scout-planning stay h
   // T's scouts must not move O. Concretely: within O's bash window, T's phase is
   // driven only by T's own work, and O's phase stays idle whenever O's main turn is.
   // ---------------------------------------------------------------------------
-  const oLeaked = samplesO.filter((s) => inBashWindow(s.wall) && s.mainTurnActive === false && s.phase && s.phase !== 'idle');
-  expect(oLeaked.length, `isolation: owner phase went non-idle during its own idle bash window (T's work leaked into O?)`).toBe(0);
+  // NOTE: this used to assert O's phase was 'idle' throughout its bash window, which
+  // silently doubled as a Defect A check. Since 2026-08-21 O is LEGITIMATELY non-idle
+  // there (its detached bash counts as live), so that form would now always fail.
+  // Narrow it to the actual leak signature: O may be 'background' for its own bash,
+  // but it must never read 'main-turn' while O's main turn is demonstrably inactive —
+  // that would mean T's turn bled into O's projection.
+  const oLeaked = samplesO.filter((s) => inBashWindow(s.wall) && s.mainTurnActive === false && s.phase === 'main-turn');
+  expect(oLeaked.length, `isolation: owner projected 'main-turn' while its own main turn was idle (T's work leaked into O?)`).toBe(0);
   // T being main-turn during O's bash window proves the two are independent streams.
   const tActiveDuringOwnerBash = samplesT.some((s) => inBashWindow(s.wall) && s.phase === 'main-turn');
   if (bgStart !== Infinity) {

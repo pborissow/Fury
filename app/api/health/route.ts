@@ -29,7 +29,7 @@ export async function GET(request: NextRequest) {
     // turn (docs/ticket-live-badge-dark-during-background-subagent.md). Read it OFF
     // the projection so computeBackgroundActive runs ONCE per request (it mutates a
     // wedged set + logs); only fall back to a direct call for a CLI-only session.
-    const backgroundActive = liveness ? liveness.backgroundAgentic : sdkSessionManager.isBackgroundActive(sessionId);
+    const backgroundActive = liveness ? liveness.backgroundActive : sdkSessionManager.isBackgroundActive(sessionId);
     // The current turn's start timestamp — mirrors the session:health SSE payload's
     // legacy field (raw buffer start, present even when idle). Distinct from the
     // projection's null-when-not-main-turn `liveness.startedAt` anchor.

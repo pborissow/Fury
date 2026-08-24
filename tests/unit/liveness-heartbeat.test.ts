@@ -86,15 +86,31 @@ describe('liveness heartbeat — re-emits the level while non-idle', () => {
     expect(cap.events.some((e) => e.sessionId === 'hb-dead')).toBe(false);
   });
 
-  it('a shell-only background set does NOT beat (Defect A: detached shells are not work)', () => {
+  it('a shell-only background set DOES beat (Defect A reversed 2026-08-21)', () => {
+    // Was: a detached shell is not work, so the heartbeat must stay silent for it.
+    // Reversed — a backgrounded build/dev-server keeps the session lit, so it must
+    // also keep beating, otherwise the badge would decay between membership signals.
     const s = newSession('hb-shell');
-    mgr.handle(s, bg([{ id: 'sh1', type: 'shell' }]));
+    mgr.handle(s, bg([{ id: 'sh1', type: 'local_bash' }]));
     s.isProcessing = false;
     s.lastBgActivityAt = Date.now();
     const cap = captureHealth();
     mgr.heartbeatTick();
     cap.stop();
-    expect(cap.events.some((e) => e.sessionId === 'hb-shell')).toBe(false);
+    expect(cap.events.some((e) => e.sessionId === 'hb-shell')).toBe(true);
+  });
+
+  it('a WEDGED background set stops beating once the grace expires (self-heal)', () => {
+    // The counterpart to the above: liveness no longer branches on task kind, so the
+    // grace is the ONLY thing that stops a lost-terminal-signal set beating forever.
+    const s = newSession('hb-wedged');
+    mgr.handle(s, bg([{ id: 'sh1', type: 'local_bash' }]));
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now() - 4 * 60_000;
+    const cap = captureHealth();
+    mgr.heartbeatTick();
+    cap.stop();
+    expect(cap.events.some((e) => e.sessionId === 'hb-wedged')).toBe(false);
   });
 
   it('each beat advances the level seq (a fresh level, so the client can order them)', () => {

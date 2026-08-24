@@ -150,70 +150,166 @@ describe('background_tasks_changed → liveness', () => {
 });
 
 /**
- * Defect A (docs/ticket-dots-desync-subagent-heavy-session.md): a detached
- * `run_in_background` Bash task (`task_type: 'shell'`/'bash') is NOT Claude work,
- * so once the main turn is idle it must not keep the dots lit via the 120s wedge
- * grace — the phantom-dots-over-a-finished-bubble symptom. A genuine background
- * subagent/monitor/workflow keeps its intended v24 cross-turn liveness.
+ * Wedge-grace ANCHORING (docs/ticket-live-badge-flicker-quiet-background-task.md).
+ *
+ * The grace must measure background silence from the START OF THE BACKGROUND PHASE
+ * (main-turn idle), not from the dispatch edge. Anchored at dispatch, the clock ages
+ * while the main turn is still processing, so a quiet task can be cleared as "wedged"
+ * while it is genuinely alive — the Live badge flickers dark mid-work.
+ *
+ * Numbers below are the real ones from the logged incident (session 58bbacd1,
+ * fury-2026-08-20.jsonl): dispatch 41.6s before the turn ended, then 78.5s of silence
+ * — 120.1s since dispatch (past the 120s grace → cleared) but only 78.5s since idle.
  */
-describe('background_tasks_changed → detached shells vs Claude subagents (Defect A)', () => {
-  it('a detached-shell-only set keeps dots lit WHILE the main turn processes', () => {
-    const s = newSession('bg-shell-proc');
-    mgr.handle(s, bgChangedTyped([{ id: 'sh1', type: 'shell' }]));
-    expect(s.backgroundHasAgentic).toBe(false);
-    s.isProcessing = true;
-    expect(mgr.isBackgroundActive('bg-shell-proc')).toBe(true); // main turn covers it
-  });
+describe('wedge grace is anchored at the background phase, not at dispatch', () => {
+  const result = () => ({ type: 'result', subtype: 'success', result: 'ok' });
 
-  it('a detached-shell-only set does NOT sustain dots once the main turn is idle (no phantom dots)', () => {
-    const s = newSession('bg-shell-idle');
-    mgr.handle(s, bgChangedTyped([{ id: 'sh1', type: 'shell' }]));
-    s.isProcessing = false;
-    s.lastBgActivityAt = Date.now(); // FRESH — well within the grace
-    // Pre-fix this returned true for the full grace (phantom dots over a finished
-    // bubble). A detached run_in_background shell is not "Claude is working".
-    expect(mgr.isBackgroundActive('bg-shell-idle')).toBe(false);
-    // The set is left INTACT (the shell is still live; a later level signal — its
-    // exit — REPLACES the set cleanly). Clearing here would only churn.
+  /** An inbound message on a subagent sidechain (streamed back to the parent). */
+  const sidechain = () => ({ type: 'stream_event', parent_tool_use_id: 'toolu_sub', event: null });
+  /** The same message shape on the MAIN thread — no parent_tool_use_id. */
+  const mainThread = () => ({ type: 'stream_event', event: null });
+
+  it('re-anchors the clock when the main turn goes idle (the reported flicker)', () => {
+    const s = newSession('bg-anchor');
+    mgr.handle(s, bgChanged(['t1']));
+
+    // The task was dispatched 41.6s ago and has been silent since; the main turn is
+    // still processing, so the badge is live via isProcessing.
+    s.isProcessing = true;
+    s.lastBgActivityAt = Date.now() - 41_600;
+
+    mgr.handle(s, result()); // turn ends → the background phase begins HERE
+    expect(s.isProcessing).toBe(false);
+    expect(Date.now() - s.lastBgActivityAt).toBeLessThan(1_000); // clock re-anchored
+
+    // 78.5s of total background silence. Measured from DISPATCH that is 120.1s and
+    // the set would be cleared as wedged (the bug). Measured from idle-start it is
+    // well inside the grace, so the badge stays lit for the whole background window.
+    s.lastBgActivityAt = Date.now() - 78_500;
+    expect(mgr.isBackgroundActive('bg-anchor')).toBe(true);
     expect(s.backgroundTasks.size).toBe(1);
   });
 
-  it('classifies a bash task as a detached shell too', () => {
-    const s = newSession('bg-bash');
-    mgr.handle(s, bgChangedTyped([{ id: 'b1', type: 'bash' }]));
-    expect(s.backgroundHasAgentic).toBe(false);
-    s.isProcessing = false;
-    s.lastBgActivityAt = Date.now();
-    expect(mgr.isBackgroundActive('bg-bash')).toBe(false);
+  it('still self-heals a wedged set — one full grace measured FROM idle-start', () => {
+    const s = newSession('bg-anchor-heal');
+    mgr.handle(s, bgChanged(['t1']));
+    s.isProcessing = true;
+    mgr.handle(s, result()); // anchor at idle-start
+
+    // The terminal clearing signal is genuinely lost and nothing ever emits again.
+    // The heal must still fire — just measured from the background phase, not forever.
+    s.lastBgActivityAt = Date.now() - 121_000;
+    expect(mgr.isBackgroundActive('bg-anchor-heal')).toBe(false);
+    expect(s.backgroundTasks.size).toBe(0);
   });
 
-  it('a MIXED set (subagent + shell) still sustains via the grace while idle', () => {
+  it('a sidechain message from a running subagent refreshes the clock (proof-of-life)', () => {
+    const s = newSession('bg-sidechain');
+    mgr.handle(s, bgChanged(['t1']));
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now() - 4 * 60_000; // would be stale…
+
+    mgr.handle(s, sidechain()); // …but the subagent is visibly still streaming
+    expect(mgr.isBackgroundActive('bg-sidechain')).toBe(true);
+    expect(s.backgroundTasks.size).toBe(1);
+  });
+
+  it('a MAIN-THREAD message does NOT refresh the clock (scoping keeps the heal working)', () => {
+    const s = newSession('bg-mainthread');
+    mgr.handle(s, bgChanged(['t1']));
+    s.isProcessing = false;
+    s.lastBgActivityAt = Date.now() - 4 * 60_000;
+
+    // Idle-process noise on the main thread is not evidence the background set is
+    // alive. If this refreshed the clock, a genuinely dead set would never self-heal.
+    mgr.handle(s, mainThread());
+    expect(mgr.isBackgroundActive('bg-mainthread')).toBe(false);
+    expect(s.backgroundTasks.size).toBe(0); // healed
+  });
+
+  it('does not touch the clock at all when no background task exists (criterion 3)', () => {
+    const s = newSession('bg-noise');
+    s.isProcessing = false;
+    expect(s.backgroundTasks.size).toBe(0);
+    expect(s.lastBgActivityAt).toBeUndefined();
+
+    mgr.handle(s, sidechain());
+    expect(s.lastBgActivityAt).toBeUndefined(); // never stamped for an empty set
+  });
+});
+
+/**
+ * TASK KIND IS NOT LOAD-BEARING (2026-08-21 decision, docs/ticket-live-badge-
+ * flicker-quiet-background-task.md).
+ *
+ * This block previously asserted Defect A (docs/ticket-dots-desync-subagent-heavy-
+ * session.md): that a detached `run_in_background` Bash must go dark the moment the
+ * main turn goes idle, while only agentic tasks earned the wedge grace. That policy
+ * is REVERSED — a backgrounded build / dev server / test run is work the user wants
+ * to see as live — and the `backgroundHasAgentic` gate it relied on is deleted.
+ *
+ * Why the gate went rather than just flipping its default: it keyed on a 'shell' /
+ * 'bash' `task_type`, but the real CLI emits `local_bash`, so it never fired in
+ * production anyway (that misclassification is what produced the 2026-08-20
+ * incident). Left in place, a CLI rename to anything containing 'shell' would have
+ * silently resurrected the dark-badge behaviour.
+ *
+ * These tests now pin the single rule — a non-empty set is live until the grace
+ * expires, whatever the task kind — using the REAL wire value alongside the
+ * synthetic ones, so no task_type can quietly regain control of liveness.
+ */
+describe('background liveness does not branch on task_type', () => {
+  const KINDS = ['local_bash', 'shell', 'bash', 'subagent', 'monitor', 'workflow', undefined];
+
+  for (const type of KINDS) {
+    it(`treats task_type=${JSON.stringify(type)} as live while the main turn processes`, () => {
+      const s = newSession(`bg-proc-${String(type)}`);
+      mgr.handle(s, bgChangedTyped([{ id: 'x1', type: type as string }]));
+      s.isProcessing = true;
+      expect(mgr.isBackgroundActive(`bg-proc-${String(type)}`)).toBe(true);
+    });
+
+    it(`sustains task_type=${JSON.stringify(type)} through the grace once idle`, () => {
+      const s = newSession(`bg-idle-${String(type)}`);
+      mgr.handle(s, bgChangedTyped([{ id: 'x1', type: type as string }]));
+      s.isProcessing = false;
+      s.lastBgActivityAt = Date.now() - 10_000; // within grace
+      expect(mgr.isBackgroundActive(`bg-idle-${String(type)}`)).toBe(true);
+      expect(s.backgroundTasks.size).toBe(1);
+    });
+
+    it(`self-heals a wedged task_type=${JSON.stringify(type)} set`, () => {
+      const s = newSession(`bg-wedged-${String(type)}`);
+      mgr.handle(s, bgChangedTyped([{ id: 'x1', type: type as string }]));
+      s.isProcessing = false;
+      s.lastBgActivityAt = Date.now() - 4 * 60_000; // past WEDGED_BG_GRACE_MS
+      expect(mgr.isBackgroundActive(`bg-wedged-${String(type)}`)).toBe(false);
+      expect(s.backgroundTasks.size).toBe(0);
+    });
+  }
+
+  it('a detached shell outliving its turn stays live for the grace (Defect A reversed)', () => {
+    // The exact 2026-08-20 shape: a `run_in_background` docker build dispatched
+    // mid-turn, arriving as `local_bash`, still running when the turn ends.
+    const s = newSession('bg-local-bash');
+    mgr.handle(s, bgChangedTyped([{ id: 'b1t7e3w4i', type: 'local_bash' }]));
+    s.isProcessing = true;
+    mgr.handle(s, { type: 'result', subtype: 'success', result: 'ok' });
+
+    // Pre-decision this was dark the instant the turn ended (Defect A); it is now
+    // lit for the whole grace window measured from idle-start.
+    expect(mgr.isBackgroundActive('bg-local-bash')).toBe(true);
+    s.lastBgActivityAt = Date.now() - 119_000;
+    expect(mgr.isBackgroundActive('bg-local-bash')).toBe(true);
+  });
+
+  it('a MIXED set behaves the same as either kind alone', () => {
     const s = newSession('bg-mixed');
-    mgr.handle(s, bgChangedTyped([{ id: 'sub1', type: 'subagent' }, { id: 'sh1', type: 'shell' }]));
-    expect(s.backgroundHasAgentic).toBe(true);
-    s.isProcessing = false;
-    s.lastBgActivityAt = Date.now() - 10_000; // within grace
-    expect(mgr.isBackgroundActive('bg-mixed')).toBe(true);
-    expect(s.backgroundTasks.size).toBe(2);
-  });
-
-  it('unknown/agentic task types (e.g. monitor) fail toward showing liveness via the grace', () => {
-    const s = newSession('bg-monitor');
-    mgr.handle(s, bgChangedTyped([{ id: 'm1', type: 'monitor' }]));
-    expect(s.backgroundHasAgentic).toBe(true);
+    mgr.handle(s, bgChangedTyped([{ id: 'sub1', type: 'subagent' }, { id: 'sh1', type: 'local_bash' }]));
     s.isProcessing = false;
     s.lastBgActivityAt = Date.now() - 10_000;
-    expect(mgr.isBackgroundActive('bg-monitor')).toBe(true);
-  });
-
-  it('a genuine agentic set STILL self-heals when wedged (idle + stale + no activity)', () => {
-    const s = newSession('bg-agentic-wedge');
-    mgr.handle(s, bgChangedTyped([{ id: 'sub1', type: 'subagent' }]));
-    s.isProcessing = false;
-    s.lastBgActivityAt = Date.now() - 4 * 60_000; // past WEDGED_BG_GRACE_MS
-    expect(mgr.isBackgroundActive('bg-agentic-wedge')).toBe(false);
-    expect(s.backgroundTasks.size).toBe(0); // wedged agentic set dropped
-    expect(s.backgroundHasAgentic).toBe(false);
+    expect(mgr.isBackgroundActive('bg-mixed')).toBe(true);
+    expect(s.backgroundTasks.size).toBe(2);
   });
 });
 

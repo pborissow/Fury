@@ -5,8 +5,10 @@
  * `deriveLiveness` is the ONE place "is Claude working?" is computed; PUSH
  * (session:health SSE) and PULL (/api/health) both project from it. These tests
  * drive the private computation + the public getLiveness accessor and assert the
- * five phases, the null-when-idle strip anchor (review Finding 2), the shell-vs-
- * agentic background rule (Defect A), and seq monotonicity (PUSH bumps, PULL reads).
+ * five phases, the null-when-idle strip anchor (review Finding 2), the rule that
+ * background liveness does NOT depend on task kind (Defect A, reversed 2026-08-21 —
+ * see docs/ticket-live-badge-flicker-quiet-background-task.md), and seq monotonicity
+ * (PUSH bumps, PULL reads).
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { sdkSessionManager } from '../../lib/sdkSessionManager';
@@ -51,7 +53,7 @@ describe('deriveLiveness — the single liveness projection', () => {
     expect(lv?.phase).toBe('idle');
     expect(lv?.startedAt).toBeNull();
     expect(lv?.mainTurnActive).toBe(false);
-    expect(lv?.backgroundAgentic).toBe(false);
+    expect(lv?.backgroundActive).toBe(false);
     expect(lv?.processAlive).toBe(true);
   });
 
@@ -73,22 +75,30 @@ describe('deriveLiveness — the single liveness projection', () => {
     s.streamBuffer = makeBuffer(222, false); // a FINISHED main turn's closed buffer
     const lv = sdkSessionManager.getLiveness('lv-bg');
     expect(lv?.phase).toBe('background');
-    expect(lv?.backgroundAgentic).toBe(true);
+    expect(lv?.backgroundActive).toBe(true);
     // The anchor must be NULL here even though phase is non-idle: the main turn is
     // finished, so its startedAt (222) would strip the completed answer if reused
     // (review Finding 2 reborn). Only the main-turn phase carries an anchor.
     expect(lv?.startedAt).toBeNull();
   });
 
-  it('a detached-shell-only set stays idle (Defect A: shells are not Claude work)', () => {
-    const s = newSession('lv-shell');
-    mgr.handle(s, bg([{ id: 'sh1', type: 'shell' }]));
-    s.isProcessing = false;
-    s.lastBgActivityAt = Date.now();
-    const lv = sdkSessionManager.getLiveness('lv-shell');
-    expect(lv?.phase).toBe('idle');
-    expect(lv?.backgroundAgentic).toBe(false);
-    expect(lv?.startedAt).toBeNull();
+  it('a detached-shell set projects `background`, not idle (Defect A reversed 2026-08-21)', () => {
+    // Was: shells are not Claude work, so phase must be 'idle'. Now a backgrounded
+    // build / dev server / test run is work the user wants to see as live, and the
+    // projection no longer branches on task_type at all. Uses `local_bash` — the
+    // value the real CLI actually emits — as well as the synthetic 'shell'.
+    for (const type of ['local_bash', 'shell']) {
+      const id = `lv-shell-${type}`;
+      const s = newSession(id);
+      mgr.handle(s, bg([{ id: 'sh1', type }]));
+      s.isProcessing = false;
+      s.lastBgActivityAt = Date.now();
+      const lv = sdkSessionManager.getLiveness(id);
+      expect(lv?.phase, `task_type=${type}`).toBe('background');
+      expect(lv?.backgroundActive, `task_type=${type}`).toBe(true);
+      // Still no strip anchor outside the main-turn phase (review Finding 2).
+      expect(lv?.startedAt, `task_type=${type}`).toBeNull();
+    }
   });
 
   it('main turn takes precedence over concurrent background work in the phase', () => {
@@ -100,7 +110,7 @@ describe('deriveLiveness — the single liveness projection', () => {
     const lv = sdkSessionManager.getLiveness('lv-both');
     expect(lv?.phase).toBe('main-turn');
     expect(lv?.mainTurnActive).toBe(true);
-    expect(lv?.backgroundAgentic).toBe(true); // both facts true; phase picks main
+    expect(lv?.backgroundActive).toBe(true); // both facts true; phase picks main
   });
 
   it('processAlive stays true for a WARM-idle session (query nulled, PID alive)', () => {
@@ -191,7 +201,7 @@ describe('liveness seq — monotonic on PUSH, read-only on PULL', () => {
     const pulled = sdkSessionManager.getLiveness('agree-1', true)!;
     expect(pulled.phase).toBe(pushed.phase);
     expect(pulled.startedAt).toBe(pushed.startedAt);
-    expect(pulled.backgroundAgentic).toBe(pushed.backgroundAgentic);
+    expect(pulled.backgroundActive).toBe(pushed.backgroundActive);
     expect(pulled.seq).toBe(pushed.seq); // pull reads the last-emitted seq
   });
 });
