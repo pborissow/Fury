@@ -234,54 +234,56 @@ export default function AskUserQuestionDialog({
                 );
               })}
 
-              {/* "Other" option */}
-              <label
-                className={`flex items-start gap-3 p-3 rounded-md border cursor-pointer transition-colors ${
+              {/* "Other" option. The radio and the editor are SIBLINGS, not
+                  nested — the editor must stay outside the <label>. A
+                  contenteditable isn't "interactive content" per HTML, so a
+                  parent <label> runs its activation behavior on every click
+                  inside it, toggling the radio and stealing cursor placement.
+                  That's a default action, not propagation, so it can't be
+                  fixed with stopPropagation (and preventDefault would break
+                  focus/caret in the editor). Keeping it a sibling avoids the
+                  problem entirely. */}
+              <div
+                className={`rounded-md border transition-colors ${
                   useOther.get(qIndex)
                     ? 'border-primary bg-primary/5'
                     : 'border-border hover:bg-accent/50'
                 }`}
               >
-                <input
-                  type={q.multiSelect ? 'checkbox' : 'radio'}
-                  name={`question-${qIndex}`}
-                  checked={useOther.get(qIndex) || false}
-                  onChange={() => toggleOther(qIndex, q.multiSelect)}
-                  className="mt-0.5 accent-primary"
-                />
-                <div className="flex-1">
+                <label className="flex items-start gap-3 p-3 cursor-pointer">
+                  <input
+                    type={q.multiSelect ? 'checkbox' : 'radio'}
+                    name={`question-${qIndex}`}
+                    checked={useOther.get(qIndex) || false}
+                    onChange={() => toggleOther(qIndex, q.multiSelect)}
+                    className="mt-0.5 accent-primary"
+                  />
                   <div className="text-sm font-medium">Other</div>
-                  {useOther.get(qIndex) && (
-                    <div
-                      className="mt-2 h-40"
-                      // The editor lives inside the option's <label>. Without
-                      // stopping propagation, a click or mousedown inside it
-                      // would activate the label and toggle "Other" back off,
-                      // unmounting the editor mid-interaction.
-                      onClick={(e) => e.stopPropagation()}
-                      onMouseDown={(e) => e.stopPropagation()}
-                      onKeyDown={(e) => {
-                        // Plain Enter inserts a newline for longer responses;
-                        // Cmd/Ctrl+Enter submits.
-                        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && isValid) {
-                          e.preventDefault();
-                          handleSubmit();
-                        }
-                      }}
-                    >
-                      <RichTextEditor
-                        initialContent={otherHtml.get(qIndex) || ''}
-                        onChange={(html) => setOtherContentForQuestion(qIndex, html)}
-                        onSubmit={() => {}}
-                        placeholder="Type your answer..."
-                        showButtonBar={false}
-                        debounceMs={150}
-                        autoFocus
-                      />
-                    </div>
-                  )}
-                </div>
-              </label>
+                </label>
+                {useOther.get(qIndex) && (
+                  <div
+                    className="px-3 pb-3 h-40"
+                    onKeyDown={(e) => {
+                      // Plain Enter inserts a newline for longer responses;
+                      // Cmd/Ctrl+Enter submits.
+                      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && isValid) {
+                        e.preventDefault();
+                        handleSubmit();
+                      }
+                    }}
+                  >
+                    <RichTextEditor
+                      initialContent={otherHtml.get(qIndex) || ''}
+                      onChange={(html) => setOtherContentForQuestion(qIndex, html)}
+                      onSubmit={() => {}}
+                      placeholder="Type your answer..."
+                      showButtonBar={false}
+                      debounceMs={150}
+                      autoFocus
+                    />
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         ))}
