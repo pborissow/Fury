@@ -161,6 +161,8 @@ Fury runs sessions on the **Claude Agent SDK** (`sdkSessionsEnabled`, on by defa
 
 6. **Parallel sessions** — Multiple sessions run concurrent warm queries, each with its own subprocess and session UUID. The `activeSessionRef` mechanism ensures only the currently-viewed session's SSE handler updates the display, preventing cross-session contamination. Deleting a session terminates its warm process.
 
+> **Heads-up — don't start long-lived servers _inside_ a session.** Asking Claude to launch a persistent process from a turn (a dev/app server, file watcher, `tail -f`, …) binds it to the session. In the **foreground** it blocks the turn forever — the tool waits on a process that never exits, so the session hangs. Via **`run_in_background`** it keeps the session showing "Live" for ~2 min (until the background-task wedge-heal clears the silent set — see `WEDGED_BG_GRACE_MS`) and then dies with the CLI subprocess anyway. Instead, launch it **detached with stdout/stderr redirected to a file** — Windows: `Start-Process -WindowStyle Hidden -RedirectStandardOutput out.log …`; POSIX: `nohup … > out.log 2>&1 &` — so the launch returns immediately, frees the shell's pipes, and the server outlives the session. Then have Claude drive it by its endpoints/logs.
+
 > **Legacy CLI path** — With `sdkSessionsEnabled` off, Fury falls back to the original stateless model: a short-lived `claude --print --session-id <uuid>` (`--resume` for follow-ups) is spawned per prompt via `SessionManager`, with conversation continuity managed by the CLI re-reading the JSONL. The SSE stream shape is identical either way, so the frontend keeps calling `/api/claude` regardless.
 
 ## Getting Started

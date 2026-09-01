@@ -1,5 +1,7 @@
 import { createServer } from 'node:http';
 import { parse } from 'node:url';
+import { readdirSync, rmSync, statSync } from 'node:fs';
+import { join } from 'node:path';
 import next from 'next';
 import { assertRealCwd } from './lib/checkSymlink';
 import { installProcessGuards, isBenignClientAbort } from './lib/processGuards';
@@ -18,6 +20,44 @@ installProcessGuards();
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';
 const port = parseInt(process.env.PORT || '3879', 10);
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Remove the e2e scratch project dirs (`../fury-e2e-*`, siblings of the repo root)
+ * that the Playwright specs create. Each holds a `.codemogger/index.db` that THIS
+ * process keeps open while the code-search specs run, so on Windows an external
+ * teardown can't unlink them — but here we can: on shutdown (after closeAllEngines
+ * releases the DB handles) and on the next boot (any prior holder is already dead)
+ * they ARE removable. Mirrors the existing shutdown-cleanup + boot-reap backstop
+ * pattern used for orphaned SDK processes, so a SIGKILL/crash that skips shutdown is
+ * still cleaned on the following start.
+ *
+ * DEV-ONLY and name-scoped to `fury-e2e-*`, so a production install never touches
+ * sibling dirs (and in practice these test dirs never exist there). Best-effort;
+ * retries the unlink to ride out a just-released Windows handle.
+ */
+async function sweepE2eScratchDirs(phase: 'startup' | 'shutdown'): Promise<void> {
+  if (!dev) return;
+  const parent = join(process.cwd(), '..'); // npm run dev sets cwd to the repo root
+  let targets: string[];
+  try {
+    targets = readdirSync(parent)
+      .filter((n) => n.startsWith('fury-e2e-'))
+      .map((n) => join(parent, n))
+      .filter((p) => { try { return statSync(p).isDirectory(); } catch { return false; } });
+  } catch {
+    return; // parent unreadable — nothing to do
+  }
+  let removed = 0;
+  for (const dir of targets) {
+    for (let i = 0; i < 6; i++) {
+      try { rmSync(dir, { recursive: true, force: true }); removed++; break; }
+      catch { await sleep(400); }
+    }
+  }
+  if (removed) console.log(`[server] ${phase}: removed ${removed} fury-e2e-* scratch dir(s)`);
+}
 
 const app = next({ dev, hostname, port });
 
@@ -139,6 +179,15 @@ app.prepare().then(() => {
     } catch (err) {
       console.error('[server] Failed to reap orphaned SDK sessions:', err);
     }
+
+    // Boot backstop for the e2e scratch dirs (dev-only): a previous run's server is
+    // dead now, so any code-search index.db it held is released and the dirs unlink
+    // cleanly — covering a SIGKILL/crash that skipped the shutdown sweep above.
+    try {
+      await sweepE2eScratchDirs('startup');
+    } catch (err) {
+      console.error('[server] e2e scratch-dir sweep failed:', err);
+    }
   });
 
   // Tear down live SDK sessions on the way out so a graceful restart doesn't
@@ -154,6 +203,15 @@ app.prepare().then(() => {
       if (killed > 0) console.log(`[server] ${signal}: killed ${killed} SDK session process(es)`);
       const { codemoggerReindexer } = await import('./lib/codemoggerReindex');
       codemoggerReindexer.stopAll();
+      // Close every in-process code-search engine so its index.db handle is released,
+      // THEN sweep the e2e scratch dirs those handles were blocking (dev-only, no-op
+      // in production). A brief pause lets the driver's async close finish releasing
+      // the file before we unlink; anything still held is caught by the boot sweep.
+      const { closeAllEngines } = await import('./lib/codemoggerServer');
+      const closed = await closeAllEngines();
+      if (closed > 0) console.log(`[server] ${signal}: closed ${closed} code-search engine(s)`);
+      await sleep(300);
+      await sweepE2eScratchDirs('shutdown');
     } catch (err) {
       console.error('[server] Shutdown cleanup failed:', err);
     }

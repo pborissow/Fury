@@ -364,6 +364,26 @@ export function evictIdle(ttlMs: number = IDLE_TTL_MS): number {
   return evicted;
 }
 
+/**
+ * Close EVERY open project engine and release its DB connection. For graceful
+ * server shutdown: a lingering open `index.db` keeps the process holding that file,
+ * which on Windows blocks removal of the containing project dir (the e2e scratch-dir
+ * cleanup depends on this). Unlike evictIdle's fire-and-forget close, this AWAITS
+ * each close so the caller can act once the handles are released. Best-effort per
+ * engine; returns how many it closed.
+ */
+export async function closeAllEngines(): Promise<number> {
+  let closed = 0;
+  for (const key of [...registry.keys()]) {
+    const p = registry.get(key);
+    registry.delete(key);
+    locks.delete(key);
+    usage.delete(key);
+    if (p) { try { await (await p).codeIndex.close(); closed++; } catch { /* already closed / never opened */ } }
+  }
+  return closed;
+}
+
 /** Whether a project currently holds an open engine (introspection for tests). */
 export function hasOpenEngine(projectPath: string): boolean {
   return registry.has(norm(projectPath));
