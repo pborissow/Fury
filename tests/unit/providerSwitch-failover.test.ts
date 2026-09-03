@@ -58,6 +58,8 @@ const BASE_SETTINGS: AppSettings = {
   modelCatalogPollEnabled: true,
   modelCatalogPollIntervalDays: 7,
   sdkSessionsEnabled: true,
+  imagePersistence: 'ephemeral',
+  keepRecentTurns: 1,
 };
 
 beforeEach(() => {

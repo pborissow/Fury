@@ -54,7 +54,9 @@ const mockWriteFile = writeFile as ReturnType<typeof vi.fn>;
 const mockAppendFile = appendFile as ReturnType<typeof vi.fn>;
 
 const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
-const LOG_PATH = join(homedir(), '.claude', 'provider-fallback-log.jsonl');
+// The fallback log is Fury-owned and lives under ~/.fury (lib/furyHome.ts);
+// ~/.claude/settings.json above is Claude-Code-owned and stays put.
+const LOG_PATH = join(homedir(), '.fury', 'provider-fallback-log.jsonl');
 
 const BASE_SETTINGS: AppSettings = {
   promptSuggestionsEnabled: true,
@@ -80,6 +82,8 @@ const BASE_SETTINGS: AppSettings = {
   modelCatalogPollEnabled: true,
   modelCatalogPollIntervalDays: 7,
   sdkSessionsEnabled: true,
+  imagePersistence: 'ephemeral',
+  keepRecentTurns: 1,
 };
 
 function clearVirtualFs() {

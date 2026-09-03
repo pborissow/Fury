@@ -18,6 +18,12 @@ export interface TurnMeta {
   toolCounts: Record<string, number>;
 }
 
+// Single definition lives in lib/types.ts (the client imports it from there);
+// re-exported here so parser consumers keep their existing import path.
+export type { TranscriptImagePart } from './types';
+import type { TranscriptImagePart } from './types';
+import { IMAGE_REF_RE, isBareImagePlaceholder } from './imageRefs';
+
 export interface TranscriptMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -26,6 +32,48 @@ export interface TranscriptMessage {
   /** JSONL entry uuid — surfaced for user messages so the UI can target a
    *  turn for the SDK's native rewindFiles(messageUuid). */
   uuid?: string;
+  /** Image parts attached to this message (user pastes). Present only when the
+   *  turn carried images (inline, scrubbed-persisted ref, or bare placeholder). */
+  images?: TranscriptImagePart[];
+}
+
+/**
+ * Split an array-form user message's content blocks into rendered text and
+ * image parts. Handles inline base64 images (recent turns), fury-img://<hash>
+ * ref placeholders (scrubbed + persisted), and bare placeholders (scrubbed +
+ * ephemeral). tool_result blocks are ignored here — Read-tool images belong in
+ * the tool UI, not the user bubble (rendered as a follow-up). Internal text
+ * blocks (system reminders etc. the CLI attaches alongside real content) are
+ * dropped, mirroring the string path's isInternalContent filter.
+ */
+export function extractUserContent(blocks: any[]): { text: string; images: TranscriptImagePart[] } {
+  const textParts: string[] = [];
+  const images: TranscriptImagePart[] = [];
+  for (const block of blocks) {
+    if (block?.type === 'image') {
+      const src = block.source;
+      if (src?.type === 'base64' && typeof src.data === 'string') {
+        const mediaType = typeof src.media_type === 'string' ? src.media_type : 'image/png';
+        images.push({ dataUrl: `data:${mediaType};base64,${src.data}` });
+      } else {
+        images.push({ placeholder: true });
+      }
+    } else if (block?.type === 'text' && typeof block.text === 'string') {
+      const trimmed = block.text.trim();
+      const refMatch = trimmed.match(IMAGE_REF_RE);
+      if (refMatch) {
+        images.push({ hash: refMatch[1] });
+      } else if (isBareImagePlaceholder(trimmed)) {
+        images.push({ placeholder: true });
+      } else if (block.text && !isInternalContent(block.text)) {
+        // Same filter the string path applies: CLI-attached system reminders,
+        // command markers, interrupt notices etc. must not render as user text.
+        textParts.push(block.text);
+      }
+    }
+    // tool_result / tool_use / other blocks: skip for user-bubble rendering.
+  }
+  return { text: textParts.join('\n\n'), images };
 }
 
 /**
@@ -82,7 +130,38 @@ export function isInternalContent(content: string): boolean {
     trimmed.startsWith('<system-reminder>') ||
     trimmed.startsWith('<task-notification>')
   ) return true;
+  // CLI interrupt markers ("[Request interrupted by user]", "...for tool use]").
+  // Written as ARRAY-form user entries, so they only became reachable when the
+  // parser gained array-content support — without this they render as bubbles.
+  if (trimmed.startsWith('[Request interrupted')) return true;
   if (/^\/[a-z]/.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * Is this JSONL entry a REAL user turn — one the user originated — as opposed
+ * to CLI plumbing (tool_result deliveries, isMeta reminders, slash-command
+ * markers, task-notifications, interrupt notices)?
+ *
+ * SINGLE source of truth for turn boundaries, shared by this parser (which
+ * message entries render as user bubbles) and lib/imageScrubber.ts (how
+ * keepRecentTurns counts turns). The two previously used different rules, so
+ * the scrubber counted internal entries as turns and scrubbed the *current*
+ * turn's image the moment a task-notification landed mid-turn.
+ */
+export function isRealUserTurnEntry(entry: any): boolean {
+  if (entry?.type !== 'user' || entry?.isMeta) return false;
+  const content = entry?.message?.content;
+  if (typeof content === 'string') return !isInternalContent(content);
+  if (Array.isArray(content)) {
+    // Real if any block carries user-originated content: an image, or a text
+    // block that isn't internal plumbing. (Scrubbed-image placeholders are NOT
+    // internal — a scrubbed paste turn is still a real turn.)
+    return content.some((b: any) =>
+      b?.type === 'image' ||
+      (b?.type === 'text' && typeof b.text === 'string' && !isInternalContent(b.text)),
+    );
+  }
   return false;
 }
 
@@ -234,6 +313,28 @@ export function parseTranscriptJsonl(content: string): {
           });
           // New turn starting — drop any tool counts accumulated during
           // the previous turn.
+          resetTurnTools();
+        } else if (Array.isArray(msg.content)) {
+          // Array-form user turn. Historically this fell through and rendered as
+          // NOTHING (constraint 6) — a text+image paste dropped even the typed
+          // text. isRealUserTurnEntry excludes pure tool_result deliveries AND
+          // internal array-form plumbing ("[Request interrupted by user]",
+          // attached system reminders) — the same filtering the string path
+          // gets from isInternalContent, and the same rule the image scrubber
+          // uses to count turns.
+          if (!isRealUserTurnEntry(entry)) continue;
+
+          const { text, images } = extractUserContent(msg.content);
+          // A real user prompt resolves any pending AskUserQuestion.
+          pendingAskUserQuestion = null;
+
+          messages.push({
+            role: 'user',
+            content: text,
+            timestamp: entry.timestamp,
+            uuid: entry.uuid,
+            ...(images.length > 0 ? { images } : {}),
+          });
           resetTurnTools();
         }
       } else if (entry.type === 'assistant') {

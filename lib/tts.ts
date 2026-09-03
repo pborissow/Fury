@@ -7,7 +7,7 @@
 import type { KokoroTTS } from 'kokoro-js';
 import Anthropic from '@anthropic-ai/sdk';
 import { importWithoutProcessHandlers } from './processGuards';
-import type { AppSettings } from '@/lib/settingsPersistence';
+import { DEFAULT_SETTINGS, type AppSettings } from '@/lib/settingsPersistence';
 import type { TurnMeta } from '@/lib/transcriptParser';
 
 const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX';
@@ -455,19 +455,10 @@ export async function generateSpeech(text: string, signal?: AbortSignal, setting
   const clean = prepareTextForSpeech(text);
   if (!clean) throw new Error('No speakable text');
 
-  const defaultSettings: AppSettings = {
-    summarizerProvider: 'none', ollamaHost: '', ollamaPort: '11434',
-    anthropicApiKey: null, ttsProvider: 'local', ttsRemoteHost: '', ttsRemotePort: '5656',
-    promptSuggestionsEnabled: true, ttsEnabled: false, localhostOnly: true,
-    authUsername: null, authPasswordHash: null,
-    bedrockAwsProfile: '', bedrockAwsRegion: '', bedrockModel: '',
-    bedrockSmallFastModel: '', bedrockAuthRefreshCmd: '',
-    bedrockClaudeFailoverEnabled: false,
-    pricingPollEnabled: true, pricingPollIntervalDays: 7,
-    modelCatalogPollEnabled: true, modelCatalogPollIntervalDays: 7,
-    sdkSessionsEnabled: true,
-  };
-  const s = settings || defaultSettings;
+  // The real defaults, not a hand-copy — the previous field-by-field literal
+  // here had already drifted (imagePersistence: 'ephemeral' vs the actual
+  // 'persist') and forced every new AppSettings field to be mirrored by hand.
+  const s = settings || DEFAULT_SETTINGS;
 
   const { text: spoken, method } = await summarizeText(clean, s, turnMeta);
   const t1 = Date.now();

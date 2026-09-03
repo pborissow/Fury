@@ -1,15 +1,16 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import path from 'path';
-import os from 'os';
 import { projectPathToSlug } from '@/lib/utils';
+import { furyNotesDir } from '@/lib/furyHome';
 
-const NOTES_DIR = path.join(os.homedir(), '.claude-session-notes');
+// ~/.fury/notes (was the $HOME sibling ~/.claude-session-notes). Resolved per
+// request, not at module load, so the startup migration always wins.
 
 // Ensure notes directory exists
 async function ensureNotesDirectory() {
   try {
-    await fs.mkdir(NOTES_DIR, { recursive: true });
+    await fs.mkdir(furyNotesDir(), { recursive: true });
   } catch (error) {
     console.error('Failed to create notes directory:', error);
   }
@@ -19,7 +20,7 @@ function getNotesPath(projectPath: string): string {
   const slug = projectPathToSlug(projectPath);
   // Sanitize to prevent directory traversal
   const sanitized = slug.replace(/[^a-zA-Z0-9-_]/g, '');
-  return path.join(NOTES_DIR, `${sanitized}.md`);
+  return path.join(furyNotesDir(), `${sanitized}.md`);
 }
 
 // GET /api/notes?projectPath=xxx

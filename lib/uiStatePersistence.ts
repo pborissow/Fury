@@ -2,6 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { atomicWriteFile } from './atomicWrite';
 import { recoverCorruptJsonFile } from './corruptState';
+import { furyUiStateFile } from './furyHome';
 
 interface UIState {
   // NOTE: activeTab is intentionally absent. Fury always starts on the Chat
@@ -29,11 +30,16 @@ interface UIState {
 }
 
 class UIStatePersistence {
-  private stateFile: string;
+  /** Test hook: when set, wins over the resolver. Production leaves it unset. */
+  private stateFile: string | null = null;
 
-  constructor() {
-    // Store UI state in .claude-ui-state directory
-    this.stateFile = path.join(process.cwd(), '.claude-ui-state', 'state.json');
+  /**
+   * ~/.fury/state/ui-state.json (was $cwd/.claude-ui-state/state.json — the
+   * migration renames it). Resolved lazily so nothing captures a legacy path
+   * before the startup migration runs.
+   */
+  private file(): string {
+    return this.stateFile ?? furyUiStateFile();
   }
 
   /**
@@ -41,7 +47,7 @@ class UIStatePersistence {
    */
   private async ensureStorageDir(): Promise<void> {
     try {
-      const dir = path.dirname(this.stateFile);
+      const dir = path.dirname(this.file());
       await fs.mkdir(dir, { recursive: true });
     } catch (error) {
       console.error('Failed to create UI state storage directory:', error);
@@ -59,9 +65,10 @@ class UIStatePersistence {
    * recovered. Now a bad file is quarantined and the next save replaces it.
    */
   async loadState(): Promise<UIState | null> {
+    const stateFile = this.file();
     let content: string;
     try {
-      content = await fs.readFile(this.stateFile, 'utf-8');
+      content = await fs.readFile(stateFile, 'utf-8');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         console.log('[UIStatePersistence] No UI state found');
@@ -89,7 +96,7 @@ class UIStatePersistence {
     // complete record if there is one (the layout survives), otherwise preserve
     // the bytes at state.json.corrupt and start clean.
     const recovered = await recoverCorruptJsonFile(
-      this.stateFile, content, 'UIStatePersistence', parseError,
+      stateFile, content, 'UIStatePersistence', parseError,
     );
     return (recovered as UIState | null) ?? null;
   }
@@ -122,7 +129,7 @@ class UIStatePersistence {
       // Atomic: a plain writeFile truncates then writes, so two servers sharing a
       // cwd could splice one document onto the tail of a longer one — which is
       // exactly the corruption this file recovered from. See ./atomicWrite.
-      await atomicWriteFile(this.stateFile, JSON.stringify(newState, null, 2));
+      await atomicWriteFile(this.file(), JSON.stringify(newState, null, 2));
       console.log('[UIStatePersistence] Saved UI state');
     } catch (error) {
       console.error('[UIStatePersistence] Failed to save UI state:', error);

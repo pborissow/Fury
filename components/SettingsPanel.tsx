@@ -27,6 +27,8 @@ interface SettingsPanelProps {
   onPromptSuggestionsChange: (enabled: boolean) => void;
   ttsEnabled: boolean;
   onTtsChange: (enabled: boolean) => void;
+  imagePersist: boolean;
+  onImagePersistChange: (enabled: boolean) => void;
   localhostOnly: boolean;
   onLocalhostOnlyChange: (enabled: boolean) => void;
   hasCredentials: boolean;
@@ -41,6 +43,8 @@ export default function SettingsPanel({
   onPromptSuggestionsChange,
   ttsEnabled,
   onTtsChange,
+  imagePersist,
+  onImagePersistChange,
   localhostOnly,
   onLocalhostOnlyChange,
   hasCredentials,
@@ -373,6 +377,18 @@ export default function SettingsPanel({
               <Switch
                 checked={ttsEnabled}
                 onCheckedChange={onTtsChange}
+              />
+            </div>
+            <div className="flex items-center justify-between py-3">
+              <div className="pr-4">
+                <div className="text-sm font-medium">Persist pasted images</div>
+                <div className="text-xs text-muted-foreground mt-0.5">
+                  Keep pasted/attached images on disk so every image in a session stays visible (fetched on demand) and survives a reload — when off, older images are scrubbed from history to keep the transcript small
+                </div>
+              </div>
+              <Switch
+                checked={imagePersist}
+                onCheckedChange={onImagePersistChange}
               />
             </div>
             <div className="flex items-center justify-between py-3">

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import next from 'next';
 import { assertRealCwd } from './lib/checkSymlink';
 import { installProcessGuards, isBenignClientAbort } from './lib/processGuards';
+import { migrateFuryHome } from './lib/furyHomeMigration';
 import { log } from './lib/logger';
 
 // Preflight: abort with a helpful message if cwd is a symlink/junction, before
@@ -16,6 +17,18 @@ assertRealCwd();
 // process as an uncaughtException and kill every live session with it.
 // docs/ticket-server-crash-on-aborted-request.md.
 installProcessGuards();
+
+// One-time migration of Fury-owned data into ~/.fury (FURY_HOME), BEFORE the
+// DB opens or any persister reads — every resolver in lib/furyHome.ts then
+// sees fully-moved data. Idempotent; a marker makes later boots a cheap no-op.
+// docs/plan-fury-home-migration.md.
+try {
+  migrateFuryHome();
+} catch (err) {
+  // Never block startup: the resolvers read-fall-back to the legacy locations
+  // when the new ones are absent, so an un-migrated boot still sees its data.
+  console.error('[server] fury-home migration failed (continuing with legacy paths):', err);
+}
 
 const dev = process.env.NODE_ENV !== 'production';
 const hostname = '0.0.0.0';

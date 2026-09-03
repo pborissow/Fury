@@ -22,7 +22,8 @@ import { DirectoryPicker } from '@/components/DirectoryPicker';
 import { getRecentDirectories } from '@/lib/recent-directories';
 import { uiLog } from '@/lib/clientTelemetry';
 import { stripInFlightPartials } from '@/lib/transcriptStrip';
-import type { Message, TranscriptMsg, HistoryEntry, PendingSession, AskUserQuestionState } from '@/lib/types';
+import type { Message, TranscriptMsg, HistoryEntry, PendingSession, AskUserQuestionState, TranscriptImagePart } from '@/lib/types';
+import { normalizeImage, type AttachedImage } from '@/lib/clientImage';
 import type { TurnMeta } from '@/lib/transcriptParser';
 import type { Liveness } from '@/lib/eventBus';
 
@@ -114,12 +115,17 @@ export default function ChatTab({
 
 
   // History transcript viewer state (renders in center panel)
-  const [historyTranscript, setHistoryTranscript] = useState<{ role: 'user' | 'assistant'; content: string; timestamp: string; turnMeta?: TurnMeta }[]>([]);
+  const [historyTranscript, setHistoryTranscript] = useState<{ role: 'user' | 'assistant'; content: string; timestamp: string; turnMeta?: TurnMeta; uuid?: string; images?: TranscriptImagePart[] }[]>([]);
   const [viewingTranscriptId, setViewingTranscriptId] = useState<string | null>(null);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [historyTranscriptLoading, setHistoryTranscriptLoading] = useState(false);
   const [historyTranscriptProject, setHistoryTranscriptProject] = useState<string | null>(null);
-  const [transcriptOverlayMessages, setTranscriptOverlayMessages] = useState<Message[]>([]);
+  const [transcriptOverlayMessages, setTranscriptOverlayMessages] = useState<(Message & { images?: TranscriptImagePart[] })[]>([]);
+  // Image attachments staged for the next send (paste/drop → normalize → chip).
+  // Lives here (not in the editor) so it survives editor clears.
+  const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
+  /** Why the last paste/drop was (partially) rejected — shown beside the chips. */
+  const [attachError, setAttachError] = useState<string | null>(null);
   const [transcriptStreaming, setTranscriptStreaming] = useState('');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
   // Independent of transcriptLoading (which is tied to an in-flight MAIN turn and
@@ -577,7 +583,7 @@ export default function ChatTab({
     setTimeout(() => chatEditorRef.current?.setContent(savedDraft), 50);
     try {
       const res = await fetch(`/api/transcript?sessionId=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(project)}`);
-      let transcriptMessages: { role: 'user' | 'assistant'; content: string; timestamp: string }[] = [];
+      let transcriptMessages: { role: 'user' | 'assistant'; content: string; timestamp: string; images?: TranscriptImagePart[] }[] = [];
       if (res.ok) {
         const data = await res.json();
         transcriptMessages = data.messages || [];
@@ -1596,8 +1602,43 @@ export default function ChatTab({
     }
   };
 
+  // Paste/drop → normalize+downscale each file → stage as an attachment chip.
+  // Normalization failures (unsupported type, decode error, over the 5MB cap)
+  // skip that file but SURFACE the reason next to the chips — a silent drop
+  // reads as "attached" to the user who just pasted.
+  const handleImagesAdded = async (files: File[]) => {
+    const failures: string[] = [];
+    const results = await Promise.all(
+      files.map(async f => {
+        try {
+          return await normalizeImage(f);
+        } catch (err) {
+          console.warn('[ChatTab] Skipping image:', err);
+          failures.push(err instanceof Error ? err.message : 'unreadable image');
+          return null;
+        }
+      }),
+    );
+    setAttachError(failures.length > 0 ? failures.join('; ') : null);
+    const added = results.filter((r): r is AttachedImage => r !== null);
+    if (added.length === 0) return;
+    // Cap total staged attachments at 8 (matches the server-side cap).
+    setAttachedImages(prev => [...prev, ...added].slice(0, 8));
+  };
+
+  const handleRemoveImage = (id: string) => {
+    setAttachedImages(prev => prev.filter(img => img.id !== id));
+  };
+
   const handleTranscriptSend = async (userMessage: string) => {
-    if (!userMessage || transcriptLoading || !viewingTranscriptId) return;
+    if ((!userMessage && attachedImages.length === 0) || transcriptLoading || !viewingTranscriptId) return;
+
+    // Snapshot + clear the staged attachments for this turn.
+    const imagesToSend = attachedImages;
+    setAttachedImages([]);
+    setAttachError(null);
+    const optimisticImages: TranscriptImagePart[] = imagesToSend.map(i => ({ dataUrl: i.dataUrl }));
+    const apiImages = imagesToSend.map(i => ({ base64: i.base64, mediaType: i.mediaType }));
 
     // Stop any TTS playback so the user isn't talked over by the previous turn.
     ttsCleanup();
@@ -1612,7 +1653,9 @@ export default function ChatTab({
     // If this session isn't in the history sidebar yet, add it optimistically
     if (!history.some(h => h.sessionId === mySessionId)) {
       setHistory(prev => [{
-        display: userMessage.length > 200 ? userMessage.substring(0, 200) + '...' : userMessage,
+        display: userMessage
+          ? (userMessage.length > 200 ? userMessage.substring(0, 200) + '...' : userMessage)
+          : `📎 ${imagesToSend.length} image${imagesToSend.length === 1 ? '' : 's'}`,
         timestamp: Date.now(),
         project: myProject || '',
         sessionId: mySessionId,
@@ -1627,8 +1670,13 @@ export default function ChatTab({
       return next;
     });
 
-    // Instant feedback
-    setTranscriptOverlayMessages(prev => [...prev, { role: 'user' as const, content: userMessage }]);
+    // Instant feedback — include the local thumbnails so the just-sent bubble
+    // shows the attachment before the transcript round-trips (A6).
+    setTranscriptOverlayMessages(prev => [...prev, {
+      role: 'user' as const,
+      content: userMessage,
+      ...(optimisticImages.length > 0 ? { images: optimisticImages } : {}),
+    }]);
     setTranscriptLoading(true);
     setTranscriptStreaming('');
     setStreamEvents([]);
@@ -1653,6 +1701,8 @@ export default function ChatTab({
         next.delete(mySessionId);
         return next;
       });
+      // Return the staged attachments too, so a backed-out takeover can retry.
+      if (imagesToSend.length > 0) setAttachedImages(prev => [...imagesToSend, ...prev].slice(0, 8));
       setTimeout(() => chatEditorRef.current?.setContent(userMessage), 50);
     };
 
@@ -1667,6 +1717,7 @@ export default function ChatTab({
           prompt: userMessage,
           sessionId: mySessionId,
           projectPath: myProject,
+          ...(apiImages.length > 0 ? { images: apiImages } : {}),
           ...(confirmTakeover ? { confirmTakeover: true } : {}),
         }),
       });
@@ -1702,6 +1753,12 @@ export default function ChatTab({
           content: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
         }]);
         setTranscriptLoading(false);
+        // Return the staged attachments so a retry re-sends them — without
+        // this, a failed send silently discarded the pasted images and the
+        // retry went out text-only (only the takeover-rollback path restored).
+        if (imagesToSend.length > 0) {
+          setAttachedImages(prev => [...imagesToSend, ...prev].slice(0, 8));
+        }
       }
     };
 
@@ -2152,6 +2209,7 @@ export default function ChatTab({
                             }
                             transcriptOverlayMessages={transcriptOverlayMessages}
                             overlayInsertPoint={overlayInsertPoint}
+                            sessionId={viewingTranscriptId ?? undefined}
                             transcriptLoading={transcriptLoading}
                             onRewindConfirm={setRewindConfirm}
                             onIntermediaryView={setIntermediaryMessages}
@@ -2310,7 +2368,43 @@ export default function ChatTab({
                         submitLabel={transcriptLoading ? 'Sending...' : 'Send'}
                         isProcessing={transcriptLoading}
                         onStop={handleTranscriptStop}
-                        statusBar={providerLabel ? (
+                        // Paste/drop image capture — SDK backend only (the CLI
+                        // `--print` path can't carry image blocks).
+                        onImagesAdded={sdkSessionsEnabled ? handleImagesAdded : undefined}
+                        hasAttachments={attachedImages.length > 0}
+                        statusBar={(attachedImages.length > 0 || attachError || providerLabel) ? (
+                          <div>
+                            {attachedImages.length > 0 && (
+                              <div className="flex flex-wrap gap-2 px-2 pt-2" data-testid="image-attachments">
+                                {attachedImages.map(img => (
+                                  <div key={img.id} className="relative group/attach">
+                                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                                    <img
+                                      src={img.dataUrl}
+                                      alt="attachment"
+                                      className="h-14 w-14 object-cover rounded border border-border"
+                                    />
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRemoveImage(img.id)}
+                                      className="absolute -top-1.5 -right-1.5 h-4 w-4 rounded-full bg-black/70 text-white text-[10px] leading-none flex items-center justify-center opacity-0 group-hover/attach:opacity-100 transition-opacity"
+                                      title="Remove attachment"
+                                    >
+                                      ✕
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                            {attachError && (
+                              <div
+                                data-testid="attach-error"
+                                className="px-2 pt-1 text-[11px] text-red-500"
+                              >
+                                ⚠ {attachError}
+                              </div>
+                            )}
+                            {providerLabel && (
                           // Style is deliberately unchanged from the read-only
                           // label — the only affordance is the pointer cursor.
                           //
@@ -2327,6 +2421,8 @@ export default function ChatTab({
                             title={modelPickerAvailable ? 'Click to change model' : undefined}
                           >
                             {providerLabel}
+                          </div>
+                            )}
                           </div>
                         ) : undefined}
                       />

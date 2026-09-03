@@ -56,7 +56,7 @@ function isTransientRenameError(err: unknown): boolean {
  * only be a blocking sleep that stalls the event loop — worse than retrying.
  * Capped at 10 immediate attempts, and POSIX never reaches the retry at all.
  */
-export function atomicWriteFileSync(path: string, data: string): void {
+export function atomicWriteFileSync(path: string, data: string | Uint8Array): void {
   const tmp = tmpPathFor(path);
   writeFileSync(tmp, data);
   for (let i = 0; ; i++) {

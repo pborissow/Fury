@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import path from 'path';
+import { furyWorkflowsDir } from './furyHome';
 
 interface Workflow {
   id: string;
@@ -10,11 +11,12 @@ interface Workflow {
 }
 
 class WorkflowPersistence {
-  private storageDir: string;
-
-  constructor() {
-    // Store workflows in .claude-workflows directory
-    this.storageDir = path.join(process.cwd(), '.claude-workflows');
+  /**
+   * ~/.fury/state/workflows (was $cwd/.claude-workflows). Resolved lazily so
+   * nothing captures a legacy path before the startup migration runs.
+   */
+  private get storageDir(): string {
+    return furyWorkflowsDir();
   }
 
   /**

@@ -17,6 +17,10 @@ import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { projectPathToSlug } from './utils';
+import { putImage } from './imageStore';
+import { isRealUserTurnEntry } from './transcriptParser';
+import { IMAGE_PLACEHOLDER_TEXT, imageRefText } from './imageRefs';
+import { ACCEPTED_IMAGE_MEDIA_TYPES } from './types';
 
 export interface ScrubOptions {
   /**
@@ -28,6 +32,17 @@ export interface ScrubOptions {
    *   N  = keep the last N turns' images
    */
   keepRecentTurns?: number;
+  /**
+   * When set, image blocks in older turns are EXTERNALIZED instead of discarded:
+   * the base64 bytes are written to the per-session on-disk store and the block
+   * is replaced with a `fury-img://<hash>` ref placeholder (so the thumbnail can
+   * be rehydrated later). Requires `sessionId`. When absent (default), older
+   * images collapse to the bare "[image previously analyzed]" placeholder and
+   * the bytes are dropped (ephemeral mode).
+   */
+  persist?: boolean;
+  /** Session id for the on-disk store when `persist` is set. */
+  sessionId?: string;
 }
 
 export interface ScrubResult {
@@ -49,29 +64,69 @@ interface ParsedLine {
   hasImage: boolean;
 }
 
-const PLACEHOLDER = { type: 'text', text: '[image previously analyzed]' };
+// Wire format shared with the transcript parser — see lib/imageRefs.ts.
+const PLACEHOLDER = { type: 'text', text: IMAGE_PLACEHOLDER_TEXT };
+
+/** Ref placeholder text carrying the store hash. Parseable by the transcript
+ *  parser (fury-img://<hash>) and still a valid text block for API replay. */
+function refPlaceholder(hash: string) {
+  return { type: 'text', text: imageRefText(hash) };
+}
 
 /**
- * Determine whether a JSONL entry is a real user turn (vs. a tool_result
- * delivery from the CLI). A real turn is one the user originated:
- *   - string content, or
- *   - array content with at least one non-tool_result block (text, image, …)
+ * Externalize a single base64 image block to the per-session store. Returns the
+ * content hash, or null if the block isn't a base64 image we can persist (in
+ * which case the caller falls back to the bare placeholder).
+ *
+ * Media types outside the accepted set are NOT externalized: the store would
+ * file them under an extension getImagePath never probes (`.bin`), producing a
+ * fury-img:// ref that can never resolve — a permanent 404 with the inline
+ * base64 already destroyed. Falling back to the bare placeholder is honest
+ * about the bytes being gone.
+ */
+function externalizeImageBlock(sessionId: string, block: any): string | null {
+  const src = block?.source;
+  if (!src || src.type !== 'base64' || typeof src.data !== 'string') return null;
+  try {
+    const mediaType = typeof src.media_type === 'string' ? src.media_type : 'image/png';
+    if (!ACCEPTED_IMAGE_MEDIA_TYPES.includes(mediaType)) return null;
+    const bytes = Buffer.from(src.data, 'base64');
+    if (bytes.length === 0) return null;
+    const { hash } = putImage(sessionId, bytes, mediaType);
+    return hash;
+  } catch {
+    return null;
+  }
+}
+
+/** Build the replacement block for a scrubbed image: a ref placeholder when
+ *  externalization succeeds, else the bare placeholder. */
+function replacementFor(sessionId: string | undefined, persist: boolean, block: any) {
+  if (persist && sessionId) {
+    const hash = externalizeImageBlock(sessionId, block);
+    if (hash) return refPlaceholder(hash);
+  }
+  return { ...PLACEHOLDER };
+}
+
+/**
+ * Turn boundary — DELEGATED to the parser's isRealUserTurnEntry so the scrubber
+ * counts turns exactly like the renderer does. The scrubber previously counted
+ * every string-content user entry (task-notifications, <command-name> markers,
+ * isMeta reminders) as a turn, inflating the index so keepRecentTurns=1 could
+ * scrub the just-pasted image on its own turn's result event. Real transcripts
+ * routinely carry runs of such entries mid-turn (6+ consecutive
+ * task-notifications observed), so this was common, not hypothetical.
  */
 function isUserTurn(entry: any): boolean {
-  if (entry?.type !== 'user') return false;
-  const content = entry?.message?.content;
-  if (typeof content === 'string') return true;
-  if (Array.isArray(content)) {
-    return content.some((b: any) => b?.type !== 'tool_result');
-  }
-  return false;
+  return isRealUserTurnEntry(entry);
 }
 
 /**
  * Scrub image content blocks from a single parsed JSONL entry (mutates).
  * Returns the number of image blocks that were replaced.
  */
-function scrubEntry(entry: any): number {
+function scrubEntry(entry: any, sessionId?: string, persist = false): number {
   let count = 0;
 
   // 1) message.content[] — handle both top-level images (user pastes) and
@@ -81,12 +136,12 @@ function scrubEntry(entry: any): number {
     for (let i = 0; i < msgContent.length; i++) {
       const block = msgContent[i];
       if (block?.type === 'image') {
-        msgContent[i] = { ...PLACEHOLDER };
+        msgContent[i] = replacementFor(sessionId, persist, block);
         count++;
       } else if (block?.type === 'tool_result' && Array.isArray(block.content)) {
         for (let j = 0; j < block.content.length; j++) {
           if (block.content[j]?.type === 'image') {
-            block.content[j] = { ...PLACEHOLDER };
+            block.content[j] = replacementFor(sessionId, persist, block.content[j]);
             count++;
           }
         }
@@ -96,8 +151,11 @@ function scrubEntry(entry: any): number {
 
   // 2) toolUseResult — metadata field added by Claude Code CLI. Counts as a
   //    scrub so the file gets written back even if message.content was clean.
+  //    Routed through replacementFor like every other image site, so persist
+  //    mode leaves a resolvable ref here too (the planned tool-UI rendering
+  //    reads toolUseResult) instead of a ref-less bare placeholder.
   if (entry?.toolUseResult?.type === 'image') {
-    entry.toolUseResult = { ...PLACEHOLDER };
+    entry.toolUseResult = replacementFor(sessionId, persist, entry.toolUseResult);
     count++;
   }
 
@@ -130,6 +188,8 @@ function countImages(entry: any): number {
  */
 export function scrubImages(jsonlContent: string, opts?: ScrubOptions): ScrubResult {
   const keepRecentTurns = opts?.keepRecentTurns ?? 0;
+  const persist = opts?.persist === true && !!opts?.sessionId;
+  const sessionId = opts?.sessionId;
   // Normalize CRLF → LF so output ends up with consistent line endings even
   // if the input was a mix (Windows-authored files, copy-paste, etc.)
   const rawLines = jsonlContent.split('\n').map(l => l.replace(/\r$/, ''));
@@ -170,7 +230,7 @@ export function scrubImages(jsonlContent: string, opts?: ScrubOptions): ScrubRes
     }
 
     if (p.turnIndex < scrubBefore) {
-      const n = scrubEntry(p.entry);
+      const n = scrubEntry(p.entry, sessionId, persist);
       scrubbed += n;
       outputLines.push(JSON.stringify(p.entry));
     } else {
@@ -209,12 +269,29 @@ async function atomicWrite(jsonlPath: string, content: string): Promise<boolean>
 }
 
 /**
- * Scrub a session's JSONL file in-place. Used by sessionManager before
- * spawning the Claude CLI to keep API requests under the 32MB limit.
+ * Scrub a session's JSONL file in-place, replacing it via `.tmp`+rename.
+ *
+ * ⚠️ CONCURRENCY: rename swaps the inode. Two hazards were considered:
+ *
+ *  1. HELD FD — if the `claude` subprocess kept the JSONL open, a rename would
+ *     detach its fd and every later append would be lost. EMPIRICALLY RULED
+ *     OUT (2026-09-02): `lsof` on a live claude CLI process *mid-turn, while
+ *     actively writing its transcript* shows ZERO open .jsonl fds — the CLI
+ *     opens/appends/closes per line. Re-verify if a CLI update changes its
+ *     write pattern.
+ *  2. REOPEN-APPEND RACE — a line appended between our read and the rename
+ *     lands on the old inode and is discarded. Guarded below by a READ-BACK
+ *     COMPARE (stronger than the previous size/mtime stat check, which could
+ *     miss a same-length rewrite within mtime granularity): if the bytes on
+ *     disk no longer equal what we scrubbed, skip the rename; the next turn's
+ *     scrub retries. The residual stat→rename window is microseconds, during
+ *     a moment (turn settled) when the CLI is idle.
+ *
+ * The DB-leanness goal does NOT depend on this path — the archiver scrubs its
+ * own in-memory copy — so a skipped rewrite costs only temporary JSONL bloat.
  *
  * Writes back whenever bytes changed (not just when scrubbed > 0) so that
  * line-ending normalization or toolUseResult-only mutations also persist.
- * The file watcher picks up the change and re-archives to SQLite.
  *
  * Returns the scrub stats (or null if the file is missing or empty).
  */
@@ -236,8 +313,25 @@ export async function scrubSessionFile(
     return { content, scrubbed: 0, kept: 0, bytesSaved: 0 };
   }
 
-  const result = scrubImages(content, opts);
+  // The store is keyed by this session, so inject the id here — callers only
+  // need to decide persist vs. ephemeral (opts.persist).
+  const result = scrubImages(content, { ...opts, sessionId });
   if (result.bytesSaved <= 0) return result;
+
+  // Read-back guard: if the file changed since we read it, a writer is active —
+  // skip the rename so we don't clobber freshly-appended lines. The next turn's
+  // scrub retries. (Bytes were already externalized to the store by scrubImages
+  // in persist mode, which is idempotent, so a skipped rename never loses
+  // image bytes.)
+  try {
+    const recheck = await readFile(jsonlPath, 'utf-8');
+    if (recheck !== content) {
+      console.warn(`[imageScrubber] JSONL changed under scrub; skipping rewrite to avoid clobbering appends: ${jsonlPath}`);
+      return result;
+    }
+  } catch {
+    return result; // re-read failed — err on the side of not renaming
+  }
 
   const written = await atomicWrite(jsonlPath, result.content);
   if (!written) {

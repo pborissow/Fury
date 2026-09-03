@@ -21,10 +21,13 @@ import { codemoggerSdkServer } from './codemoggerServer';
 import { isCodeSearchEnabled, codeSearchDbPath, stripStdioCodemogger } from './codeSearchConfig';
 import { log } from './logger';
 import { findSessionJsonlDir } from './sessionPaths';
+import { scrubSessionFile } from './imageScrubber';
+import { settingsPersistence } from './settingsPersistence';
 // Type-only (erased at compile time) — no runtime coupling to the CLI manager.
 // Reusing its shapes keeps /api/stream-buffer and ChatTab identical for both
 // backends.
 import type { StreamBuffer, StreamBufferEvent } from './sessionManager';
+import type { ImageAttachmentInput } from './types';
 
 /**
  * PROTOTYPE — persistent-session manager built on @anthropic-ai/claude-agent-sdk.
@@ -454,7 +457,7 @@ class SdkSessionManager {
     sessionId: string,
     prompt: string,
     projectPath?: string,
-    opts?: { confirmTakeover?: boolean },
+    opts?: { confirmTakeover?: boolean; images?: ImageAttachmentInput[] },
   ): Promise<void> {
     const s = this.getOrCreate(sessionId);
     if (projectPath) s.projectPath = projectPath;
@@ -559,11 +562,58 @@ class SdkSessionManager {
     });
     this.emitHealth(s, true);
 
+    // With image attachments, the turn content becomes a block array: the prompt
+    // text (if any) followed by one image block per attachment. This is the ONLY
+    // shape that gives Claude real vision — a base64 data URL embedded in the
+    // text does not (see docs/plan-image-paste-support.md §2). The CLI writes
+    // these inline blocks into the JSONL; the per-turn scrub (handle() 'result')
+    // then bounds them.
+    const images = opts?.images ?? [];
+    const content: unknown = images.length > 0
+      ? [
+          ...(prompt ? [{ type: 'text', text: prompt }] : []),
+          ...images.map(img => ({
+            type: 'image',
+            source: { type: 'base64', media_type: img.mediaType, data: img.base64 },
+          })),
+        ]
+      : prompt;
+
     s.input!.push({
       type: 'user',
-      message: { role: 'user', content: prompt },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      message: { role: 'user', content: content as any },
       parent_tool_use_id: null,
     });
+  }
+
+  /**
+   * Scrub (and, in persist mode, externalize) the images in a session's JSONL
+   * after a turn settles. Reads keepRecentTurns + imagePersistence from settings
+   * so the newest turn keeps true vision inline while older turns are bounded.
+   * Fire-and-forget: never throws into the result handler.
+   */
+  private scrubImagesAfterTurn(s: SdkSession): void {
+    if (!s.projectPath) return;
+    void (async () => {
+      try {
+        const settings = await settingsPersistence.loadSettings();
+        // Clamp: a negative/fractional value from a hand-edited settings.json
+        // would push the scrub window past every turn (including the current
+        // one, losing inline vision mid-conversation).
+        const keepRecentTurns = Number.isFinite(settings.keepRecentTurns)
+          ? Math.max(0, Math.floor(settings.keepRecentTurns))
+          : 1;
+        const persist = settings.imagePersistence === 'persist';
+        await scrubSessionFile(s.sessionId, s.projectPath!, { keepRecentTurns, persist });
+      } catch (err) {
+        log.error('sdk.turn', 'image scrub failed', {
+          sessionId: s.sessionId,
+          corrId: s.sessionId,
+          data: { err: err instanceof Error ? err.message : String(err) },
+        });
+      }
+    })();
   }
 
   /**
@@ -888,7 +938,7 @@ class SdkSessionManager {
    * Status handling is deliberately split, because "not connected" is not always
    * an error:
    *  - `failed` — the server crashed / couldn't start. A real problem the user
-   *    should see: `log.warn` under `sdk.mcp` (durable in ~/.claude/fury-logs)
+   *    should see: `log.warn` under `sdk.mcp` (durable in ~/.fury/logs)
    *    AND a `session:stream` signal so the client shows "failed to connect".
    *  - `needs-auth` / `pending` / anything else — EXPECTED, benign states for
    *    user connectors (an un-authed claude.ai Gmail/Calendar/Drive is `pending`
@@ -1363,7 +1413,7 @@ class SdkSessionManager {
    * every signal except 0 to TerminateProcess, so there is no soft stop there —
    * but the user has already agreed to end the terminal, which is the property
    * that matters. Narrated to sdk.handoff so the whole exchange is reconstructable
-   * from ~/.claude/fury-logs/ the way this ticket was diagnosed.
+   * from ~/.fury/logs/ the way this ticket was diagnosed.
    */
   private async takeoverExternalOwner(s: SdkSession): Promise<void> {
     const owner = await this.detectExternalOwner(s.sessionId);
@@ -2570,6 +2620,21 @@ class SdkSessionManager {
           // guards against.
           s.lastBgActivityAt = Date.now();
           this.emitHealth(s, false);
+          // The turn has settled — scrub/externalize this session's older-turn
+          // images (B4a) to keep the LIVE JSONL lean and populate the store for
+          // mid-session reload rehydration. The SDK path keeps a long-lived
+          // query() and never relaunches, so this is the only per-turn hook.
+          //
+          // NB: this rewrites the live JSONL that the long-lived `claude`
+          // subprocess also writes. Empirically safe: the CLI opens/appends/
+          // closes the JSONL per line (lsof on a live mid-turn CLI shows zero
+          // open .jsonl fds — see scrubSessionFile's doc), so the rename can't
+          // detach a held fd; the residual reopen-append race is covered by
+          // scrubSessionFile's read-back guard. The "no base64 in DB" goal
+          // does NOT depend on this — the archiver scrubs its own in-memory copy
+          // (transcriptArchiver.archiveTranscript), so the DB stays lean even if
+          // this live rewrite is skipped by the guard. Fire-and-forget.
+          this.scrubImagesAfterTurn(s);
         }
         break;
       }

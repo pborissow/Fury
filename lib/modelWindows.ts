@@ -55,10 +55,11 @@ interface WindowFile {
   models: Record<string, WindowEntry>;
 }
 
-// process.cwd() is the repo root under `tsx server.ts`, matching how
-// .claude-ui-state is located. The running app writes here, so it must be the
-// on-disk source file, not a bundled copy. The env override exists so tests can
-// point at a throwaway file instead of clobbering the real seed.
+// process.cwd() is the repo root under `tsx server.ts`. Unlike the user-data
+// stores (now under ~/.fury — see lib/furyHome.ts), this seed file IS part of
+// the repo: the running app enriches it in place, so it must be the on-disk
+// source file, not a bundled copy. The env override exists so tests can point
+// at a throwaway file instead of clobbering the real seed.
 const FILE = process.env.FURY_MODEL_WINDOWS_PATH ?? join(process.cwd(), 'lib', 'model-windows.json');
 
 let cache: WindowFile | null = null;

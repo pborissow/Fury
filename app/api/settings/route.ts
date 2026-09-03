@@ -31,6 +31,7 @@ const ALLOWED_KEYS = [
   'bedrockAwsProfile', 'bedrockAwsRegion', 'bedrockModel',
   'bedrockSmallFastModel', 'bedrockAuthRefreshCmd',
   'bedrockClaudeFailoverEnabled', 'sdkSessionsEnabled',
+  'imagePersistence', 'keepRecentTurns',
 ] as const;
 
 export async function POST(request: Request) {
@@ -42,6 +43,19 @@ export async function POST(request: Request) {
       if (body[key] !== undefined) {
         updates[key] = key === 'anthropicApiKey' ? (body[key] || null) : body[key];
       }
+    }
+
+    // Validate image settings.
+    if (updates.imagePersistence !== undefined &&
+        updates.imagePersistence !== 'ephemeral' && updates.imagePersistence !== 'persist') {
+      return NextResponse.json({ error: 'Invalid imagePersistence' }, { status: 400 });
+    }
+    if (updates.keepRecentTurns !== undefined) {
+      const n = parseInt(String(updates.keepRecentTurns), 10);
+      if (!Number.isFinite(n) || n < 0) {
+        return NextResponse.json({ error: 'Invalid keepRecentTurns' }, { status: 400 });
+      }
+      updates.keepRecentTurns = n;
     }
 
     for (const portKey of ['ollamaPort', 'ttsRemotePort'] as const) {

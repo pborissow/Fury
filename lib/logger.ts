@@ -21,8 +21,8 @@
  * browser goes through lib/clientTelemetry.ts instead.
  */
 import { appendFile, mkdir } from 'fs/promises';
-import { homedir } from 'os';
 import { join } from 'path';
+import { furyLogsDir } from './furyHome';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 export type LogSource = 'server' | 'ui';
@@ -55,10 +55,13 @@ export interface RawUiEntry {
   data?: Record<string, unknown>;
 }
 
-const LOG_DIR = join(homedir(), '.claude', 'fury-logs');
+// Resolved lazily (NOT at import time): this module loads before the startup
+// migration in server.ts runs, and lib/furyHome's read-fallback could capture
+// the legacy ~/.claude/fury-logs path that the migration is about to move.
+const logDir = () => furyLogsDir();
 // Under the test runner, keep the console mirror but don't append to the durable
 // daily file — unit tests import sdkSessionManager (which logs) and shouldn't
-// pollute the user's real ~/.claude/fury-logs.
+// pollute the user's real ~/.fury/logs.
 const IN_TEST = !!process.env.VITEST || process.env.NODE_ENV === 'test';
 const LEVEL_ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 };
 const MIN_LEVEL =
@@ -70,7 +73,7 @@ const MIN_LEVEL =
 let dirReady: Promise<void> | null = null;
 function ensureDir(): Promise<void> {
   if (!dirReady) {
-    dirReady = mkdir(LOG_DIR, { recursive: true })
+    dirReady = mkdir(logDir(), { recursive: true })
       .then(() => undefined)
       .catch(() => undefined);
   }
@@ -84,7 +87,7 @@ function pad(n: number): string {
 /** Daily rolling file — one JSONL per calendar day (local time). */
 function fileForTs(ts: number): string {
   const d = new Date(ts);
-  return join(LOG_DIR, `fury-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.jsonl`);
+  return join(logDir(), `fury-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.jsonl`);
 }
 
 function consoleLine(e: LogEntry): string {
@@ -182,4 +185,6 @@ export function ingestUiEntry(raw: RawUiEntry): void {
 }
 
 /** Where the logs are, for surfacing in diagnostics/UI if ever needed. */
-export const LOG_DIRECTORY = LOG_DIR;
+export function logDirectory(): string {
+  return logDir();
+}

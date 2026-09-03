@@ -12,6 +12,30 @@ import { Button } from '@/components/ui/button';
 import { htmlToMarkdown } from '@/lib/htmlToMarkdown';
 import { Bold, Code, List, ListOrdered, Type, Send, Mic, MicOff, Square } from 'lucide-react';
 
+/** Pull image File objects out of a clipboard/drag DataTransfer. */
+function imageFilesFrom(dt: DataTransfer | null): File[] {
+  if (!dt) return [];
+  const out: File[] = [];
+  // Prefer .files (screenshots, dragged files); fall back to items for some
+  // browsers that only expose the image via items on paste.
+  if (dt.files && dt.files.length > 0) {
+    for (let i = 0; i < dt.files.length; i++) {
+      const f = dt.files[i];
+      if (f && f.type.startsWith('image/')) out.push(f);
+    }
+  }
+  if (out.length === 0 && dt.items) {
+    for (let i = 0; i < dt.items.length; i++) {
+      const item = dt.items[i];
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) out.push(f);
+      }
+    }
+  }
+  return out;
+}
+
 interface RichTextEditorProps {
   onSubmit: (content: string) => void;
   placeholder?: string;
@@ -26,6 +50,13 @@ interface RichTextEditorProps {
   debounceMs?: number; // Debounce delay for onChange callback (default: 300ms)
   statusBar?: React.ReactNode; // Optional status bar rendered below the editor
   autoFocus?: boolean; // If true, focus the editor once it's ready
+  /** When set, pasted/dropped image files are captured and handed here as
+   *  attachments instead of being inlined by TipTap. Gate this to the SDK
+   *  backend (only it can carry image blocks). */
+  onImagesAdded?: (files: File[]) => void;
+  /** When true, allow submitting with an empty editor (there are image
+   *  attachments staged in the parent). Also enables the send button. */
+  hasAttachments?: boolean;
 }
 
 export interface RichTextEditorHandle {
@@ -49,7 +80,13 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
   debounceMs = 300,
   statusBar,
   autoFocus = false,
+  onImagesAdded,
+  hasAttachments = false,
 }, ref) {
+  // Keep the latest callback in a ref so the editorProps closures (created once)
+  // always see the current handler without re-initializing the editor.
+  const onImagesAddedRef = useRef(onImagesAdded);
+  onImagesAddedRef.current = onImagesAdded;
   const [isRecording, setIsRecording] = useState(false);
   const [isSupported, setIsSupported] = useState(true);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -114,6 +151,28 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
       // aren't auto-wrapped in hyperlinks by the source application.
       transformPastedHTML(html) {
         return html.replace(/<a[^>]*>(.*?)<\/a>/gi, '$1');
+      },
+      // Capture pasted image files as attachments (not inline content). Only
+      // when a handler is wired (SDK backend); otherwise fall through to TipTap.
+      handlePaste: (_view, event) => {
+        const handler = onImagesAddedRef.current;
+        if (!handler) return false;
+        const files = imageFilesFrom(event.clipboardData);
+        if (files.length === 0) return false;
+        event.preventDefault();
+        handler(files);
+        return true;
+      },
+      // Capture dropped image files the same way.
+      handleDrop: (_view, event) => {
+        const handler = onImagesAddedRef.current;
+        if (!handler) return false;
+        const dt = (event as DragEvent).dataTransfer;
+        const files = imageFilesFrom(dt);
+        if (files.length === 0) return false;
+        event.preventDefault();
+        handler(files);
+        return true;
       },
       handleKeyDown: (view, event) => {
         if (showButtonBar && event.key === 'Enter') {
@@ -268,9 +327,10 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
   const handleSubmit = () => {
     if (!editor) return;
 
-    // Check if there's any meaningful content
+    // Check if there's any meaningful content. Allow an empty editor when the
+    // parent has image attachments staged (image-only turn).
     const plainText = editor.getText().trim();
-    if (!plainText) return;
+    if (!plainText && !hasAttachments) return;
 
     // Convert HTML to markdown so formatting (bold, lists, code blocks, and
     // tables) is preserved in prompts sent to Claude.
@@ -523,7 +583,7 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
           <Button
             data-testid={isProcessing ? 'stop-button' : 'send-button'}
             onClick={isProcessing ? onStop : handleSubmit}
-            disabled={!isProcessing && (disabled || editor.isEmpty)}
+            disabled={!isProcessing && (disabled || (editor.isEmpty && !hasAttachments))}
             className={`h-10 w-10 rounded-full text-white p-0 ${
               isProcessing
                 ? 'bg-red-600 hover:bg-red-700'

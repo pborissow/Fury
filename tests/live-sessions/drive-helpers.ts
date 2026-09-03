@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { homedir } from 'os';
 import { join } from 'path';
 import { findSessionJsonlDir } from '../../lib/sessionPaths';
+import { furyLogsDir } from '../../lib/furyHome';
 
 export const BASE_URL = 'http://localhost:3879';
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -42,7 +43,7 @@ export function reapPidFiles(match: (entry: any) => boolean): void {
 
 /** All fury-log entries for a session, across daily files, in file order. */
 export function furyLogLinesFor(sessionId: string): any[] {
-  const dir = join(homedir(), '.claude', 'fury-logs');
+  const dir = furyLogsDir();
   if (!existsSync(dir)) return [];
   const out: any[] = [];
   for (const f of readdirSync(dir).sort()) {

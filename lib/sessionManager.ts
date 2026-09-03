@@ -6,6 +6,7 @@ import { eventBus } from './eventBus';
 import { killProcessTree } from './killProcessTree';
 import { detectUsageLimit, handleUsageLimitDetected } from './providerSwitch';
 import { scrubSessionFile } from './imageScrubber';
+import { settingsPersistence } from './settingsPersistence';
 import { findSessionJsonlDir } from './sessionPaths';
 import { persistSessionContextWindow, restoreJsonlFromArchive } from './transcriptArchiver';
 
@@ -715,8 +716,16 @@ class SessionManager {
         // Images live forever in the conversation history otherwise and push
         // large sessions past the 32MB API request limit. Always launch the
         // CLI, even if scrubbing fails — this is best-effort cleanup.
+        // keepRecentTurns:0 is right for --print (a TEXT prompt — inline
+        // images give no vision here), but the persist setting MUST be
+        // honored: without it this scrub destroyed image bytes ephemerally on
+        // the CLI backend while the SDK backend was externalizing them.
         if (isExistingSession) {
-          scrubSessionFile(session.sessionId, cwd, { keepRecentTurns: 0 })
+          settingsPersistence.loadSettings()
+            .then(settings => scrubSessionFile(session.sessionId, cwd, {
+              keepRecentTurns: 0,
+              persist: settings.imagePersistence === 'persist',
+            }))
             .then(result => {
               if (result && result.scrubbed > 0) {
                 const mb = (result.bytesSaved / 1024 / 1024).toFixed(1);

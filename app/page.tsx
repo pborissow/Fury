@@ -75,6 +75,10 @@ export default function Home() {
   // App settings (persisted to server)
   const [promptSuggestionsEnabled, setPromptSuggestionsEnabled] = useState(true);
   const [ttsEnabled, setTtsEnabled] = useState(false);
+  // Persist pasted/Read-tool images to the on-disk store once they age out of
+  // the recent-turn window (vs. discard them). 'ephemeral' | 'persist'. Defaults
+  // to persist (see DEFAULTS) so every image stays fetchable via /api/images.
+  const [imagePersist, setImagePersist] = useState(true);
   const [sdkSessionsEnabled, setSdkSessionsEnabled] = useState(true);
   const [localhostOnly, setLocalhostOnly] = useState(true);
   const [hasCredentials, setHasCredentials] = useState(false);
@@ -101,6 +105,7 @@ export default function Home() {
     fetch('/api/settings').then(r => r.json()).then(s => {
       if (s.promptSuggestionsEnabled !== undefined) setPromptSuggestionsEnabled(s.promptSuggestionsEnabled);
       if (s.ttsEnabled !== undefined) setTtsEnabled(s.ttsEnabled);
+      if (s.imagePersistence !== undefined) setImagePersist(s.imagePersistence === 'persist');
       if (s.sdkSessionsEnabled !== undefined) setSdkSessionsEnabled(s.sdkSessionsEnabled);
       if (s.localhostOnly !== undefined) setLocalhostOnly(s.localhostOnly);
       if (s.hasCredentials !== undefined) setHasCredentials(s.hasCredentials);
@@ -142,6 +147,10 @@ export default function Home() {
   useEffect(() => {
     saveSettings({ ttsEnabled });
   }, [ttsEnabled, saveSettings]);
+
+  useEffect(() => {
+    saveSettings({ imagePersistence: imagePersist ? 'persist' : 'ephemeral' });
+  }, [imagePersist, saveSettings]);
 
   useEffect(() => {
     saveSettings({ localhostOnly });
@@ -354,6 +363,8 @@ export default function Home() {
             onPromptSuggestionsChange={setPromptSuggestionsEnabled}
             ttsEnabled={ttsEnabled}
             onTtsChange={setTtsEnabled}
+            imagePersist={imagePersist}
+            onImagePersistChange={setImagePersist}
             localhostOnly={localhostOnly}
             onLocalhostOnlyChange={setLocalhostOnly}
             hasCredentials={hasCredentials}

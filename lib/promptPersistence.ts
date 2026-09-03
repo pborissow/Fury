@@ -1,5 +1,6 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { furyPromptsDir } from './furyHome';
 
 export interface Prompt {
   id: string;
@@ -10,7 +11,13 @@ export interface Prompt {
 }
 
 class PromptPersistence {
-  private storageDir = path.join(process.cwd(), '.claude-prompts');
+  /**
+   * ~/.fury/state/prompts (was $cwd/.claude-prompts). Resolved lazily so
+   * nothing captures a legacy path before the startup migration runs.
+   */
+  private get storageDir(): string {
+    return furyPromptsDir();
+  }
 
   private async ensureStorageDir(): Promise<void> {
     try {

@@ -1,7 +1,8 @@
 #!/usr/bin/env npx tsx
 /**
  * Standalone script to populate the Fury transcript database.
- * Scans all ~/.claude/projects/* JSONL files and archives them to ~/.claude/fury.db.
+ * Scans all ~/.claude/projects/* JSONL files and archives them to the Fury
+ * archive DB (~/.fury/fury.db by default — see lib/furyHome.ts).
  *
  * Usage:  npx tsx scripts/populate-db.ts [--dry-run] [--verbose]
  */
@@ -12,6 +13,7 @@ import { readdir, readFile, stat } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { parseTranscriptJsonl } from '../lib/transcriptParser';
+import { furyDbPath } from '../lib/furyHome';
 
 const args = process.argv.slice(2);
 const DRY_RUN = args.includes('--dry-run');
@@ -58,7 +60,7 @@ async function buildHistoryMap(): Promise<Map<string, HistoryInfo>> {
 }
 
 async function main() {
-  const dbFile = join(homedir(), '.claude', 'fury.db');
+  const dbFile = furyDbPath();
   const dbUrl = 'file:///' + dbFile.replace(/\\/g, '/');
 
   log(`Database: ${dbFile}`);

@@ -21,12 +21,12 @@ A prototype IDE for AI-assisted development built with Next.js and the Claude Ag
 - **Node types** - Rectangle, Diamond, and Circle nodes with configurable inputs/outputs
 - **Per-node chat** - Double-click any node to open a chat session scoped to that node
 - **Workflow persistence** - Create, rename, delete, and auto-save workflows to disk
-- **Import/Export** - Workflows stored as JSON in `.claude-workflows/`
+- **Import/Export** - Workflows stored as JSON in `~/.fury/state/workflows/`
 
 ### Right Panel
 - **Stream** - Live stream of tool use events, text output, and errors during Claude responses
 - **File Tree** - Explore the active session's project directory (filters out `node_modules`, `.next`, `.git`, etc.)
-- **Notes** - Per-project rich text notes with auto-save (stored in `~/.claude-session-notes/`)
+- **Notes** - Per-project rich text notes with auto-save (stored in `~/.fury/notes/`)
 - **MCP Servers** - Manage Model Context Protocol servers with a guided wizard
 
 ### Settings
@@ -103,19 +103,23 @@ responses go through a two-pass tighten + list-stripping pipeline.
 |------|----------|
 | Session transcripts | `~/.claude/projects/<slug>/<sessionId>.jsonl` (written by the Claude Code subprocess) |
 | Chat history | `~/.claude/history.jsonl` (Claude Code global, also appended by Fury) |
-| **Transcript archive** | **`~/.claude/fury.db` (SQLite, Fury managed)** |
-| Workflows | `.claude-workflows/*.json` (project-local) |
-| UI state | `.claude-ui-state/state.json` (project-local) |
-| App settings | `.claude-ui-state/settings.json` (project-local) |
-| Saved prompts | `.claude-prompts/*.json` (project-local) |
-| Session notes | `~/.claude-session-notes/*.md` (user home) |
+| **Transcript archive** | **`~/.fury/fury.db` (SQLite, Fury managed)** |
+| Image store | `~/.fury/images/<sessionId>/` |
+| Logs | `~/.fury/logs/*.jsonl` (daily) |
+| Workflows | `~/.fury/state/workflows/*.json` |
+| UI state | `~/.fury/state/ui-state.json` |
+| App settings | `~/.fury/state/settings.json` |
+| Saved prompts | `~/.fury/state/prompts/*.json` |
+| Session notes | `~/.fury/notes/*.md` |
 | MCP servers | `~/.claude.json` (user scope) or `.mcp.json` (project scope), created and managed by Claude CLI via `claude mcp add/remove` |
 | Code search index | `~/.codemogger/index.db` (codemogger, user home) |
 | Theme | `localStorage` (browser) |
 
+All Fury-owned data lives under a single `~/.fury/` home (override with `FURY_HOME`; `FURY_DB_PATH` / `FURY_IMAGES_PATH` override individual stores). Data previously scattered across `~/.claude`, `~/.claude-session-notes`, and project-local dot-dirs is moved in automatically by a one-time migration on server startup (see `docs/plan-fury-home-migration.md`). Claude-Code-owned files (`~/.claude/projects`, `history.jsonl`, credentials, settings) stay in `~/.claude` — Fury only interoperates with those.
+
 ### Transcript Database
 
-Claude Code auto-deletes session JSONL files after 30 days (controlled by `cleanupPeriodDays` in `~/.claude/settings.json`). Fury maintains an independent SQLite archive at `~/.claude/fury.db` so transcripts survive cleanup.
+Claude Code auto-deletes session JSONL files after 30 days (controlled by `cleanupPeriodDays` in `~/.claude/settings.json`). Fury maintains an independent SQLite archive at `~/.fury/fury.db` so transcripts survive cleanup.
 
 **How it works:**
 

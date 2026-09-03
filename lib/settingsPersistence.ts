@@ -4,6 +4,7 @@ import { scryptSync, timingSafeEqual } from 'crypto';
 import path from 'path';
 import { atomicWriteFile } from './atomicWrite';
 import { recoverCorruptJsonFile, salvageLeadingObject } from './corruptState';
+import { furySettingsFile } from './furyHome';
 
 /** Parse settings content, or null if it is not a usable JSON object. */
 function parseSettingsObject(content: string): Record<string, unknown> | null {
@@ -62,9 +63,23 @@ export interface AppSettings {
    *  background tasks and scheduled wakeups survive instead of being orphaned.
    *  Default ON in the sdk-session-prototype branch. */
   sdkSessionsEnabled: boolean;
+  /** How pasted/Read-tool images are handled once they age past the recent
+   *  window (see keepRecentTurns). 'ephemeral' scrubs them to a placeholder and
+   *  discards the bytes (no new disk footprint, images vanish from history).
+   *  'persist' externalizes the bytes to the per-session on-disk store
+   *  (~/.fury/images/<sessionId>/<hash>.<ext>) and leaves a
+   *  fury-img://<hash> ref in the transcript so the thumbnail survives reload. */
+  imagePersistence: 'ephemeral' | 'persist';
+  /** Number of recent turns whose transcript images stay INLINE (true vision on
+   *  resume + direct render) before scrubbing/externalizing kicks in. 1 = the
+   *  current turn keeps its inline image, everything older is scrubbed. */
+  keepRecentTurns: number;
 }
 
-const DEFAULTS: AppSettings = {
+/** Exported so fallback consumers (lib/tts.ts) can't drift from the real
+ *  defaults by hand-copying them — which had already happened once
+ *  (imagePersistence: 'ephemeral' vs this 'persist'). */
+export const DEFAULT_SETTINGS: AppSettings = {
   promptSuggestionsEnabled: true,
   ttsEnabled: false,
   localhostOnly: true,
@@ -88,17 +103,34 @@ const DEFAULTS: AppSettings = {
   modelCatalogPollEnabled: true,
   modelCatalogPollIntervalDays: 7,
   sdkSessionsEnabled: true,
+  // Persist by default: every image in a session stays renderable via
+  // /api/images/<sessionId>/<hash>. `scrubImages` externalizes an image's bytes
+  // to the store in the SAME pass that replaces it with a fury-img://<hash> ref,
+  // so any ref we render (live JSONL or DB fallback) is guaranteed to resolve.
+  imagePersistence: 'persist',
+  keepRecentTurns: 1,
 };
 
-class SettingsPersistence {
-  private stateFile: string;
+// Internal alias — the class body reads naturally as "merged over DEFAULTS".
+const DEFAULTS = DEFAULT_SETTINGS;
 
-  constructor() {
-    this.stateFile = path.join(process.cwd(), '.claude-ui-state', 'settings.json');
+class SettingsPersistence {
+  /** Test hook: when set, wins over the resolver. Production leaves it unset. */
+  private stateFile: string | null = null;
+
+  /**
+   * Resolved lazily (per call, not in the constructor): the module loads
+   * before the startup migration runs, and lib/furyHome's read-fallback could
+   * capture the legacy $cwd/.claude-ui-state path the migration is about to
+   * move. Was $cwd-relative — launching Fury from a different directory
+   * silently "reset" settings; ~/.fury/state fixes that.
+   */
+  private file(): string {
+    return this.stateFile ?? furySettingsFile();
   }
 
   private async ensureStorageDir(): Promise<void> {
-    const dir = path.dirname(this.stateFile);
+    const dir = path.dirname(this.file());
     await fs.mkdir(dir, { recursive: true });
   }
 
@@ -115,9 +147,10 @@ class SettingsPersistence {
    * loss is logged loudly.
    */
   async loadSettings(): Promise<AppSettings> {
+    const stateFile = this.file();
     let content: string;
     try {
-      content = await fs.readFile(this.stateFile, 'utf-8');
+      content = await fs.readFile(stateFile, 'utf-8');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         console.warn('[SettingsPersistence] Could not read settings:', error);
@@ -129,7 +162,7 @@ class SettingsPersistence {
     if (parsed) return { ...DEFAULTS, ...parsed };
 
     const recovered = await recoverCorruptJsonFile(
-      this.stateFile, content, 'SettingsPersistence', lastParseError(content),
+      stateFile, content, 'SettingsPersistence', lastParseError(content),
     );
     return { ...DEFAULTS, ...(recovered ?? {}) };
   }
@@ -149,7 +182,7 @@ class SettingsPersistence {
   loadSettingsSync(): AppSettings {
     let content: string;
     try {
-      content = readFileSync(this.stateFile, 'utf-8');
+      content = readFileSync(this.file(), 'utf-8');
     } catch {
       return { ...DEFAULTS };
     }
@@ -177,7 +210,7 @@ class SettingsPersistence {
     // returned, so a torn file that silently read as DEFAULTS would destroy the
     // stored auth hash and API key right here. That is now the read side's job
     // to prevent (./corruptState); this end just guarantees no NEW tear.
-    await atomicWriteFile(this.stateFile, JSON.stringify(merged, null, 2));
+    await atomicWriteFile(this.file(), JSON.stringify(merged, null, 2));
     return merged;
   }
 }

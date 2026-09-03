@@ -12,6 +12,9 @@ import { eventBus } from './eventBus';
 import { parseTranscriptJsonl, type TranscriptMessage, type UsageEvent } from './transcriptParser';
 import { parseSubagentUsageEvents, subagentsDirFor } from './subagentUsage';
 import { projectPathToSlug } from './utils';
+import { deleteSessionImages } from './imageStore';
+import { scrubImages } from './imageScrubber';
+import { settingsPersistence } from './settingsPersistence';
 
 export interface SessionMetadata {
   label?: string;
@@ -236,7 +239,31 @@ export async function archiveTranscript(
       args: [sessionId, messages[i].role, messages[i].content, messages[i].timestamp, i],
     });
   }
-  const lines = rawLines ?? jsonlContent.split('\n').filter(l => l.trim());
+  // Authoritative DB-leanness guard: strip ALL inline base64 images out of the
+  // copy that lands in raw_jsonl (keepRecentTurns:0). The DB is a downstream
+  // fallback (constraint 7) that never needs inline vision, so the recent-turn
+  // image the LIVE JSONL keeps must NOT be copied verbatim here — otherwise a
+  // 1.4MB base64 blob lands in fury.db, permanently if the session ends on an
+  // image turn (the "no base64 in DB" goal). This runs on the in-memory content
+  // string and NEVER touches the live JSONL file, so it can't race the live
+  // `claude` writer. In persist mode it externalizes the bytes to the per-
+  // session store (so the DB carries fury-img:// refs the fallback can rehydrate
+  // and loadTranscript re-derives) — meaning the store is populated here too,
+  // independent of the live per-turn scrub. `hash` above is computed on the
+  // ORIGINAL content, so change-detection still tracks the live file (no re-
+  // archive loop). Guarded by a cheap substring check so text-only sessions pay
+  // nothing.
+  let lines = rawLines ?? jsonlContent.split('\n').filter(l => l.trim());
+  if (jsonlContent.includes('"type":"image"') || jsonlContent.includes('"type": "image"')) {
+    try {
+      const settings = await settingsPersistence.loadSettings();
+      const persist = settings.imagePersistence === 'persist';
+      const scrubbed = scrubImages(jsonlContent, { keepRecentTurns: 0, persist, sessionId });
+      lines = scrubbed.content.split('\n').filter(l => l.trim());
+    } catch (err) {
+      console.error('[archiveTranscript] image scrub for DB failed; storing verbatim:', err);
+    }
+  }
   for (let i = 0; i < lines.length; i++) {
     inserts.push({
       sql: 'INSERT INTO raw_jsonl (session_id, line_number, content) VALUES (?, ?, ?)',
@@ -555,6 +582,45 @@ export async function loadTranscript(
 
   const rawLines = rawResult.rows.map(row => row.content as string);
 
+  // The messages table has no images column (no schema change for this
+  // feature — the JSONL is the source of truth). Re-derive image parts from the
+  // stored raw_jsonl so a file-gone session still renders thumbnail refs.
+  //
+  // Joined by (role, timestamp) — NOT by array index. The stored rows are not
+  // guaranteed to mirror a fresh reparse one-to-one: /api/transcript splices a
+  // synthetic plan-mode assistant bubble into the array it archives (raw_jsonl
+  // can't reproduce it), and rows archived by an older parser may lack
+  // array-form user turns entirely. An index zip guarded by an exact count
+  // match silently disabled enrichment for exactly those sessions; the keyed
+  // join enriches every row it CAN match and ignores the rest. Duplicate keys
+  // are consumed in order (queue) so twin-timestamped messages stay aligned.
+  // (Post-archive purge means the bytes 404 → placeholder chip; intended.)
+  if (rawLines.length > 0) {
+    const joined = rawLines.join('\n');
+    // Cheap gate: skip the full reparse for image-less sessions.
+    const mayHaveImages = joined.includes('fury-img://')
+      || joined.includes('"type":"image"') || joined.includes('"type": "image"');
+    if (mayHaveImages) {
+      try {
+        const reparsed = parseTranscriptJsonl(joined);
+        const byKey = new Map<string, TranscriptMessage[]>();
+        for (const m of reparsed.messages) {
+          if (!m.images?.length) continue;
+          const key = `${m.role}|${m.timestamp}`;
+          const q = byKey.get(key);
+          if (q) q.push(m); else byKey.set(key, [m]);
+        }
+        for (const msg of messages) {
+          const q = byKey.get(`${msg.role}|${msg.timestamp}`);
+          const match = q?.shift();
+          if (match?.images) msg.images = match.images;
+        }
+      } catch {
+        // Best-effort enrichment — fall back to image-less messages.
+      }
+    }
+  }
+
   return { messages, rawLines };
 }
 
@@ -765,6 +831,15 @@ export async function archiveForDelete(sessionId: string, project: string | null
     } catch (err) {
       console.error('[archiveForDelete] archive failed; JSONL will be preserved:', err);
     }
+  }
+  // Purge the session's on-disk image store (plan §3 retention). No cross-session
+  // dedup, so this is a self-contained `rm -rf <sessionId>/`. Post-archive the
+  // session renders from the SQLite fallback with ref placeholders whose bytes
+  // are now gone — thumbnails 404 → graceful placeholder chip, as intended.
+  try {
+    await deleteSessionImages(sanitized);
+  } catch (err) {
+    console.error('[archiveForDelete] image purge failed:', err);
   }
   return withSessionMetaLock(sanitized, async () => {
     const exists = await sessionRowExists(sanitized);

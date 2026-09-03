@@ -2,7 +2,8 @@
  * SQLite database singleton for transcript archival.
  *
  * Uses @libsql/client (Turso/libSQL) with a local file-based database
- * at ~/.claude/fury.db. Survives Next.js HMR via globalThis.
+ * at ~/.fury/fury.db (see lib/furyHome.ts). Survives Next.js HMR via
+ * globalThis.
  *
  * On first initialization, runs a startup scan to archive all existing
  * JSONL transcripts into the database.
@@ -10,8 +11,10 @@
 
 import { createClient, type Client } from '@libsql/client';
 import { homedir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
+import { mkdirSync } from 'fs';
 import { readdir, readFile, stat } from 'fs/promises';
+import { furyDbPath } from './furyHome';
 import { parseTranscriptJsonl } from './transcriptParser';
 import { PRICING, PRICING_AS_OF } from './pricing';
 import { hasAnyConfirmedWindow } from './modelWindows';
@@ -32,7 +35,11 @@ const SCHEMA_VERSION = 2; // 2: usage_events.agent_id + subagent-usage backfill
 const IN_TEST = !!process.env.VITEST || process.env.NODE_ENV === 'test';
 
 function getDbPath(): string {
-  const dbFile = process.env.FURY_DB_PATH || join(homedir(), '.claude', 'fury.db');
+  const dbFile = furyDbPath();
+  // libSQL won't create missing parent directories, so ensure them here —
+  // matters for a fresh install (~/.fury not yet created) and for tests that
+  // point homedir at a scratch dir.
+  try { mkdirSync(dirname(dbFile), { recursive: true }); } catch { /* best-effort */ }
   // libSQL requires file:// URL with forward slashes
   return 'file:///' + dbFile.replace(/\\/g, '/');
 }

@@ -1,8 +1,9 @@
 /**
  * Append-only log of provider-switch events.
  *
- * Lives at ~/.claude/provider-fallback-log.jsonl. Each line is a JSON
- * object describing a single provider transition. The log doubles as:
+ * Lives at ~/.fury/provider-fallback-log.jsonl (see lib/furyHome.ts). Each
+ * line is a JSON object describing a single provider transition. The log
+ * doubles as:
  *
  *  1. A durable record of "is there a pending switch-back to Anthropic?"
  *     so the auto-failover survives server restarts.
@@ -16,11 +17,8 @@
 
 import { appendFile, readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
-import { homedir } from 'os';
-import { join, dirname } from 'path';
-
-const CLAUDE_DIR = join(homedir(), '.claude');
-const FALLBACK_LOG_PATH = join(CLAUDE_DIR, 'provider-fallback-log.jsonl');
+import { dirname } from 'path';
+import { furyProviderFallbackLogPath } from './furyHome';
 
 export type FallbackLogEventType =
   | 'switched-to-bedrock'
@@ -64,7 +62,7 @@ export interface PendingSwitchBack {
 }
 
 function getLogPath(): string {
-  return FALLBACK_LOG_PATH;
+  return furyProviderFallbackLogPath();
 }
 
 async function ensureDir(): Promise<void> {

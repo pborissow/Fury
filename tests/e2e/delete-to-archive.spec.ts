@@ -23,11 +23,12 @@
  */
 import { test, expect, type Page } from '@playwright/test';
 import { createClient, type Client } from '@libsql/client';
-import { homedir } from 'os';
-import { join } from 'path';
+import { furyDbPath } from '../../lib/furyHome';
 
-// Mirrors getDbPath() in lib/db.ts — libSQL needs a file:// URL with forward slashes.
-const DB_URL = 'file:///' + join(homedir(), '.claude', 'fury.db').replace(/\\/g, '/');
+// Mirrors getDbPath() in lib/db.ts — libSQL needs a file:// URL with forward
+// slashes. furyDbPath() resolves the same file the running server uses
+// (~/.fury/fury.db, legacy-aware).
+const DB_URL = 'file:///' + furyDbPath().replace(/\\/g, '/');
 
 const STAMP = Date.now();
 // Sanitized to [a-zA-Z0-9-] so it survives the delete route's path-traversal
