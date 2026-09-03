@@ -2524,6 +2524,11 @@ export default function ChatTab({
         // question Y renders with question X's stale pre-checked answers.
         key={askUserQuestion.toolUseID ?? 'cli'}
         open={true}
+        // Draft identity: in-progress selections/text survive the unmount a
+        // session switch causes (P17 clears askUserQuestion unconditionally)
+        // and are restored when the question re-parks on switch-back. The CLI
+        // path (null) falls back to a question-text signature inside.
+        draftKey={askUserQuestion.toolUseID}
         // Anchor the modal to the Chat tab's middle panel instead of the
         // whole viewport, so it dims/centers within the conversation column.
         portalContainer={middlePanelRef.current}
