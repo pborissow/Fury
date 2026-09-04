@@ -17,48 +17,55 @@
  * The SQLite DB is backed up to ~/.claude/fury-backup-* BEFORE this test runs.
  */
 import { test, expect } from '@playwright/test';
-import { execSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { createClient } from '@libsql/client';
+import { furyDbPath } from '../../lib/furyHome';
 
 const SESSION_ID = '85defa96-1b44-4030-8978-ca2b2db9db5d';
 const PROJECT_PATH = '/Users/peterborrisow/Documents/Java/BoatsGroup/maven/YC2-357';
 const SLUG = '-Users-peterborrisow-Documents-Java-BoatsGroup-maven-YC2-357';
-const DB = join(homedir(), '.claude', 'fury.db');
+// Resolve like the app does (~/.fury/fury.db with legacy ~/.claude fallback) —
+// the old hardcoded legacy path broke when the home migration moved the DB.
+const DB = furyDbPath();
 const JSONL = join(homedir(), '.claude', 'projects', SLUG, `${SESSION_ID}.jsonl`);
 
-function sqliteJson(query: string): any[] {
-  const out = execSync(`sqlite3 -json "${DB}" "${query.replace(/"/g, '\\"')}"`, { encoding: 'utf-8' });
-  return out.trim() ? JSON.parse(out) : [];
+// Query via @libsql/client (the same driver Fury's archiver uses on the same
+// file) instead of shelling out to a `sqlite3` CLI the machine may not have.
+const db = createClient({ url: 'file:///' + DB.replace(/\\/g, '/') });
+async function sqliteJson(query: string): Promise<any[]> {
+  const res = await db.execute(query);
+  return res.rows.map((r) => ({ ...r }));
 }
 
-function sessionRow() {
-  return sqliteJson(
+async function sessionRow() {
+  return (await sqliteJson(
     `SELECT session_id, message_count, jsonl_hash,
             datetime(created_at/1000,'unixepoch','localtime') AS created,
             datetime(updated_at/1000,'unixepoch','localtime') AS updated,
             json_extract(metadata,'$.label') AS label
      FROM sessions WHERE session_id='${SESSION_ID}'`
-  )[0] || null;
+  ))[0] || null;
 }
 
-function messageStats() {
-  const rows = sqliteJson(
+async function messageStats() {
+  const rows = await sqliteJson(
     `SELECT role, COUNT(*) AS count, MIN(timestamp) AS first, MAX(timestamp) AS last
      FROM messages WHERE session_id='${SESSION_ID}' GROUP BY role`
   );
-  const total = sqliteJson(`SELECT COUNT(*) AS n FROM messages WHERE session_id='${SESSION_ID}'`)[0]?.n ?? 0;
-  const historical = sqliteJson(
+  // Number(): libsql may surface COUNT(*) as BigInt; toBe(11) needs a number.
+  const total = Number((await sqliteJson(`SELECT COUNT(*) AS n FROM messages WHERE session_id='${SESSION_ID}'`))[0]?.n ?? 0);
+  const historical = Number((await sqliteJson(
     `SELECT COUNT(*) AS n FROM messages WHERE session_id='${SESSION_ID}' AND timestamp LIKE '2026-03-10%'`
-  )[0]?.n ?? 0;
+  ))[0]?.n ?? 0);
   return { rows, total, historical };
 }
 
-async function waitFor<T>(probe: () => T | null, timeoutMs: number, intervalMs = 500): Promise<T | null> {
+async function waitFor<T>(probe: () => T | null | Promise<T | null>, timeoutMs: number, intervalMs = 500): Promise<T | null> {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
-    const v = probe();
+    const v = await probe();
     if (v !== null && v !== undefined && v !== false) return v;
     await new Promise(r => setTimeout(r, intervalMs));
   }
@@ -69,8 +76,8 @@ test('resuming a JSONL-less old session wipes the SQLite archive', async ({ page
   test.setTimeout(120_000);
 
   // ---- BASELINE ----
-  const before = sessionRow();
-  const beforeStats = messageStats();
+  const before = await sessionRow();
+  const beforeStats = await messageStats();
   console.log('\n[TEST] ============ BEFORE ============');
   console.log('[TEST] Session row:', before);
   console.log('[TEST] Total archived messages:', beforeStats.total);
@@ -119,15 +126,15 @@ test('resuming a JSONL-less old session wipes the SQLite archive', async ({ page
 
   // ---- Wait for archive to update (updated_at changes vs baseline) ----
   const baselineUpdated = before!.updated;
-  const updatedRow = await waitFor(() => {
-    const r = sessionRow();
+  const updatedRow = await waitFor(async () => {
+    const r = await sessionRow();
     return r && r.updated !== baselineUpdated ? r : null;
   }, 45_000, 500);
   console.log(`[TEST] Archive updated_at changed? ${updatedRow ? 'YES' : 'NO (no update detected within 45s)'}`);
 
   // ---- AFTER ----
-  const after = sessionRow();
-  const afterStats = messageStats();
+  const after = await sessionRow();
+  const afterStats = await messageStats();
   console.log('\n[TEST] ============ AFTER ============');
   console.log('[TEST] Session row:', after);
   console.log('[TEST] Total archived messages:', afterStats.total);

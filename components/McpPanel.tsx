@@ -219,6 +219,9 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
   const [mcpForm, setMcpForm] = useState<McpForm>(INITIAL_FORM);
   const [mcpAddLoading, setMcpAddLoading] = useState(false);
   const [mcpAddError, setMcpAddError] = useState<string | null>(null);
+  // Soft post-add warning (W3): server registered but its trust approval could
+  // not be verified in <project>/.claude/settings.local.json — it may not load.
+  const [mcpAddWarning, setMcpAddWarning] = useState<string | null>(null);
 
   // Step 3: CLAUDE.md instructions
   const [instructions, setInstructions] = useState('');
@@ -326,6 +329,7 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
   const handleAddServer = useCallback(async () => {
     setMcpAddLoading(true);
     setMcpAddError(null);
+    setMcpAddWarning(null);
     try {
       // If editing, remove the old server first
       if (editingServerName) {
@@ -378,6 +382,7 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
       }
 
       const errors: string[] = [];
+      const warnings: string[] = [];
       const succeeded: ParsedServer[] = [];
 
       for (const server of servers) {
@@ -396,6 +401,11 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
           errors.push(`${server.name}: ${data.error || 'Failed'}`);
         } else {
           succeeded.push(server);
+          // The add succeeded but the approval may not have persisted (W3,
+          // docs/ticket-mcp-auto-approve-stale-trust-store.md): an unapproved
+          // project server is silently absent from sessions — not "failed" — so
+          // this soft warning is the user's only signal. Surface it.
+          if (typeof data.warning === 'string' && data.warning) warnings.push(data.warning);
         }
       }
 
@@ -411,6 +421,9 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
 
       if (errors.length > 0) {
         setMcpAddError(`Added ${succeeded.length}/${servers.length}. Failed:\n${errors.join('\n')}`);
+      }
+      if (warnings.length > 0) {
+        setMcpAddWarning(warnings.join('\n'));
       }
 
       setWizardStep('instructions');
@@ -877,6 +890,11 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
             {mcpAddError && (
               <div className="text-sm text-red-400 p-2 bg-red-500/10 rounded">
                 {mcpAddError}
+              </div>
+            )}
+            {mcpAddWarning && (
+              <div data-testid="mcp-approve-warning" className="text-sm text-yellow-400 p-2 bg-yellow-500/10 rounded whitespace-pre-wrap">
+                {mcpAddWarning}
               </div>
             )}
           </div>

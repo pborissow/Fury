@@ -11,8 +11,8 @@
  *     MUST keep reading as live for the grace window. (This was the inverse — Defect A,
  *     "a shell is not Claude work" — until the 2026-08-21 decision in
  *     docs/ticket-live-badge-flicker-quiet-background-task.md reversed it.)
- *   - DRIVEN session T fans out PARALLEL FOREGROUND scouts against real Gypsy — its
- *     scenario-2 surface: the dots/phase must not go dark mid-turn.
+ *   - DRIVEN session T fans out PARALLEL FOREGROUND scouts against the Fury repo
+ *     itself — its scenario-2 surface: the dots/phase must not go dark mid-turn.
  *
  * Neither is visible watching one session alone; they co-occur only in the real
  * topology. This spec monitors BOTH threads on one timeline via the single liveness
@@ -39,8 +39,9 @@
  *     docs/ticket-live-badge-flicker-quiet-background-task.md.
  *
  * COST/TIME: two real multi-minute turns (a planning fan-out + a background bash).
- * Budget ~12 min and a few dollars. Lives in tests/live-sessions (costly), gated on
- * the real Gypsy codebase being present.
+ * Budget ~12 min and a few dollars. Lives in tests/live-sessions (costly). The
+ * scouts' read target is the Fury repo itself, so the spec is portable — no
+ * machine-specific codebase required (previously gated on a personal Java repo).
  */
 import { test, expect } from '@playwright/test';
 import { randomUUID } from 'crypto';
@@ -55,13 +56,13 @@ const STEP2 = process.env.STEP2 === '1'; // when the client renders `liveness`, 
 // Repo-parent scratch dirs (same convention as the sibling drives).
 const PROJECT_T = join(__dirname, '..', '..', '..', 'fury-e2e-dual-driven');
 const PROJECT_O = join(__dirname, '..', '..', '..', 'fury-e2e-dual-owner');
-const GYPSY = 'C:\\Users\\petya\\Documents\\Java\\Web Projects\\Gypsy';
+const TARGET = join(__dirname, '..', '..'); // the Fury repo itself — always present
 
 // ---- Driven (T): the scout-planning fixture from planning-scouts-inflight.spec.ts,
 //      kept self-contained here on purpose (a costly spec shouldn't import another). ----
-const T_CLAUDE_MD = `# Planner — Gypsy → Node/React migration
+const T_CLAUDE_MD = `# Planner — Fury → Java-or-Python rewrite
 
-You are a PLANNER. Your job is to produce a migration plan, NOT to read source code
+You are a PLANNER. Your job is to produce a rewrite plan, NOT to read source code
 into this (main) thread. You DELEGATE all code reading to the \`scout\` subagent.
 
 ## Hard rules — follow EXACTLY
@@ -70,16 +71,19 @@ into this (main) thread. You DELEGATE all code reading to the \`scout\` subagent
 2. Launch scouts in PARALLEL: put MULTIPLE Task(scout) tool calls in a SINGLE
    message — one scout per subsystem — and wait for them all. Do this at least TWICE
    (an initial survey, then a deeper pass on the areas the survey flags).
-3. The target codebase is the Gypsy Java web app at:
-   ${GYPSY}
-   Its three subsystems are \`JTS/\`, \`WebApp/\`, and \`kartographia-map/\`.
-4. After the scouts report, WRITE the plan to \`docs/PLAN-gypsy-node-react.md\`
-   (create the docs/ dir). Keep the main thread lean.
+3. The target codebase is Fury, a Next.js/React UI for Claude Code, at:
+   ${TARGET}
+   Its three subsystems are \`lib/\` (session/SDK backend), \`app/\` (Next.js API
+   routes + pages), and \`components/\` (the React UI). The target is READ-ONLY —
+   never write into it.
+4. After the scouts report, WRITE the plan to \`docs/PLAN-fury-rewrite.md\` in THIS
+   project (create the docs/ dir). Recommend Java or Python per subsystem. Keep the
+   main thread lean.
 
 ## Scouts (one Task per subsystem, run concurrently)
-- scout JTS/            → server/topology/geometry code: entry points, key classes.
-- scout WebApp/         → the web layer: endpoints, servlets/JSP, JS front-end.
-- scout kartographia-map/→ the mapping library: public API surface, dependencies.
+- scout lib/        → session management, SDK spawn path, transcript parsing: entry points, key modules.
+- scout app/        → the API routes + pages: endpoints, request/response shapes.
+- scout components/ → the React UI: main views, state flow, key components.
 `;
 
 const SCOUT_MD = `---
@@ -88,7 +92,7 @@ description: >-
   Reads code and returns a tight summary with file:line references. Use for ANY
   multi-file exploration so raw file content never enters the main thread's context.
 tools: Read, Grep, Glob, Bash
-model: sonnet
+model: claude-haiku-4-5
 ---
 
 You are a scout. Explore the codebase and return the smallest answer that lets the
@@ -98,10 +102,10 @@ references. You are read-only. State what you did NOT check.
 `;
 
 const T_KICKOFF =
-  'Read CLAUDE.md and produce the Gypsy → Node/React migration plan EXACTLY as it ' +
+  'Read CLAUDE.md and produce the Fury → Java-or-Python rewrite plan EXACTLY as it ' +
   'specifies. Start by launching parallel scout subagents (one per subsystem, all in ' +
   'one message), wait for their summaries, do a second deeper parallel scout pass, ' +
-  'then write docs/PLAN-gypsy-node-react.md. Do not read source files into this thread.';
+  'then write docs/PLAN-fury-rewrite.md. Do not read source files into this thread.';
 
 // ---- Owner (O): launch ONE detached run_in_background bash, then END the turn. This
 //      is the f407574a topology — the Fury session that kicked off a background drive
@@ -175,7 +179,7 @@ function record(h: any, tSec: number): Sample {
 test('dual-session liveness: owner-idle-with-bash + driven-scout-planning stay honest', async ({ page }) => {
   test.setTimeout(13 * 60 * 1000);
 
-  expect(existsSync(GYPSY), `Gypsy codebase present at ${GYPSY}`).toBe(true);
+  expect(existsSync(join(TARGET, 'lib')), `Fury lib/ present under ${TARGET}`).toBe(true);
 
   sidT = randomUUID();
   sidO = randomUUID();

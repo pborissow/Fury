@@ -158,6 +158,9 @@ test.describe('This project code-search — auto-refresh (full e2e, in-process)'
 
     sessionId = randomUUID();
     reapPidFiles((e) => String(e.cwd || '').replace(/\\/g, '/').includes('/fury-e2e-mcp-refresh'));
+    // Disable BEFORE the reset — a crashed prior run's live engine handle would
+    // put the deleted DB into Windows delete-pending (see mcp-codesearch.spec.ts).
+    await disableCodeSearch(PROJECT);
     await resetProjectDir(PROJECT);
     console.log(`[E2E] session=${sessionId} project=${PROJECT}`);
 

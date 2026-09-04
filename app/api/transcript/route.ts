@@ -6,6 +6,8 @@ import { realpath } from 'fs/promises';
 import { projectPathToSlug } from '@/lib/utils';
 import { parseTranscriptJsonl, type TranscriptMessage } from '@/lib/transcriptParser';
 import { archiveTranscript, loadTranscript } from '@/lib/transcriptArchiver';
+import { sessionManager } from '@/lib/sessionManager';
+import { sdkSessionManager } from '@/lib/sdkSessionManager';
 
 export const runtime = 'nodejs';
 
@@ -203,9 +205,20 @@ export async function GET(request: NextRequest) {
           }
 
           const historyMessages = await getHistoryPrompts(sanitizedSessionId);
+          // A missing JSONL does NOT always mean "the CLI never persisted this
+          // session": a brand-new session's JSONL only appears a few seconds
+          // after the first turn spawns the CLI. If the session is LIVE right
+          // now (either backend), this is that startup window — report it as
+          // `pending` (benign; the stream buffer paints the in-flight turn)
+          // instead of `partial`, which makes ChatTab show the scary
+          // "transcripts were not persisted" banner on an actively-streaming
+          // session (observed live 2026-09-04 during the scout-planning drive).
+          const liveNow = sessionManager.getSessionHealth(sanitizedSessionId).isProcessing
+            || sdkSessionManager.isSessionProcessing(sanitizedSessionId)
+            || sdkSessionManager.isBackgroundActive(sanitizedSessionId);
           return NextResponse.json({
             messages: historyMessages,
-            partial: true,
+            ...(liveNow ? { pending: true } : { partial: true }),
           });
         }
       } else {

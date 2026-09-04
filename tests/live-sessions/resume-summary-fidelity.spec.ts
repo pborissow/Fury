@@ -12,20 +12,26 @@
  * 2026-03-10, JSONL deleted by Claude CLI's 30-day cleanup).
  */
 import { test, expect } from '@playwright/test';
-import { execSync } from 'child_process';
 import { existsSync, readFileSync, statSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { createClient } from '@libsql/client';
+import { furyDbPath } from '../../lib/furyHome';
 
 const SESSION_ID = '85defa96-1b44-4030-8978-ca2b2db9db5d';
 const PROJECT_PATH = '/Users/peterborrisow/Documents/Java/BoatsGroup/maven/YC2-357';
 const SLUG = '-Users-peterborrisow-Documents-Java-BoatsGroup-maven-YC2-357';
-const DB = join(homedir(), '.claude', 'fury.db');
+// Resolve like the app does (~/.fury/fury.db with legacy ~/.claude fallback) —
+// the old hardcoded legacy path broke when the home migration moved the DB.
+const DB = furyDbPath();
 const JSONL = join(homedir(), '.claude', 'projects', SLUG, `${SESSION_ID}.jsonl`);
 
-function archivedCount(): number {
-  const out = execSync(`sqlite3 "${DB}" "SELECT COUNT(*) FROM messages WHERE session_id='${SESSION_ID}'"`, { encoding: 'utf-8' });
-  return parseInt(out.trim(), 10) || 0;
+// Query via @libsql/client (the same driver Fury's archiver uses on the same
+// file) instead of shelling out to a `sqlite3` CLI the machine may not have.
+const db = createClient({ url: 'file:///' + DB.replace(/\\/g, '/') });
+async function archivedCount(): Promise<number> {
+  const res = await db.execute(`SELECT COUNT(*) AS n FROM messages WHERE session_id='${SESSION_ID}'`);
+  return Number(res.rows[0]?.n ?? 0);
 }
 
 async function waitForJsonlStable(stableMs: number, timeoutMs: number): Promise<{ stable: boolean; sizeBytes: number; lines: number }> {
@@ -80,7 +86,7 @@ test('resume preserves history AND Claude CLI sees the archived context', async 
 
   // ---- Preconditions ----
   console.log('\n[FIDELITY] ====== Preconditions ======');
-  const before = archivedCount();
+  const before = await archivedCount();
   console.log('[FIDELITY] Archived messages before:', before);
   console.log('[FIDELITY] JSONL exists?', existsSync(JSONL));
   expect(before).toBe(11);
@@ -139,7 +145,7 @@ test('resume preserves history AND Claude CLI sees the archived context', async 
 
   // Final state: archive still has at least the original 11 — possibly more
   // if the new assistant turn was archived in time.
-  const after = archivedCount();
+  const after = await archivedCount();
   console.log('[FIDELITY] Archived messages after:', after);
   expect(after).toBeGreaterThanOrEqual(11);
 });

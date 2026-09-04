@@ -116,6 +116,9 @@ test.describe('code search coexists with a project .mcp.json MCP server (no shad
     test.setTimeout(4 * 60 * 1000);
     sessionId = randomUUID();
     reapPidFiles((e) => String(e.cwd || '').replace(/\\/g, '/').includes('/fury-e2e-mcp-coexist'));
+    // Disable BEFORE the reset — a crashed prior run's live engine handle would
+    // put the deleted DB into Windows delete-pending (see mcp-codesearch.spec.ts).
+    await disableCodeSearch(PROJECT);
     await resetProjectDir(PROJECT);
 
     // A source symbol for code search + a REAL project .mcp.json MCP server (the fixture).
@@ -123,8 +126,9 @@ test.describe('code search coexists with a project .mcp.json MCP server (no shad
     writeFileSync(join(PROJECT, '.mcp.json'), JSON.stringify({
       mcpServers: { fixture: { command: 'node', args: [FIXTURE] } },
     }, null, 2));
-    // Project-scope .mcp.json servers need trust; approve it (the B2 mechanism).
-    await approveProjectServer(join(homedir(), '.claude.json'), PROJECT, 'fixture');
+    // Project-scope .mcp.json servers need trust; approve it (the B2 mechanism,
+    // now targeting <project>/.claude/settings.local.json — the store the CLI reads).
+    await approveProjectServer(PROJECT, 'fixture');
 
     // Enable code search — writes fury-codesearch.json and strips only *codemogger*
     // entries, so the fixture entry survives.

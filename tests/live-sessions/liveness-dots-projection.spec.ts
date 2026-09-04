@@ -5,7 +5,7 @@
  * With the `fury.livenessDots` opt-in on, the focused session's bouncing dots render
  * off the single liveness projection (`live.phase !== 'idle'`) instead of the legacy
  * `transcriptLoading || backgroundWorking` OR-of-proxies. This drives ONE trivial turn
- * (a one-word reply, ~seconds — far cheaper than the Gypsy planning drive) and asserts
+ * (a one-word reply, ~seconds — far cheaper than the scout-planning drive) and asserts
  * the dots track `/api/health.liveness.phase`: lit while `main-turn`, gone once `idle`,
  * with no mid-turn dark tick and no lingering-lit-after-idle tick.
  *

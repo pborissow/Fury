@@ -68,6 +68,9 @@ test.describe('Per-project code-search DB — cross-project isolation (in-proces
     test.setTimeout(4 * 60 * 1000);
 
     reapPidFiles((e) => /fury-e2e-mcp-proj[AB]/.test(String(e.cwd || '')));
+    // Disable BEFORE the reset — a crashed prior run's live engine handle would
+    // put the deleted DB into Windows delete-pending (see mcp-codesearch.spec.ts).
+    await disable(A); await disable(B);
     await resetProjectDir(A); await resetProjectDir(B);
     // Distinct symbols; files written BEFORE enabling so the route's initial index
     // picks them up.

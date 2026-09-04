@@ -18,6 +18,17 @@ import { furyLogsDir } from '../../lib/furyHome';
 export const BASE_URL = 'http://localhost:3879';
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Model every live drive runs on. These specs exercise Fury's plumbing (MCP
+ * loading, liveness, transcripts) — not model quality — so they pin the
+ * cheapest current model ($1/$5 per MTok) instead of whatever the CLI default
+ * is (which drifts expensive). Notably NOT Sonnet 5: its per-token price is low
+ * but it burns far more tokens per task. Override with FURY_TEST_MODEL (e.g.
+ * claude-sonnet-4-6 if a drive ever needs more instruction-following, or '' to
+ * fall through to the CLI default).
+ */
+export const TEST_MODEL = process.env.FURY_TEST_MODEL ?? 'claude-haiku-4-5';
+
 /** The on-disk JSONL path for a session under a project cwd, or null if not created yet. */
 export function jsonlPath(sessionId: string, project: string): string | null {
   const loc = findSessionJsonlDir(sessionId, project);
@@ -64,8 +75,33 @@ export async function resetProjectDir(project: string): Promise<void> {
   mkdirSync(project, { recursive: true });
 }
 
-/** POST a turn to the SDK backend. Returns the raw fetch Response. */
-export function driveTurn(sessionId: string, project: string, prompt: string): Promise<Response> {
+/**
+ * POST a turn to the SDK backend. Returns the raw fetch Response.
+ *
+ * Pins TEST_MODEL on the session first (POST /api/claude-sdk/model records a
+ * pending model for a not-yet-opened session; startQuery replays it — the same
+ * mechanism the new-session wizard uses). Fails LOUDLY if the pin is rejected:
+ * silently falling through to an expensive default is worse than a failed test.
+ * Pass `model: null` to skip pinning (CLI default), or a string to override.
+ */
+export async function driveTurn(
+  sessionId: string,
+  project: string,
+  prompt: string,
+  opts: { model?: string | null } = {},
+): Promise<Response> {
+  const model = opts.model === undefined ? (TEST_MODEL || null) : opts.model;
+  if (model) {
+    const res = await fetch(`${BASE_URL}/api/claude-sdk/model`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId, model }),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`driveTurn: could not pin test model "${model}" on ${sessionId}: ${res.status} ${body}`);
+    }
+  }
   return fetch(`${BASE_URL}/api/claude-sdk`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

@@ -5,7 +5,7 @@ import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { homedir } from 'os';
 import { mcpCache, projectKeyCandidates, type McpServer } from '@/lib/mcpCache';
-import { approveProjectServer } from '@/lib/mcpApprove';
+import { approveProjectServer, isProjectServerApproved, localSettingsPath, overlayLocalApprovals } from '@/lib/mcpApprove';
 import { normalizeArgs, ensureDbParentDir } from '@/lib/mcpArgs';
 import { migrateStdioCodemogger, readCodeSearchConfig } from '@/lib/codeSearchConfig';
 import { CODESEARCH_MCP_SERVER_NAME, CODESEARCH_DISPLAY_NAME } from '@/lib/mcpRuntimeStatus';
@@ -31,10 +31,10 @@ function stableEnvKey(env: Record<string, string> | undefined): string {
 }
 
 // B2 lives in lib/mcpApprove.ts (atomic re-read + rename + verify-retry) so it
-// can be unit-tested against a temp config file under a competing writer.
-function autoApproveProjectServer(projectPath: string, serverName: string): Promise<boolean> {
-  return approveProjectServer(join(homedir(), '.claude.json'), projectPath, serverName);
-}
+// can be unit-tested against a temp settings file under a competing writer. It
+// now targets the CLI's canonical store, <project>/.claude/settings.local.json
+// (docs/ticket-mcp-auto-approve-stale-trust-store.md — the legacy ~/.claude.json
+// location is migrated away by the CLI and no longer read).
 
 export const dynamic = 'force-dynamic';
 
@@ -85,7 +85,13 @@ export async function GET(request: NextRequest) {
       mcpCache.invalidate(projectPath, 'project').catch(() => { /* background */ });
     }
     const { servers, error } = await mcpCache.get(projectPath);
-    return NextResponse.json({ servers: withCodeSearchEntry(projectPath, servers), ...(error ? { error } : {}) });
+    // A project-scoped server the CLI list calls "pending approval" but that IS
+    // approved in <project>/.claude/settings.local.json loads fine in real
+    // sessions — the CLI's non-bypass list just can't see the approval for
+    // untrusted/non-git workspaces. Overlay our own approval knowledge so the
+    // panel reflects session reality (see overlayLocalApprovals for the why).
+    const adjusted = await overlayLocalApprovals(projectPath, servers);
+    return NextResponse.json({ servers: withCodeSearchEntry(projectPath, adjusted), ...(error ? { error } : {}) });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     console.error('[MCP API] Error listing MCP servers:', message);
@@ -222,10 +228,18 @@ export async function POST(request: NextRequest) {
       // The server IS registered (.mcp.json written) even if the trust write
       // loses a race; surface a soft warning rather than failing the whole add,
       // so the user knows the server may not load until manually approved.
-      const approved = await autoApproveProjectServer(projectPath, name);
-      if (!approved) {
-        warning = `Registered "${name}", but could not persist its trust approval in ~/.claude.json ` +
-          `(a concurrent writer kept clobbering it). It may not load until you enable it manually.`;
+      await approveProjectServer(projectPath, name);
+      // W3 self-check (docs/ticket-mcp-auto-approve-stale-trust-store.md): an
+      // UNAPPROVED project server is invisible to the B4 failure surfacing (it's
+      // absent from system:init mcp_servers, not `failed`), so verify against
+      // the EFFECTIVE store — a fresh re-read of settings.local.json — rather
+      // than trusting the writer's return value. This is also the early-warning
+      // signal for the next time the CLI moves its trust store.
+      if (!(await isProjectServerApproved(projectPath, name))) {
+        warning = `Registered "${name}", but could not persist its approval in ` +
+          `${localSettingsPath(projectPath)} (a concurrent writer kept clobbering it, or the file ` +
+          `is unwritable/invalid JSON). The server may not load until you enable it manually ` +
+          `(add it to enabledMcpjsonServers there, or accept the prompt in an interactive claude run).`;
       }
     }
     // NOTE: "This project" code search is no longer registered here — it's enabled

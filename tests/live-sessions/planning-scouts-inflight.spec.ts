@@ -26,10 +26,13 @@
  * FAIL on current code when the bug fires, pinning the exact tick + correlating the
  * fury-log flip. It doubles as the regression guard once the fix lands.
  *
- * The target is a REAL Java codebase (Gypsy) so the scouts have genuine, multi-
- * minute work to do across three subsystems — the fixture project only holds a
- * coercive CLAUDE.md + the scout/plan-reader agents and points them at Gypsy by
- * absolute path, so the real project stays pristine.
+ * The read target is the FURY REPO ITSELF (the codebase these tests live in), so
+ * the spec is PORTABLE — no machine-specific project needed — while the scouts
+ * still get genuine, multi-minute work across three real subsystems (lib/, app/,
+ * components/). The fixture project only holds a coercive CLAUDE.md + the
+ * scout/plan-reader agents and points them at Fury by absolute path, read-only,
+ * so the repo stays pristine (the plan is written into the fixture project).
+ * (Previously targeted a personal Java codebase by absolute path — not portable.)
  *
  * COST/TIME: runs a real multi-subagent planning turn. Budget up to ~10 min and a
  * few dollars of tokens. Lives in tests/live-sessions (costly), not the unit suite.
@@ -43,16 +46,17 @@ import {
 } from './drive-helpers';
 
 // Repo-parent scratch dir (same convention as the other drives). The fixture is
-// rebuilt from scratch each run; Gypsy (the read target) is never written.
+// rebuilt from scratch each run; Fury (the read target) is never written — the
+// plan lands in the fixture project's own docs/.
 const PROJECT = join(__dirname, '..', '..', '..', 'fury-e2e-planning');
-const GYPSY = 'C:\\Users\\petya\\Documents\\Java\\Web Projects\\Gypsy';
+const TARGET = join(__dirname, '..', '..'); // the Fury repo itself — always present
 
 // A planner CLAUDE.md that FORCES parallel foreground scouts and forbids reading
 // source into the main thread — the exact shape that fans out sidechains while the
 // main turn stays processing. Mirrors docs/workflow-enhancements.zip's agreement.
-const CLAUDE_MD = `# Planner — Gypsy → Node/React migration
+const CLAUDE_MD = `# Planner — Fury → Java-or-Python rewrite
 
-You are a PLANNER. Your job is to produce a migration plan, NOT to read source
+You are a PLANNER. Your job is to produce a rewrite plan, NOT to read source
 code into this (main) thread. Reading big things here is the main cost lever, so
 you DELEGATE all code reading to the \`scout\` subagent.
 
@@ -62,18 +66,21 @@ you DELEGATE all code reading to the \`scout\` subagent.
 2. Launch scouts in PARALLEL: put MULTIPLE Task(scout) tool calls in a SINGLE
    message — one scout per subsystem — and wait for them all. Do this at least
    TWICE (an initial survey, then a deeper pass on the areas the survey flags).
-3. The target codebase is the Gypsy Java web app at:
-   ${GYPSY}
-   Its three subsystems are \`JTS/\`, \`WebApp/\`, and \`kartographia-map/\`.
-4. After the scouts report, WRITE the plan to \`docs/PLAN-gypsy-node-react.md\`
-   (create the docs/ dir). The plan must cover, per subsystem: what it does, the
-   Node/React equivalents, migration order, and risks — with \`file:line\` anchors
-   the scouts returned. Keep the main thread lean.
+3. The target codebase is Fury, a Next.js/React UI for Claude Code, at:
+   ${TARGET}
+   Its three subsystems are \`lib/\` (session/SDK backend, transcript parsing),
+   \`app/\` (Next.js API routes + pages), and \`components/\` (the React UI).
+   The target is READ-ONLY — never write into it.
+4. After the scouts report, WRITE the plan to \`docs/PLAN-fury-rewrite.md\` in THIS
+   project (create the docs/ dir). The plan must recommend Java or Python (pick
+   per subsystem, justify briefly) and cover, per subsystem: what it does, the
+   equivalent stack/libraries, rewrite order, and risks — with \`file:line\`
+   anchors the scouts returned. Keep the main thread lean.
 
 ## Scouts (one Task per subsystem, run concurrently)
-- scout JTS/            → server/topology/geometry code: entry points, key classes.
-- scout WebApp/         → the web layer: endpoints, servlets/JSP, JS front-end.
-- scout kartographia-map/→ the mapping library: public API surface, dependencies.
+- scout lib/        → session management, SDK spawn path, transcript parsing: entry points, key modules.
+- scout app/        → the API routes + pages: endpoints, request/response shapes.
+- scout components/ → the React UI: main views, state flow, key components.
 `;
 
 // Read-and-summarize scout (Sonnet), from the zip — minus codemogger so the
@@ -85,7 +92,7 @@ description: >-
   multi-file exploration or understanding a subsystem — so raw file content never
   enters the main thread's context. Returns findings, not file dumps.
 tools: Read, Grep, Glob, Bash
-model: sonnet
+model: claude-haiku-4-5
 ---
 
 You are a scout. Explore the codebase and return the smallest answer that lets the
@@ -104,7 +111,7 @@ const PLAN_READER_MD = `---
 name: plan-reader
 description: Turns a docs/PLAN-*.md into an ordered execution checklist with file:line targets.
 tools: Read, Grep, Glob
-model: sonnet
+model: claude-haiku-4-5
 ---
 You turn a plan document into an ordered execution checklist for another agent.
 Resolve each step to concrete \`path:line\` targets; flag ambiguities; list verify
@@ -112,10 +119,10 @@ commands. Read-only.
 `;
 
 const KICKOFF =
-  'Read CLAUDE.md and produce the Gypsy → Node/React migration plan EXACTLY as it ' +
+  'Read CLAUDE.md and produce the Fury → Java-or-Python rewrite plan EXACTLY as it ' +
   'specifies. Start by launching parallel scout subagents (one per subsystem, all ' +
   'in one message), wait for their summaries, do a second deeper parallel scout ' +
-  'pass on whatever they flag as complex, then write docs/PLAN-gypsy-node-react.md. ' +
+  'pass on whatever they flag as complex, then write docs/PLAN-fury-rewrite.md. ' +
   'Do not read source files into this thread yourself.';
 
 function writeFixture(): void {
@@ -140,7 +147,8 @@ test('scout-planning turn: dots stay lit and no partial leaks as a bubble', asyn
   test.setTimeout(14 * 60 * 1000);
 
   // Sanity: the read target must exist, or the scouts have nothing to chew on.
-  expect(existsSync(GYPSY), `Gypsy codebase present at ${GYPSY}`).toBe(true);
+  // (The target is the Fury repo itself, so this can only fail if the layout moves.)
+  expect(existsSync(join(TARGET, 'lib')), `Fury lib/ present under ${TARGET}`).toBe(true);
 
   const sessionId = randomUUID();
   createdSessionId = sessionId;
@@ -256,7 +264,7 @@ test('scout-planning turn: dots stay lit and no partial leaks as a bubble', asyn
   const healthFlips = logs
     .filter((e) => e.scope === 'sdk.health' && (e.msg === 'processing' || e.msg === 'idle'))
     .map((e) => e.msg);
-  const planWritten = existsSync(join(PROJECT, 'docs', 'PLAN-gypsy-node-react.md'));
+  const planWritten = existsSync(join(PROJECT, 'docs', 'PLAN-fury-rewrite.md'));
 
   console.log('\n[E2E] ===== SUMMARY =====');
   console.log(`   samples / mid-turn window:  ${samples.length} total, [0,${endIdx}) mid-turn`);

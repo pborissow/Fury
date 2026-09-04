@@ -121,6 +121,12 @@ test.describe('MCP code-search (codemogger) — in-process, live', () => {
     okId = sessionId;
 
     reapPidFiles((e) => String(e.cwd || '').replace(/\\/g, '/').includes('/fury-e2e-mcp-ok'));
+    // Disable BEFORE deleting the dir: a crashed prior run leaves the server's
+    // in-process engine holding the DB open, and deleting the files under a
+    // live handle puts them in Windows delete-pending — every later open then
+    // fails "permission denied" until the server restarts. Disabling first
+    // closes the engine so the reset gets a genuinely fresh directory.
+    await disableCodeSearch(PROJECT_OK);
     await resetProjectDir(PROJECT_OK);
 
     // A distinctive symbol, unlikely to exist in the model's priors — so a correct,
