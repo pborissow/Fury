@@ -109,6 +109,13 @@ const RATE_LIMIT_PATTERNS = [
   /you'?re out of extra usage/i,
   /you'?ve hit your limit/i,
   /hit your limit/i,
+  // The per-model usage-limit wording the CLI emits as a synthetic 429, e.g.
+  // "You've reached your Fable limit. Switch to another model …". Neither the
+  // "hit your limit" nor "usage limit" patterns match "reached your … limit".
+  // Anchored on a model family or a usage/plan keyword so it does NOT fire on
+  // unrelated prose like "reached your storage limit" / "configured turn limit" —
+  // this feeds automatic Bedrock failover, so a false positive switches providers.
+  /reached your (?:fable|mythos|opus|sonnet|haiku|usage|plan|weekly|daily|monthly|5[\s-]?hour)\b.{0,20}?\blimit\b/i,
   /usage limit reached/i,
   /rate limit exceeded/i,
   /exceeded your current usage/i,
@@ -285,6 +292,19 @@ function isBedrock(settings: Record<string, any>): boolean {
   const env = settings.env || {};
   const val = String(env.CLAUDE_CODE_USE_BEDROCK || '').trim();
   return ['1', 'true', 'yes'].includes(val.toLowerCase());
+}
+
+/**
+ * Whether an automatic Bedrock failover is BOTH enabled and fully configured —
+ * the exact precondition `handleUsageLimitDetected` gates on. The limit-recovery
+ * dialog uses this to decide whether to offer a live "Use Bedrock fallback"
+ * button or a "configure it" hint, so the two stay in lock-step.
+ */
+export async function isFailoverConfigured(): Promise<boolean> {
+  const userSettings = await settingsPersistence.loadSettings();
+  if (!userSettings.bedrockClaudeFailoverEnabled) return false;
+  const cfg = await loadBedrockConfigFromSettings(userSettings);
+  return !!cfg;
 }
 
 export async function getProviderStatus(): Promise<ProviderStatus> {

@@ -12,6 +12,7 @@ import { eventBus } from './eventBus';
 import { parseTranscriptJsonl, type TranscriptMessage, type UsageEvent } from './transcriptParser';
 import { parseSubagentUsageEvents, subagentsDirFor } from './subagentUsage';
 import { projectPathToSlug } from './utils';
+import { sessionJsonlPath } from './sessionPaths';
 import { deleteSessionImages } from './imageStore';
 import { scrubImages } from './imageScrubber';
 import { settingsPersistence } from './settingsPersistence';
@@ -641,7 +642,22 @@ export async function restoreJsonlFromArchive(
   const archived = await loadTranscript(sessionId);
   if (!archived || archived.rawLines.length === 0) return null;
 
-  const slug = projectPathToSlug(projectPath);
+  // Write to the CANONICAL dir the CLI will use, not the caller's projectPath
+  // slug. On a Windows subst-mapped drive the two differ (`C:\Users\…` vs the
+  // `U:\…` the CLI recorded), and the CLI — which Fury spawns with the cwd stored
+  // INSIDE this transcript — reads/writes the canonical slug. Writing the restore
+  // under the naive slug would strand it in a dir the CLI ignores while
+  // findSessionJsonlDir's tier-1 (naive slug, checked first) still surfaces it
+  // ahead of the CLI's real copy — the divergence #2 was about, on the write side.
+  // The cwd is on the transcript's own entries, so read it back from the content.
+  let canonicalCwd = projectPath;
+  for (const line of archived.rawLines.slice(0, 50)) {
+    try {
+      const entry = JSON.parse(line);
+      if (typeof entry?.cwd === 'string' && entry.cwd) { canonicalCwd = entry.cwd; break; }
+    } catch { /* skip non-JSON / partial line */ }
+  }
+  const slug = projectPathToSlug(canonicalCwd);
   const dir = join(homedir(), '.claude', 'projects', slug);
   const jsonlPath = join(dir, `${sessionId}.jsonl`);
 
@@ -897,8 +913,13 @@ export async function archiveSessionFromDisk(
   display?: string
 ): Promise<void> {
   const sanitizedId = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
-  const slug = projectPathToSlug(project);
-  const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sanitizedId}.jsonl`);
+  // MUST resolve the same subst-drive / symlink safe way the delete route's unlink
+  // does. If archive-read and unlink resolve to DIFFERENT files (naive slug here,
+  // robust there), a mapped-drive session archives nothing yet still reports an
+  // existing (stale) DB row, and the delete then unlinks the real JSONL — losing
+  // every turn since the last view. Shared locator keeps the two in lock-step.
+  const jsonlPath = sessionJsonlPath(sanitizedId, project);
+  if (!jsonlPath) return; // File doesn't exist (yet) — nothing to archive
 
   let content: string;
   try {

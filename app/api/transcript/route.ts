@@ -2,10 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
-import { realpath } from 'fs/promises';
-import { projectPathToSlug } from '@/lib/utils';
 import { parseTranscriptJsonl, type TranscriptMessage } from '@/lib/transcriptParser';
 import { archiveTranscript, loadTranscript } from '@/lib/transcriptArchiver';
+import { sessionJsonlPath } from '@/lib/sessionPaths';
 import { sessionManager } from '@/lib/sessionManager';
 import { sdkSessionManager } from '@/lib/sdkSessionManager';
 
@@ -152,78 +151,47 @@ export async function GET(request: NextRequest) {
     // Sanitize sessionId to prevent path traversal
     const sanitizedSessionId = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
 
-    const projectsBase = join(homedir(), '.claude', 'projects');
-    const slug = projectPathToSlug(project);
-    const jsonlPath = join(projectsBase, slug, `${sanitizedSessionId}.jsonl`);
-
+    // Locate the transcript JSONL subst-drive / symlink safe. This replaces a
+    // hand-rolled naive→realpath→scan chain that duplicated (and had drifted from)
+    // lib/sessionPaths' findSessionJsonlDir.
+    const resolvedJsonlPath = sessionJsonlPath(sanitizedSessionId, project);
     let content = '';
-    let resolvedJsonlPath = jsonlPath;
-    try {
-      content = await fs.readFile(jsonlPath, 'utf-8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        // The project path may be a symlink or mapped drive that resolves to a
-        // different real path. Try the resolved path before giving up.
-        try {
-          const resolvedProject = await realpath(project);
-          if (resolvedProject !== project) {
-            const altSlug = projectPathToSlug(resolvedProject);
-            if (altSlug !== slug) {
-              const altPath = join(projectsBase, altSlug, `${sanitizedSessionId}.jsonl`);
-              content = await fs.readFile(altPath, 'utf-8');
-              resolvedJsonlPath = altPath;
-            } else {
-              throw error; // same slug, won't help
-            }
-          } else {
-            // realpath didn't change it — try scanning project dirs for the file
-            const dirs = await fs.readdir(projectsBase);
-            let found = false;
-            for (const dir of dirs) {
-              try {
-                const candidate = join(projectsBase, dir, `${sanitizedSessionId}.jsonl`);
-                content = await fs.readFile(candidate, 'utf-8');
-                resolvedJsonlPath = candidate;
-                found = true;
-                break;
-              } catch { /* try next */ }
-            }
-            if (!found) throw error;
-          }
-        } catch {
-          // All JSONL attempts failed — try SQLite archive, then history.jsonl
-          try {
-            const archived = await loadTranscript(sanitizedSessionId);
-            if (archived && archived.messages.length > 0) {
-              return NextResponse.json({
-                messages: archived.messages,
-                fromArchive: true,
-              });
-            }
-          } catch (archiveErr) {
-            console.error('[Transcript API] Archive fallback error:', archiveErr);
-          }
-
-          const historyMessages = await getHistoryPrompts(sanitizedSessionId);
-          // A missing JSONL does NOT always mean "the CLI never persisted this
-          // session": a brand-new session's JSONL only appears a few seconds
-          // after the first turn spawns the CLI. If the session is LIVE right
-          // now (either backend), this is that startup window — report it as
-          // `pending` (benign; the stream buffer paints the in-flight turn)
-          // instead of `partial`, which makes ChatTab show the scary
-          // "transcripts were not persisted" banner on an actively-streaming
-          // session (observed live 2026-09-04 during the scout-planning drive).
-          const liveNow = sessionManager.getSessionHealth(sanitizedSessionId).isProcessing
-            || sdkSessionManager.isSessionProcessing(sanitizedSessionId)
-            || sdkSessionManager.isBackgroundActive(sanitizedSessionId);
+    if (resolvedJsonlPath) {
+      try {
+        content = await fs.readFile(resolvedJsonlPath, 'utf-8');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+    if (!content) {
+      // JSONL missing — try SQLite archive, then history.jsonl.
+      try {
+        const archived = await loadTranscript(sanitizedSessionId);
+        if (archived && archived.messages.length > 0) {
           return NextResponse.json({
-            messages: historyMessages,
-            ...(liveNow ? { pending: true } : { partial: true }),
+            messages: archived.messages,
+            fromArchive: true,
           });
         }
-      } else {
-        throw error;
+      } catch (archiveErr) {
+        console.error('[Transcript API] Archive fallback error:', archiveErr);
       }
+
+      const historyMessages = await getHistoryPrompts(sanitizedSessionId);
+      // A missing JSONL does NOT always mean "the CLI never persisted this
+      // session": a brand-new session's JSONL only appears a few seconds after
+      // the first turn spawns the CLI. If the session is LIVE right now (either
+      // backend), this is that startup window — report it as `pending` (benign;
+      // the stream buffer paints the in-flight turn) instead of `partial`, which
+      // makes ChatTab show the scary "transcripts were not persisted" banner on
+      // an actively-streaming session.
+      const liveNow = sessionManager.getSessionHealth(sanitizedSessionId).isProcessing
+        || sdkSessionManager.isSessionProcessing(sanitizedSessionId)
+        || sdkSessionManager.isBackgroundActive(sanitizedSessionId);
+      return NextResponse.json({
+        messages: historyMessages,
+        ...(liveNow ? { pending: true } : { partial: true }),
+      });
     }
 
     // Parse the JSONL using shared parser
@@ -287,7 +255,7 @@ export async function GET(request: NextRequest) {
       // Time gate: only suggest if the JSONL hasn't been modified recently.
       // Claude API delays and conversation compaction can cause gaps of 1+ min.
       try {
-        const fileStat = await fs.stat(resolvedJsonlPath);
+        const fileStat = await fs.stat(resolvedJsonlPath!);
         const age = Date.now() - fileStat.mtimeMs;
 
         if (age >= STALE_THRESHOLD_MS) {
@@ -340,7 +308,17 @@ export async function GET(request: NextRequest) {
     archiveTranscript(sanitizedSessionId, project, display.substring(0, 200), content, messages, rawLines, undefined, { numCompactions, totalOutputTokens, usageEvents, contextTokens })
       .catch(err => console.error('[Transcript API] Archive error:', err));
 
-    return NextResponse.json({ messages, suggestedPrompt, unprocessedPrompt, numCompactions, pendingAskUserQuestion, currentModel });
+    // For a LIVE (managed) session, report the model its next turn will use, not
+    // the transcript-derived one: after a mid-session switch the transcript's most
+    // recent assistant message still names the OLD model until a turn runs on the
+    // new one, which would revert the composer's label on every reload. For a cold
+    // or non-SDK session getManagedModel returns null and we keep the transcript
+    // model — so a stale persisted override can't permanently mask what actually
+    // served the session's turns.
+    const liveModel = sdkSessionManager.getManagedModel(sanitizedSessionId);
+    const effectiveModel = liveModel || currentModel;
+
+    return NextResponse.json({ messages, suggestedPrompt, unprocessedPrompt, numCompactions, pendingAskUserQuestion, currentModel: effectiveModel });
   } catch (error) {
     console.error('[Transcript API] Error:', error);
     return NextResponse.json(

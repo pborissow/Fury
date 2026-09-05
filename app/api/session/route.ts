@@ -4,9 +4,11 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { sessionManager } from '@/lib/sessionManager';
 import { sdkSessionManager } from '@/lib/sdkSessionManager';
-import { projectPathToSlug } from '@/lib/utils';
 import { archiveForDelete, invalidateArchive, updateSessionMetadata } from '@/lib/transcriptArchiver';
 import { isInternalContent } from '@/lib/transcriptParser';
+import { sessionJsonlPath } from '@/lib/sessionPaths';
+// Path resolution goes through sessionJsonlPath (subst-drive / symlink safe),
+// never a bare projectPathToSlug — see lib/sessionPaths.
 
 export const runtime = 'nodejs';
 
@@ -81,15 +83,22 @@ export async function DELETE(request: NextRequest) {
   // 3. Delete the session JSONL file — ONLY once a durable DB copy exists, so we never
   //    destroy the sole copy of an un-archived transcript.
   if (project && archived) {
-    const slug = projectPathToSlug(project);
-    const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sanitizedSessionId}.jsonl`);
-    try {
-      await unlink(jsonlPath);
-      results.push('Deleted session JSONL');
-    } catch (err: any) {
-      if (err.code !== 'ENOENT') {
-        console.error('[DeleteSession] Failed to delete JSONL:', err);
+    // Resolve robustly (subst-drive / symlink safe) — a naive slug would miss the
+    // real file on a mapped drive and leave the transcript on disk after "delete".
+    const jsonlPath = sessionJsonlPath(sanitizedSessionId, project);
+    if (jsonlPath) {
+      try {
+        await unlink(jsonlPath);
+        results.push('Deleted session JSONL');
+      } catch (err: any) {
+        if (err.code !== 'ENOENT') {
+          console.error('[DeleteSession] Failed to delete JSONL:', err);
+        }
       }
+    } else {
+      // Symmetric with the "Kept session JSONL" branch: record that there was
+      // nothing on disk to remove (already gone, or never persisted).
+      results.push('No session JSONL on disk');
     }
   } else if (project && !archived) {
     // Nothing durable was archived (empty/unparseable transcript, or a transient
@@ -148,8 +157,19 @@ export async function PATCH(request: NextRequest) {
     }
 
     const sanitizedSessionId = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
-    const slug = projectPathToSlug(project);
-    const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sanitizedSessionId}.jsonl`);
+    // Resolve subst-drive / symlink safe. The naive `projectPathToSlug(project)`
+    // alone breaks when the client's project path and the dir that was actually
+    // created differ — most sharply on a Windows `subst`-mapped drive, where the
+    // JSONL lives under `U--…` but the client sends the `C:\Users\…` form. That
+    // mismatch made this PATCH read a non-existent path and 500, so the rewind
+    // silently failed while the UI had already truncated optimistically.
+    const jsonlPath = sessionJsonlPath(sanitizedSessionId, project);
+    if (!jsonlPath) {
+      return NextResponse.json(
+        { error: 'Transcript file not found for this session' },
+        { status: 404 }
+      );
+    }
 
     const content = await readFile(jsonlPath, 'utf-8');
     const lines = content.split('\n').filter(line => line.trim());

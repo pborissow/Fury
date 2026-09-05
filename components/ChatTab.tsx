@@ -17,6 +17,8 @@ import IntermediaryMessagesDialog from '@/components/IntermediaryMessagesDialog'
 import SessionContextMenu from '@/components/SessionContextMenu';
 import LabelEditDialog from '@/components/LabelEditDialog';
 import ModelPickerDialog from '@/components/ModelPickerDialog';
+import LimitReachedDialog, { type LimitReachedInfo } from '@/components/LimitReachedDialog';
+import { setSessionModel } from '@/lib/setSessionModel';
 import NewSessionModelStep from '@/components/NewSessionModelStep';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
 import { getRecentDirectories } from '@/lib/recent-directories';
@@ -150,6 +152,10 @@ export default function ChatTab({
   const [providerSource, setProviderSource] = useState<'Anthropic' | 'Bedrock' | null>(null);
   const [providerConfiguredModel, setProviderConfiguredModel] = useState<string | null>(null);
   const [currentModel, setCurrentModel] = useState<string | null>(null);
+  // The most recent prompt+attachments sent, per session — so a terminal usage
+  // limit can auto-resend it verbatim on the newly chosen model without the user
+  // retyping. Keyed by sessionId; cleared implicitly by being overwritten.
+  const lastSendRef = useRef<{ sessionId: string; prompt: string; images: AttachedImage[] } | null>(null);
   const transcriptLoadingRef = useRef(false);
   const backgroundWorkingRef = useRef(false);
   const transcriptStreamingRef = useRef('');
@@ -252,6 +258,44 @@ export default function ChatTab({
     }
   };
 
+  // Provider status → status-bar + Bedrock-button state. One definition, reused by
+  // the SSE effect and the limit dialog (which used to do a partial refetch that
+  // left providerSource/configuredModel stale).
+  const applyProviderStatus = useCallback(
+    (data: { current?: string; bedrockEnv?: Record<string, string>; failoverConfigured?: boolean }) => {
+      setProviderSource(data.current === 'bedrock' ? 'Bedrock' : 'Anthropic');
+      setProviderConfiguredModel(data.bedrockEnv?.ANTHROPIC_MODEL || null);
+      setFailoverConfigured(!!data.failoverConfigured);
+    },
+    [],
+  );
+  const refreshProviderStatus = useCallback(() => {
+    fetch('/api/provider').then(res => res.json()).then(applyProviderStatus).catch(() => {});
+  }, [applyProviderStatus]);
+
+  // Sessions whose limit dialog the user dismissed with "Not now" — so a stream-
+  // buffer restore (on open / SSE reconnect) doesn't keep re-popping a limit they
+  // chose to leave. Re-armed when a FRESH limit fires for the session.
+  const limitDismissedRef = useRef<Set<string>>(new Set());
+
+  // Raise the recovery dialog for a terminal usage limit. `force` (a fresh SSE
+  // event) re-arms a previously dismissed session; a buffer restore does not.
+  // Never overrides a dialog already open for the same session. Refreshes whether
+  // Bedrock is configured so the fallback button is correct right now.
+  const raiseLimit = useCallback(
+    (sid: string, limitedModel: string | null, message: string, force: boolean) => {
+      if (!message) return;
+      if (force) limitDismissedRef.current.delete(sid);
+      else if (limitDismissedRef.current.has(sid)) return;
+      setLimitError(null);
+      setLimitInfo(prev => (prev?.sessionId === sid ? prev : { sessionId: sid, limitedModel, message }));
+      // Refresh full provider status so the Bedrock button (and status bar) are
+      // correct right now.
+      refreshProviderStatus();
+    },
+    [refreshProviderStatus],
+  );
+
   // Session-scoped SSE ref
   const sessionEsRef = useRef<EventSource | null>(null);
 
@@ -299,6 +343,16 @@ export default function ChatTab({
   // so a refetch would erase it and the chat would go silent (the 87487df4 bug).
   // Cleared on the next send and on session switch.
   const [sessionError, setSessionError] = useState<string | null>(null);
+  // Terminal usage/rate limit on the turn's model (server `session:limit`). Opens
+  // the LimitReachedDialog — a recovery flow: pick another model and auto-resend
+  // the prompt that failed, or fail over to Bedrock when it's configured.
+  const [limitInfo, setLimitInfo] = useState<LimitReachedInfo | null>(null);
+  // Inline recovery error shown in the LimitReachedDialog (e.g. a rejected model
+  // switch) — keeps the dialog open for another choice instead of a silent retry.
+  const [limitError, setLimitError] = useState<string | null>(null);
+  // True when an automatic Bedrock failover is enabled AND configured — gates the
+  // dialog's "Use Bedrock fallback" button. From /api/provider (failoverConfigured).
+  const [failoverConfigured, setFailoverConfigured] = useState(false);
 
   // Durable per-session set of MCP servers that FAILED to connect at init (B4).
   // Server-authoritative: set from the session-stream signal, restored from
@@ -645,6 +699,11 @@ export default function ChatTab({
           applyPendingAskFromBuffer(bufData, bufIssuedAt);
           // Restore the durable failed-MCP banner for this session (B4).
           setMcpFailedServers(Array.isArray(bufData.mcpFailed) ? bufData.mcpFailed : []);
+          // Re-raise a terminal usage limit whose SSE event fired while this tab
+          // wasn't watching (unless the user already dismissed it).
+          if (bufData.pendingLimit?.message) {
+            raiseLimit(sessionId, bufData.pendingLimit.limitedModel ?? null, bufData.pendingLimit.message, false);
+          }
           // Show the background-work dots immediately when opening a session whose
           // main turn is idle but which is still driving a background subagent.
           setBackgroundWorking(!!bufData.backgroundActive);
@@ -751,10 +810,6 @@ export default function ChatTab({
     // Fetch current provider status. Source (Anthropic/Bedrock) and the
     // configured model (if any) are tracked separately so we can override
     // the model portion with the per-session value once we know it.
-    const applyProviderStatus = (data: { current: string; bedrockEnv?: Record<string, string> }) => {
-      setProviderSource(data.current === 'bedrock' ? 'Bedrock' : 'Anthropic');
-      setProviderConfiguredModel(data.bedrockEnv?.ANTHROPIC_MODEL || null);
-    };
     fetch('/api/provider').then(res => res.json()).then(applyProviderStatus).catch(() => {
       setProviderSource(null);
       setProviderConfiguredModel(null);
@@ -790,6 +845,15 @@ export default function ChatTab({
 
     return () => es.close();
   }, [isActive]);
+
+  // Free the resend stash (which may hold full-size image payloads) when leaving
+  // the session it belongs to — the limit auto-resend only applies to the session
+  // in view, so there's no reason to retain another session's attachments.
+  useEffect(() => {
+    if (lastSendRef.current && lastSendRef.current.sessionId !== viewingTranscriptId) {
+      lastSendRef.current = null;
+    }
+  }, [viewingTranscriptId]);
 
   // --- Session-scoped SSE for stream, health, and transcript events ---
   useEffect(() => {
@@ -848,6 +912,9 @@ export default function ChatTab({
           applyPendingAskFromBuffer(bufData, bufIssuedAt);
           // Re-sync the durable failed-MCP banner on connect (B4).
           setMcpFailedServers(Array.isArray(bufData.mcpFailed) ? bufData.mcpFailed : []);
+          if (bufData.pendingLimit?.message) {
+            raiseLimit(mySessionId, bufData.pendingLimit.limitedModel ?? null, bufData.pendingLimit.message, false);
+          }
 
           // Sync background-work dots on connect (SSE may have missed the change).
           setBackgroundWorking(!!bufData.backgroundActive);
@@ -994,6 +1061,21 @@ export default function ChatTab({
       if (!shouldProcess()) return;
       const data = JSON.parse(e.data);
       if (data.model) setCurrentModel(data.model);
+    });
+
+    // Terminal usage/rate limit on this session's model. Drop the in-flight
+    // spinner (the turn is over, it produced nothing) and raise the recovery
+    // dialog. Refresh provider status so the Bedrock button reflects config.
+    es.addEventListener('session-limit', (e: MessageEvent) => {
+      if (!shouldProcess()) return;
+      const data = JSON.parse(e.data);
+      setTranscriptLoading(false);
+      setSubmitEndTime(Date.now());
+      raiseLimit(mySessionId, data.limitedModel ?? null, String(data.message || ''), true);
+      uiLog('warn', 'chat.limit', 'usage limit dialog raised', {
+        sessionId: mySessionId,
+        data: { limitedModel: data.limitedModel ?? null },
+      });
     });
 
     // Live context occupancy for the in-flight turn. An absolute level, so it
@@ -1630,12 +1712,17 @@ export default function ChatTab({
     setAttachedImages(prev => prev.filter(img => img.id !== id));
   };
 
-  const handleTranscriptSend = async (userMessage: string) => {
-    if ((!userMessage && attachedImages.length === 0) || transcriptLoading || !viewingTranscriptId) return;
+  const handleTranscriptSend = async (userMessage: string, imagesOverride?: AttachedImage[]) => {
+    // `imagesOverride` is set only by the limit-recovery auto-resend, which replays
+    // a prior turn's attachments verbatim (they were never in the composer's
+    // staged state on this attempt).
+    const isResend = imagesOverride !== undefined;
+    if ((!userMessage && (imagesOverride ?? attachedImages).length === 0) || transcriptLoading || !viewingTranscriptId) return;
 
-    // Snapshot + clear the staged attachments for this turn.
-    const imagesToSend = attachedImages;
-    setAttachedImages([]);
+    // Snapshot + clear the staged attachments for this turn. A resend supplies its
+    // own images and must not disturb (or be disturbed by) the live composer.
+    const imagesToSend = imagesOverride ?? attachedImages;
+    if (!isResend) setAttachedImages([]);
     setAttachError(null);
     const optimisticImages: TranscriptImagePart[] = imagesToSend.map(i => ({ dataUrl: i.dataUrl }));
     const apiImages = imagesToSend.map(i => ({ base64: i.base64, mediaType: i.mediaType }));
@@ -1645,6 +1732,10 @@ export default function ChatTab({
 
     const mySessionId = viewingTranscriptId;
     const myProject = historyTranscriptProject;
+
+    // Stash this turn's prompt + attachments so a terminal usage limit can resend
+    // it on a different model without retyping. Overwritten each send.
+    lastSendRef.current = { sessionId: mySessionId, prompt: userMessage, images: imagesToSend };
 
     // Clear the draft and remove from pending sessions since it's being submitted
     sessionDraftsRef.current.delete(mySessionId);
@@ -1701,9 +1792,13 @@ export default function ChatTab({
         next.delete(mySessionId);
         return next;
       });
-      // Return the staged attachments too, so a backed-out takeover can retry.
-      if (imagesToSend.length > 0) setAttachedImages(prev => [...imagesToSend, ...prev].slice(0, 8));
-      setTimeout(() => chatEditorRef.current?.setContent(userMessage), 50);
+      // Return the staged attachments + text to the composer so a backed-out
+      // takeover can retry — but NOT for a resend, whose images/prompt were never
+      // in the live composer (they'd clobber the user's in-progress draft).
+      if (!isResend) {
+        if (imagesToSend.length > 0) setAttachedImages(prev => [...imagesToSend, ...prev].slice(0, 8));
+        setTimeout(() => chatEditorRef.current?.setContent(userMessage), 50);
+      }
     };
 
     // The POST, factored so the takeover-confirm path can replay it verbatim with
@@ -1756,7 +1851,9 @@ export default function ChatTab({
         // Return the staged attachments so a retry re-sends them — without
         // this, a failed send silently discarded the pasted images and the
         // retry went out text-only (only the takeover-rollback path restored).
-        if (imagesToSend.length > 0) {
+        // Skip for a resend: those images were never staged in the live composer,
+        // so re-injecting them would disturb the user's current draft.
+        if (!isResend && imagesToSend.length > 0) {
           setAttachedImages(prev => [...imagesToSend, ...prev].slice(0, 8));
         }
       }
@@ -1767,6 +1864,100 @@ export default function ChatTab({
     } catch (error) {
       handleSendError(error);
     }
+  };
+
+  // Resend the prompt that was limited, verbatim, on whatever model is now set.
+  // Guards on the stash belonging to the session still being viewed. Plain
+  // function (NOT useCallback): it must call the CURRENT render's
+  // handleTranscriptSend — a memoized copy would freeze the render-0 closure
+  // whose viewingTranscriptId is null, and the resend would silently early-return.
+  // The limited turn already persisted this prompt (the CLI writes the user
+  // message before the 429). Drop that dangling turn before resending so the model
+  // doesn't see the instruction twice. GUARDED: only truncates when the transcript's
+  // last message is exactly this prompt as a user turn (the limited-turn shape) —
+  // if an assistant reply followed, the turn really ran, so we skip. A duplicate is
+  // acceptable; truncating a real turn is not, so this fails safe toward skipping.
+  const dropLimitedTurnIfMatches = async (sessionId: string, project: string, prompt: string) => {
+    try {
+      const res = await fetch(
+        `/api/transcript?sessionId=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(project)}`,
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      const msgs: { role: string; content: string }[] = data.messages || [];
+      const last = msgs[msgs.length - 1];
+      if (!last || last.role !== 'user' || last.content !== prompt) return;
+      const userTurns = msgs.filter(m => m.role === 'user').length;
+      await fetch('/api/session', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, project, turnIndex: userTurns - 1, removeLastHistoryEntry: false }),
+      });
+    } catch { /* best effort — see the fail-safe note above */ }
+  };
+
+  // Resend the prompt that was limited, verbatim, on whatever model/provider is now
+  // set. Plain function (NOT useCallback) so it calls the CURRENT render's
+  // handleTranscriptSend. Surfaces feedback when the stash is gone (#11) rather than
+  // silently doing nothing after the dialog promised an auto-resend.
+  const resendLastPrompt = async () => {
+    const st = lastSendRef.current;
+    if (!st || st.sessionId !== activeSessionRef.current) {
+      setSessionError('Model switched, but the message couldn’t be resent automatically — please send it again.');
+      return;
+    }
+    if (historyTranscriptProject) {
+      await dropLimitedTurnIfMatches(st.sessionId, historyTranscriptProject, st.prompt);
+    }
+    // Re-run the normal send path with the stashed attachments as an override.
+    void handleTranscriptSend(st.prompt, st.images);
+  };
+
+  // Limit-recovery: switch the session to `model` (null = provider default), then
+  // auto-resend. The dialog stays OPEN until this resolves — so its "Switching…"
+  // state renders and a rejected switch shows inline instead of silently resending
+  // on the still-limited model.
+  const handleLimitSwitch = async (model: string | null) => {
+    const sessionId = limitInfo?.sessionId;
+    if (!sessionId) { setLimitInfo(null); return; }
+    setLimitError(null);
+    const res = await setSessionModel(sessionId, model);
+    if (!res.ok) {
+      setLimitError(`Couldn’t switch model: ${res.error ?? 'unknown error'}. Try another one.`);
+      return; // keep the dialog open for another choice
+    }
+    if (model) setCurrentModel(model);
+    setLimitInfo(null);
+    await resendLastPrompt();
+  };
+
+  // Limit-recovery: fail the provider over to the configured Bedrock fallback, then
+  // auto-resend on Bedrock. Only reachable when failoverConfigured. Recycles the
+  // warm process (so the next turn spawns under Bedrock env) and the pin-clear it
+  // performs means the resend follows the Bedrock default, not the Anthropic id.
+  const handleLimitBedrock = async () => {
+    const sessionId = limitInfo?.sessionId;
+    if (!sessionId) { setLimitInfo(null); return; }
+    setLimitError(null);
+    try {
+      const res = await fetch('/api/provider', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: 'bedrock' }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await fetch('/api/claude-sdk/recycle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      });
+    } catch {
+      setLimitError('Failed to switch to the Bedrock fallback. Check the Bedrock settings.');
+      return; // keep the dialog open
+    }
+    setCurrentModel(null); // pin cleared server-side → follow the Bedrock default
+    setLimitInfo(null);
+    await resendLastPrompt();
   };
 
   const handleRewind = async (mode: 'conversation' | 'both') => {
@@ -2513,6 +2704,23 @@ export default function ChatTab({
       onOpenChange={setModelPickerOpen}
       sessionId={viewingTranscriptId}
       activeModel={currentModel}
+    />
+    <LimitReachedDialog
+      open={!!limitInfo}
+      onOpenChange={(o) => {
+        if (!o) {
+          // "Not now" / backdrop / escape — remember the dismissal so a buffer
+          // restore doesn't re-pop it. (Switch/Bedrock clear limitInfo directly,
+          // bypassing this, and clear the server's pendingLimit on the next turn.)
+          if (limitInfo) limitDismissedRef.current.add(limitInfo.sessionId);
+          setLimitInfo(null);
+        }
+      }}
+      info={limitInfo}
+      bedrockConfigured={failoverConfigured}
+      onSwitchAndRetry={handleLimitSwitch}
+      onUseBedrock={handleLimitBedrock}
+      error={limitError}
     />
     <IntermediaryMessagesDialog messages={intermediaryMessages} onClose={() => setIntermediaryMessages([])} />
     <CodeViewerDialog filePath={codeViewerPath} onClose={() => setCodeViewerPath(null)} />

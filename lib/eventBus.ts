@@ -142,6 +142,26 @@ export interface McpUpdatedEvent {
   projectPath: string | null;
 }
 
+/**
+ * A TERMINAL usage/rate limit on the turn's model — the account has hit its quota
+ * for that model (HTTP 429), NOT a transient overload the SDK retries and recovers
+ * from. The turn produced no visible output, so without this the UI would just go
+ * silent (the "are you still there?" bug). The client opens a recovery dialog that
+ * offers switching to another model (and auto-resending the failed prompt) or, when
+ * configured, the Bedrock fallback. Distinct from `session:stream {error}` so the UI
+ * can react with an actionable dialog rather than a passive error bubble.
+ */
+export interface SessionLimitEvent {
+  type: 'session:limit';
+  sessionId: string;
+  /** The model that was limited (wire id, e.g. 'claude-fable-5'). */
+  limitedModel: string | null;
+  /** The provider's own message, shown verbatim in the dialog. */
+  message: string;
+  /** HTTP status when known (429 for a usage limit). */
+  status?: number;
+}
+
 export type AppEvent =
   | LiveSessionsEvent
   | HistoryUpdatedEvent
@@ -151,7 +171,8 @@ export type AppEvent =
   | SessionUsageEvent
   | TranscriptUpdatedEvent
   | ProviderSwitchedEvent
-  | McpUpdatedEvent;
+  | McpUpdatedEvent
+  | SessionLimitEvent;
 
 class AppEventBus extends EventEmitter {
   emitApp(payload: AppEvent): boolean {

@@ -13,10 +13,7 @@
  */
 
 import { readFile, rename, unlink, writeFile } from 'fs/promises';
-import { existsSync } from 'fs';
-import { homedir } from 'os';
-import { join } from 'path';
-import { projectPathToSlug } from './utils';
+import { sessionJsonlPath } from './sessionPaths';
 import { putImage } from './imageStore';
 import { isRealUserTurnEntry } from './transcriptParser';
 import { IMAGE_PLACEHOLDER_TEXT, imageRefText } from './imageRefs';
@@ -300,10 +297,8 @@ export async function scrubSessionFile(
   projectPath: string,
   opts?: ScrubOptions,
 ): Promise<ScrubResult | null> {
-  const slug = projectPathToSlug(projectPath);
-  const jsonlPath = join(homedir(), '.claude', 'projects', slug, `${sessionId}.jsonl`);
-
-  if (!existsSync(jsonlPath)) return null;
+  const jsonlPath = sessionJsonlPath(sessionId, projectPath);
+  if (!jsonlPath) return null;
 
   const content = await readFile(jsonlPath, 'utf-8');
   if (!content.trim()) return null;

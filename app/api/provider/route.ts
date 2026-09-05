@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import {
   getProviderStatus,
+  isFailoverConfigured,
   switchToAnthropic,
   switchToBedrock,
   cancelScheduledSwitchBack,
@@ -14,9 +15,13 @@ export const runtime = 'nodejs';
  */
 export async function GET() {
   try {
-    const status = await getProviderStatus();
-    const switchBack = await getSwitchBackScheduled();
-    return NextResponse.json({ ...status, ...switchBack });
+    // Three independent reads — run them concurrently.
+    const [status, switchBack, failoverConfigured] = await Promise.all([
+      getProviderStatus(),
+      getSwitchBackScheduled(),
+      isFailoverConfigured(),
+    ]);
+    return NextResponse.json({ ...status, ...switchBack, failoverConfigured });
   } catch (error) {
     console.error('[Provider API] GET error:', error);
     return NextResponse.json(

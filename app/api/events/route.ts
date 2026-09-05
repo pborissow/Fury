@@ -135,6 +135,14 @@ export async function GET(request: NextRequest) {
             send('provider-switched', payload);
             break;
 
+          case 'session:limit':
+            // Terminal usage/rate limit — only the tab watching this session
+            // should raise the recovery dialog.
+            if (watchSessionId && payload.sessionId === watchSessionId) {
+              send('session-limit', payload);
+            }
+            break;
+
           case 'mcp:updated':
             send('mcp-updated', payload);
             break;

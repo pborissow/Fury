@@ -17,11 +17,19 @@ import { homedir } from 'os';
 import { join } from 'path';
 import { parseTranscriptJsonl, type UsageEvent } from './transcriptParser';
 import { projectPathToSlug } from './utils';
+import { findSessionJsonlDir } from './sessionPaths';
 
-/** The subagents sidecar dir for a session: `<projects>/<slug>/<sid>/subagents`. */
+/** The subagents sidecar dir for a session: `<projects>/<slug>/<sid>/subagents`.
+ *  Resolves the project slug dir the subst-drive / symlink safe way (via the
+ *  session's own JSONL location) so a mapped-drive session's sidecars aren't
+ *  silently missed → its subagent tokens under-counted. Falls back to the naive
+ *  slug when the JSONL can't be located (e.g. sidecars but no main transcript). */
 export function subagentsDirFor(sessionId: string, project: string): string {
   const sanitized = sessionId.replace(/[^a-zA-Z0-9-]/g, '');
-  return join(homedir(), '.claude', 'projects', projectPathToSlug(project), sanitized, 'subagents');
+  const dir =
+    findSessionJsonlDir(sanitized, project)?.dir ??
+    join(homedir(), '.claude', 'projects', projectPathToSlug(project));
+  return join(dir, sanitized, 'subagents');
 }
 
 /**

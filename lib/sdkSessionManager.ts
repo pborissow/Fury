@@ -20,6 +20,7 @@ import { codemoggerReindexer } from './codemoggerReindex';
 import { codemoggerSdkServer } from './codemoggerServer';
 import { isCodeSearchEnabled, codeSearchDbPath, stripStdioCodemogger } from './codeSearchConfig';
 import { log } from './logger';
+import { detectUsageLimit } from './providerSwitch';
 import { findSessionJsonlDir } from './sessionPaths';
 import { scrubSessionFile } from './imageScrubber';
 import { settingsPersistence } from './settingsPersistence';
@@ -232,6 +233,11 @@ interface SdkSession {
   // /api/stream-buffer) so the "failed to connect" banner survives turn resets
   // and navigation, and clears on recovery.
   mcpFailed?: { name: string; status: string }[];
+  // Durable terminal-usage-limit state (mirrors mcpFailed): set when a turn hits a
+  // terminal 429, exposed via /api/stream-buffer so the recovery dialog survives a
+  // tab that wasn't watching when the SSE event fired (its `session:limit` reached
+  // no listener). Cleared at the next turn start.
+  pendingLimit?: { message: string; limitedModel: string | null; status: number };
   // Server-side buffer of the current turn's stream, mirroring the CLI manager.
   // Load-bearing for the UI: ChatTab keys its "strip the in-flight turn's
   // partial assistant messages" logic on this (otherwise the JSONL's partials
@@ -551,6 +557,9 @@ class SdkSessionManager {
     s.turnStartedAt = Date.now();
     s.ttftEmitted = false;
     s.turnErrorEmitted = false;
+    // A new user-initiated turn (incl. the limit-recovery resend) clears any
+    // pending limit — it's being acted on.
+    s.pendingLimit = undefined;
     // Stamp this turn with a fresh epoch (P2). A prior turn stopped via
     // interrupt() can still deliver a trailing `result`; the epoch lets the
     // result handler tell that stale result apart from this turn's own.
@@ -1003,6 +1012,45 @@ class SdkSessionManager {
     return this.sessions.get(sessionId)?.mcpFailed ?? [];
   }
 
+  /** A terminal usage/rate limit the session is parked on, awaiting recovery
+   *  (durable across a tab that wasn't watching when it fired). */
+  getPendingLimit(sessionId: string): { message: string; limitedModel: string | null; status: number } | null {
+    return this.sessions.get(sessionId)?.pendingLimit ?? null;
+  }
+
+  /**
+   * The model the NEXT turn will use for a LIVE (in-memory) session: the pin if
+   * set, else the last observed wire model. Returns null when the session isn't
+   * managed here — callers then fall back to the transcript-derived model, since a
+   * cold or non-SDK session's persisted override may no longer govern anything (it
+   * can't even be changed — /api/claude-sdk/model 409s when SDK sessions are off).
+   * This is what keeps the composer's model label honest after a mid-session switch
+   * WITHOUT permanently masking a divergent transcript model on a dead session.
+   */
+  getManagedModel(sessionId: string): string | null {
+    const s = this.sessions.get(sessionId);
+    if (!s) return null;
+    return s.model ?? s.lastEmittedModel ?? null;
+  }
+
+  /**
+   * Surface a TERMINAL usage/rate limit: record durable per-session state (so a
+   * non-watching tab recovers it via /api/stream-buffer), emit the `session:limit`
+   * event for any live listener, and mark the turn's error emitted so the result
+   * branch doesn't also fire. The single emit path for both detection sites (the
+   * synthetic-assistant path and the is_error-result backstop).
+   *
+   * `limitedModel` is the last OBSERVED wire model (what actually served turns),
+   * falling back to the session's pin — never null when the session has run, so
+   * the dialog's same-model guard and header have a real id to work with.
+   */
+  private emitSessionLimit(s: SdkSession, message: string, status: number): void {
+    const limitedModel = s.lastEmittedModel ?? s.model ?? null;
+    s.pendingLimit = { message, limitedModel, status };
+    s.turnErrorEmitted = true;
+    eventBus.emitApp({ type: 'session:limit', sessionId: s.sessionId, limitedModel, message, status });
+  }
+
   /**
    * Settle a parked question with a deny, and tell any open dialog to close.
    *
@@ -1096,6 +1144,42 @@ class SdkSessionManager {
     // The process is being torn down, so any background work it hosted is gone —
     // drop the set so it can't keep the session reading "live".
     s.backgroundTasks.clear();
+    this.closeBuffer(s);
+    this.emitHealth(s, false);
+  }
+
+  /**
+   * Recycle a session's warm process for a PROVIDER switch (Anthropic ⇄ Bedrock).
+   *
+   * The env that selects the provider (CLAUDE_CODE_USE_BEDROCK, AWS_*) is read
+   * only when the CLI process spawns, so a warm process keeps talking to the OLD
+   * provider — a Bedrock failover would resend straight back into the exhausted
+   * Anthropic quota. Tearing down the query here makes the NEXT sendMessage spawn
+   * a fresh process (which resumes the conversation from the JSONL) under the new
+   * env. The session record is kept (unlike killSession) so the resume is seamless.
+   *
+   * Also clears the model pin: an Anthropic wire id (`claude-fable-5`) is invalid
+   * on a Bedrock process (`us.anthropic.*` profiles) and would 400 the turn, so the
+   * recycled session follows the provider default until the user re-picks.
+   */
+  async recycleForProviderSwitch(sessionId: string): Promise<void> {
+    const s = this.sessions.get(sessionId);
+    if (!s) return;
+    try { s.abortController?.abort(); } catch { /* best effort */ }
+    this.settlePendingAsk(s, 'Switching provider…');
+    try { s.input?.end(); } catch { /* best effort */ }
+    this.killProcessesForSession(sessionId);
+    s.q = null;
+    s.input = null;
+    s.abortController = undefined;
+    s.isProcessing = false;
+    s.backgroundTasks.clear();
+    // Drop the Anthropic pin, in memory and on disk, so neither this turn nor a
+    // later restart replays it into the new provider.
+    s.model = undefined;
+    s.modelHydrated = true; // don't let ensureModelHydrated re-read the old override
+    s.lastEmittedModel = null;
+    void persistSessionModel(sessionId, undefined);
     this.closeBuffer(s);
     this.emitHealth(s, false);
   }
@@ -2402,19 +2486,36 @@ class SdkSessionManager {
           const code: SDKAssistantMessageError | undefined = anyMsg.error;
           const text = this.textFromContent(anyMsg.message?.content);
           const legacySynthetic = !code && anyMsg.message?.model === '<synthetic>' && !!text;
-          // rate_limit / overloaded are TRANSIENT — the SDK retries them (they also
-          // arrive as api_retry system messages) and the turn can still finish
-          // successfully. Surfacing them here would leave a fatal error bubble the
-          // success result never clears (that branch only logs, and turnErrorEmitted
-          // is sticky). A genuinely terminal rate limit comes back as a NON-success
-          // result and is caught by the result branch below.
-          const transient = code === 'rate_limit' || code === 'overloaded';
-          if (transient) {
+          // rate_limit / overloaded are USUALLY transient — the SDK retries them
+          // (they also arrive as api_retry system messages) and the turn finishes
+          // successfully. But a TERMINAL per-model usage limit ALSO arrives with
+          // code 'rate_limit', distinguished by `is_api_error_message: true` (the
+          // synthetic 429 the CLI injects when the quota is exhausted, e.g.
+          // "You've reached your Fable limit. Switch to another model …"). That one
+          // never recovers — the turn ends `success` with zero output — so it must
+          // be surfaced, not swallowed. See the 2026-09-04 investigation: the old
+          // code classified BOTH as transient and dropped the terminal one on the
+          // floor, leaving the UI silent.
+          const rateLike = code === 'rate_limit' || code === 'overloaded';
+          const isApiError = anyMsg.is_api_error_message === true;
+          if (rateLike && !isApiError) {
+            // Genuinely transient: the SDK is retrying and the turn can still
+            // finish. Log for diagnosis, do NOT surface.
             log.warn('sdk.retry', 'assistant transient error (not surfaced)', {
               sessionId: s.sessionId,
               corrId: s.sessionId,
-              data: { code },
+              data: { code, msgModel: anyMsg.message?.model ?? null, turnModel: s.model ?? null },
             });
+          } else if (rateLike && isApiError) {
+            // TERMINAL usage/rate limit. Surface as a structured limit event so the
+            // client can offer recovery (switch model + auto-resend / Bedrock).
+            const message = text || this.assistantErrorText(code, text);
+            log.error('sdk.turn', 'usage limit — surfaced as session:limit', {
+              sessionId: s.sessionId,
+              corrId: s.sessionId,
+              data: { code, limitedModel: s.lastEmittedModel ?? s.model ?? null, text: message.slice(0, 300) },
+            });
+            this.emitSessionLimit(s, message, 429);
           } else if (code || legacySynthetic) {
             const errText = this.assistantErrorText(code, text);
             log.error('sdk.turn', 'assistant error surfaced', {
@@ -2551,6 +2652,45 @@ class SdkSessionManager {
               costUsd: anyMsg.total_cost_usd ?? null,
             },
           });
+          // The SDK can report `subtype: 'success'` on a result that is actually an
+          // error — it sets `is_error: true` (+ `api_error_status`) on it. Error
+          // surfacing lives entirely in the `else` (non-success) branch, so without
+          // this backstop such a result flips isProcessing false with nothing shown
+          // (the silent-turn bug). Catch it: a terminal 429 becomes a session:limit
+          // (recovery dialog), anything else surfaces its result text.
+          if (anyMsg.is_error === true && !s.turnErrorEmitted) {
+            const resultText = typeof anyMsg.result === 'string' ? anyMsg.result : '';
+            const isLimit =
+              anyMsg.api_error_status === 429 ||
+              (!!resultText && detectUsageLimit(resultText).detected);
+            log.error('sdk.turn', 'success result flagged is_error', {
+              sessionId: s.sessionId,
+              corrId: s.sessionId,
+              data: {
+                turnModel: s.model ?? null,
+                apiErrorStatus: anyMsg.api_error_status ?? null,
+                terminalReason: anyMsg.terminal_reason ?? null,
+                treatedAs: isLimit ? 'session:limit' : 'error',
+                result: resultText.slice(0, 300),
+              },
+            });
+            if (isLimit) {
+              // Terminal usage/rate limit that the assistant-message path did not
+              // already catch (e.g. no synthetic assistant message, only a result).
+              this.emitSessionLimit(
+                s,
+                resultText || 'You have reached your usage limit for this model.',
+                anyMsg.api_error_status ?? 429,
+              );
+            } else {
+              // A silent success that is NOT a recognized limit — surface the
+              // result text (or a generic notice) so the turn never ends in silence.
+              const errText = resultText || 'The turn ended without producing any output.';
+              this.bufferEvent(s, { type: 'error', content: errText, ts: Date.now() });
+              eventBus.emitApp({ type: 'session:stream', sessionId: s.sessionId, error: errText });
+              s.turnErrorEmitted = true;
+            }
+          }
         } else {
           // A non-success result ends the turn on an error the SDK did NOT throw
           // (e.g. subtype 'error_during_execution', 'error_max_turns'). Previously
@@ -3031,7 +3171,7 @@ class SdkSessionManager {
 //     amplifier). startHeartbeat/stopHeartbeat are wired into the HMR swap alongside
 //     reconcile; without this bump the live instance keeps only the transition-only
 //     emits and the mid-turn dark gap (screenshot3) never self-heals.
-const SINGLETON_VERSION = 36;
+const SINGLETON_VERSION = 38; // 38: durable pendingLimit + provider-switch recycle + getManagedModel
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

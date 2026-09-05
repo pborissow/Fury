@@ -128,4 +128,36 @@ describe('detectUsageLimit', () => {
     const r = detectUsageLimit('rate limit exceeded');
     expect(r.rawMessage).toBe('rate limit exceeded');
   });
+
+  it('detects the per-model "reached your <model> limit" 429 wording (2026-09-04 repro)', () => {
+    // Captured verbatim from a live terminal usage limit on Fable 5. Neither the
+    // "hit your limit" nor the "usage limit" patterns match "reached your … limit",
+    // so failover silently missed it until the dedicated pattern was added.
+    const text =
+      "You've reached your Fable limit. Switch to another model, or manage usage " +
+      'credits at claude.ai/settings/usage?from=cc_cli_limit_message, to continue.';
+    expect(detectUsageLimit(text).detected).toBe(true);
+    // The CLI's earlier phrasing carried a model number; both must match.
+    expect(detectUsageLimit("You've reached your Fable 5 limit.").detected).toBe(true);
+    expect(detectUsageLimit('You have reached your Opus limit for today.').detected).toBe(true);
+  });
+
+  it('does not match ordinary prose that merely contains "reached" or "limit"', () => {
+    expect(detectUsageLimit('We reached the summit before the time limit.').detected).toBe(false);
+    expect(detectUsageLimit('I reached out to the team about the rate.').detected).toBe(false);
+  });
+
+  it('does not fire on non-usage "reached your … limit" wordings (feeds auto-failover)', () => {
+    // The "reached your … limit" pattern is anchored on a model family / usage
+    // keyword precisely so these DON'T trip an unwanted Bedrock provider switch.
+    expect(detectUsageLimit('You have reached your storage limit.').detected).toBe(false);
+    expect(detectUsageLimit('You have reached your configured turn limit.').detected).toBe(false);
+    expect(detectUsageLimit('reached your upload size limit').detected).toBe(false);
+  });
+
+  it('detects usage/plan-window "reached your … limit" wordings', () => {
+    expect(detectUsageLimit('You have reached your usage limit.').detected).toBe(true);
+    expect(detectUsageLimit("You've reached your weekly limit.").detected).toBe(true);
+    expect(detectUsageLimit('reached your 5-hour limit').detected).toBe(true);
+  });
 });

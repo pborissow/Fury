@@ -53,6 +53,11 @@ export async function GET(req: NextRequest) {
   // an empty array clears it after a recovery.
   const mcpFailed = sdkSessionManager.getMcpFailed(sessionId);
 
+  // Durable terminal-usage-limit state — returned on BOTH branches so the recovery
+  // dialog reappears on open / switch-back even when the SSE `session:limit` fired
+  // while no tab was watching this session. Cleared server-side at the next turn.
+  const pendingLimit = sdkSessionManager.getPendingLimit(sessionId);
+
   if (!buffer) {
     return Response.json({
       hasBuffer: false,
@@ -60,6 +65,7 @@ export async function GET(req: NextRequest) {
       backgroundActive,
       pendingAsk,
       mcpFailed,
+      pendingLimit,
     });
   }
 
@@ -74,5 +80,6 @@ export async function GET(req: NextRequest) {
     startedAt: buffer.startedAt,
     pendingAsk,
     mcpFailed,
+    pendingLimit,
   });
 }

@@ -53,6 +53,13 @@ export function readCwdFromJsonl(jsonlPath: string): string | null {
  * so callers can pass the path Claude CLI's slug derivation will round-trip
  * to the same dir.
  */
+// A session id is globally unique, so the dir that holds its JSONL is stable for
+// the file's lifetime. Cache it so a subst-mapped session (tiers 1–2 always miss)
+// doesn't re-run the full readdirSync sweep on every rewind/delete/archive — that
+// sync scan runs on the request path and blocks the event loop. Validated with a
+// single existsSync on hit, so a moved/deleted file falls back to a fresh lookup.
+const dirCache = new Map<string, string>();
+
 export function findSessionJsonlDir(sessionId: string, projectPath: string): JsonlLocation | null {
   const base = join(homedir(), '.claude', 'projects');
   const slug = projectPathToSlug(projectPath);
@@ -60,8 +67,16 @@ export function findSessionJsonlDir(sessionId: string, projectPath: string): Jso
   const tryDir = (dir: string, fallbackCwd: string): JsonlLocation | null => {
     const file = join(dir, `${sessionId}.jsonl`);
     if (!existsSync(file)) return null;
+    dirCache.set(sessionId, dir);
     return { dir, canonicalCwd: readCwdFromJsonl(file) || fallbackCwd };
   };
+
+  const cached = dirCache.get(sessionId);
+  if (cached) {
+    const hit = tryDir(cached, projectPath);
+    if (hit) return hit;
+    dirCache.delete(sessionId); // stale — fall through to a fresh resolve
+  }
 
   const primary = tryDir(join(base, slug), projectPath);
   if (primary) return primary;
@@ -85,4 +100,16 @@ export function findSessionJsonlDir(sessionId: string, projectPath: string): Jso
   } catch { /* ignore */ }
 
   return null;
+}
+
+/**
+ * The absolute path to a session's JSONL transcript, resolved subst-drive /
+ * symlink safe via findSessionJsonlDir. Returns null when the file cannot be
+ * located. The one lookup every reader/writer/deleter should share so archive,
+ * unlink, rewind, scrub and usage-scan can never resolve to DIFFERENT files —
+ * the asymmetry that let a delete destroy an un-archived transcript.
+ */
+export function sessionJsonlPath(sessionId: string, projectPath: string): string | null {
+  const loc = findSessionJsonlDir(sessionId, projectPath);
+  return loc ? join(loc.dir, `${sessionId}.jsonl`) : null;
 }
