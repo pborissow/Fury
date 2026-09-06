@@ -225,7 +225,37 @@ export default function ChatTab({
   const [submitStartTime, setSubmitStartTime] = useState<number | null>(null);
   const [submitEndTime, setSubmitEndTime] = useState<number | null>(null);
   const chatEditorRef = useRef<RichTextEditorHandle>(null);
-  const sessionDraftsRef = useRef<Map<string, string>>(new Map());
+  /** Unsent composer state per session: editor HTML + staged image
+   *  attachments. Attachments MUST travel with the text — stashing only the
+   *  HTML left `attachedImages` behind on switch, so a pasted image followed
+   *  the user into the next session (and got sent with, or cleared by, that
+   *  session's next turn). Same family of bug as the AskUserQuestion draft
+   *  store in AskUserQuestionDialog.tsx. */
+  const sessionDraftsRef = useRef<Map<string, { html: string; images: AttachedImage[] }>>(new Map());
+
+  /** Stash the CURRENT session's composer (editor + attachment chips) before
+   *  switching away. Every navigation path must call this — and its
+   *  counterpart restoreDraft — as a pair. */
+  const stashDraft = () => {
+    if (!viewingTranscriptId || !chatEditorRef.current) return;
+    const html = chatEditorRef.current.getContent();
+    const hasText = !!(chatEditorRef.current.getPlainText?.()?.trim?.() || html.replace(/<[^>]*>/g, '').trim());
+    if (hasText || attachedImages.length > 0) {
+      sessionDraftsRef.current.set(viewingTranscriptId, { html: hasText ? html : '', images: attachedImages });
+    } else {
+      sessionDraftsRef.current.delete(viewingTranscriptId);
+    }
+  };
+
+  /** Restore (or clear) the composer for the session being switched TO. A
+   *  session with no stashed draft gets an empty editor and NO chips — a new
+   *  or clean session must never inherit another session's attachments. */
+  const restoreDraft = (sessionId: string) => {
+    const draft = sessionDraftsRef.current.get(sessionId);
+    setAttachedImages(draft?.images || []);
+    setAttachError(null);
+    setTimeout(() => chatEditorRef.current?.setContent(draft?.html || ''), 50);
+  };
 
   // When overlay messages are restored from a previous session, they belong at a
   // specific position in the transcript (not at the end). null = append at end (live sends).
@@ -632,15 +662,8 @@ export default function ChatTab({
 
   // --- fetchTranscript ---
   const fetchTranscript = async (sessionId: string, project: string, displayTitle: string) => {
-    // Save current editor draft before switching
-    if (viewingTranscriptId && chatEditorRef.current) {
-      const draft = chatEditorRef.current.getContent();
-      if (chatEditorRef.current.getPlainText?.()?.trim?.() || draft.replace(/<[^>]*>/g, '').trim()) {
-        sessionDraftsRef.current.set(viewingTranscriptId, draft);
-      } else {
-        sessionDraftsRef.current.delete(viewingTranscriptId);
-      }
-    }
+    // Save current composer draft (text + attachments) before switching
+    stashDraft();
 
     // Update the active session ref synchronously so SSE handlers for the
     // previous session's isStillActive() return false immediately.
@@ -677,9 +700,8 @@ export default function ChatTab({
     setSubmitStartTime(null);
     setSubmitEndTime(null);
 
-    // Restore draft for the target session (or clear)
-    const savedDraft = sessionDraftsRef.current.get(sessionId) || '';
-    setTimeout(() => chatEditorRef.current?.setContent(savedDraft), 50);
+    // Restore composer draft (text + attachments) for the target session (or clear)
+    restoreDraft(sessionId);
     try {
       const res = await fetch(`/api/transcript?sessionId=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(project)}`);
       let transcriptMessages: { role: 'user' | 'assistant'; content: string; timestamp: string; images?: TranscriptImagePart[] }[] = [];
@@ -1635,15 +1657,8 @@ export default function ChatTab({
   };
 
   const createNewSession = (path: string, model: string | null, resolvedModel: string | null = null) => {
-    // Save current editor draft before switching
-    if (viewingTranscriptId && chatEditorRef.current) {
-      const draft = chatEditorRef.current.getContent();
-      if (chatEditorRef.current.getPlainText?.()?.trim?.() || draft.replace(/<[^>]*>/g, '').trim()) {
-        sessionDraftsRef.current.set(viewingTranscriptId, draft);
-      } else {
-        sessionDraftsRef.current.delete(viewingTranscriptId);
-      }
-    }
+    // Save current composer draft (text + attachments) before switching
+    stashDraft();
 
     const newId = generateUUID();
     // Update ref synchronously so any in-flight handler's isStillActive() returns false
@@ -1688,20 +1703,14 @@ export default function ChatTab({
     // Track this as a pending session so it persists in the sidebar
     setPendingNewSessions(prev => [...prev, { sessionId: newId, project: path, title: 'New Session', createdAt: Date.now() }]);
 
-    // New session starts with an empty editor
-    setTimeout(() => chatEditorRef.current?.setContent(''), 50);
+    // New session starts with an empty composer — restoreDraft on a fresh id
+    // clears the editor AND the attachment chips (which previously leaked in).
+    restoreDraft(newId);
   };
 
   const restorePendingSession = (pending: { sessionId: string; project: string; title: string }) => {
-    // Save current editor draft before switching
-    if (viewingTranscriptId && chatEditorRef.current) {
-      const draft = chatEditorRef.current.getContent();
-      if (chatEditorRef.current.getPlainText?.()?.trim?.() || draft.replace(/<[^>]*>/g, '').trim()) {
-        sessionDraftsRef.current.set(viewingTranscriptId, draft);
-      } else {
-        sessionDraftsRef.current.delete(viewingTranscriptId);
-      }
-    }
+    // Save current composer draft (text + attachments) before switching
+    stashDraft();
 
     activeSessionRef.current = pending.sessionId;
     setViewingTranscriptId(pending.sessionId);
@@ -1722,9 +1731,8 @@ export default function ChatTab({
     setSubmitStartTime(null);
     setSubmitEndTime(null);
 
-    // Restore draft for this pending session
-    const savedDraft = sessionDraftsRef.current.get(pending.sessionId) || '';
-    setTimeout(() => chatEditorRef.current?.setContent(savedDraft), 50);
+    // Restore composer draft (text + attachments) for this pending session
+    restoreDraft(pending.sessionId);
   };
 
   const handleKillStuckSession = async () => {
