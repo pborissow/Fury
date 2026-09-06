@@ -168,6 +168,51 @@ export default function ChatTab({
   const ttsBlobUrlRef = useRef<string | null>(null);
   const ttsAbortRef = useRef<AbortController | null>(null);
   const [ttsPlaying, setTtsPlaying] = useState<'loading' | 'playing' | 'paused' | 'idle'>('idle');
+
+  // --- Turn-complete chime ---
+  // A short notification sound whenever Claude finishes a turn in ANY session
+  // (unlike TTS, which only ever speaks the session in view). Ownership rule:
+  // when the finished session IS the one in view and voice summary is on, the
+  // chime defers to TTS — speech is the notification — but every TTS failure
+  // path chimes instead, so a completed turn is never silent by accident.
+  const chimeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const lastChimeAtRef = useRef(0);
+  /** Minimum gap between chimes. Several sessions finishing within a couple of
+   *  seconds (distinct SSE events, so the per-event dedupe can't see them)
+   *  should ring ONCE, not machine-gun the bell. */
+  const CHIME_COOLDOWN_MS = 2000;
+  const playChime = useCallback(() => {
+    try {
+      // Never ring over active voice playback: speech IS the notification
+      // (original spec). The <audio> element is the source of truth — no state
+      // to fall out of sync — and the TTS failure-path chimes still pass, since
+      // a playback that failed or ended isn't playing. A single shared chime
+      // element (below) means chimes can't stack over EACH OTHER either.
+      const tts = ttsAudioRef.current;
+      if (tts && !tts.paused && !tts.ended) return;
+      const now = Date.now();
+      if (now - lastChimeAtRef.current < CHIME_COOLDOWN_MS) return;
+      lastChimeAtRef.current = now;
+      if (!chimeAudioRef.current) {
+        chimeAudioRef.current = new Audio('/sounds/bike-bell.mp3');
+        chimeAudioRef.current.volume = 0.5;
+      }
+      chimeAudioRef.current.currentTime = 0;
+      // Rejection = browser autoplay policy (no user gesture yet) — expected
+      // on a fresh tab; nothing to do about it.
+      chimeAudioRef.current.play().catch(() => {});
+    } catch {
+      // No audio support — a chime is never worth an error.
+    }
+  }, []);
+  /** Live-session ids as of the LAST global SSE event / baseline fetch. The
+   *  chime triggers on ids leaving this set (turn finished), so baseline
+   *  fetches (mount, SSE reconnect catch-up) must update it WITHOUT chiming —
+   *  sessions that finished while the tab was hidden are old news. */
+  const prevLiveIdsRef = useRef<Set<string>>(new Set());
+  /** Mirror of viewingTranscriptId for the global SSE closure (bound once per
+   *  tab activation). */
+  const viewingIdRef = useRef<string | null>(null);
   const activeSessionRef = useRef<string | null>(null);
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const lastAssistantRef = useRef<HTMLDivElement>(null);
@@ -457,6 +502,10 @@ export default function ChatTab({
   useEffect(() => {
     ttsEnabledRef.current = ttsEnabled;
   }, [ttsEnabled]);
+
+  useEffect(() => {
+    viewingIdRef.current = viewingTranscriptId;
+  }, [viewingTranscriptId]);
 
   // Auto-scroll transcript viewer during streaming
   useEffect(() => {
@@ -798,7 +847,9 @@ export default function ChatTab({
 
     // Fetch initial / catch-up data
     fetch('/api/live-sessions').then(res => res.json()).then(data => {
-      setLiveSessionIds(new Set(data.liveSessionIds || []));
+      const ids = new Set<string>(data.liveSessionIds || []);
+      prevLiveIdsRef.current = ids; // baseline — never chime off a fetch
+      setLiveSessionIds(ids);
     }).catch(() => {});
     fetchHistory();
 
@@ -814,7 +865,19 @@ export default function ChatTab({
 
     es.addEventListener('live-sessions', (e: MessageEvent) => {
       const data = JSON.parse(e.data);
-      setLiveSessionIds(new Set(data.liveSessionIds || []));
+      const ids = new Set<string>(data.liveSessionIds || []);
+      // A session leaving the live set = Claude finished a turn (including
+      // background work draining). Chime for it — EXCEPT when it's the session
+      // in view with voice summary on: there TTS is the notification, and its
+      // failure paths chime instead (see playChime).
+      for (const id of prevLiveIdsRef.current) {
+        if (ids.has(id)) continue;
+        if (id === viewingIdRef.current && ttsEnabledRef.current) continue;
+        playChime();
+        break; // one chime per event, even if several sessions finished at once
+      }
+      prevLiveIdsRef.current = ids;
+      setLiveSessionIds(ids);
     });
 
     es.addEventListener('history-updated', () => {
@@ -831,7 +894,9 @@ export default function ChatTab({
         // connection was dropped (e.g. provider switch-back fired during
         // a server restart).
         fetch('/api/live-sessions').then(res => res.json()).then(data => {
-          setLiveSessionIds(new Set(data.liveSessionIds || []));
+          const ids = new Set<string>(data.liveSessionIds || []);
+          prevLiveIdsRef.current = ids; // baseline — never chime off a fetch
+          setLiveSessionIds(ids);
         }).catch(() => {});
         fetchHistory();
         fetch('/api/provider').then(res => res.json()).then(applyProviderStatus).catch(() => {});
@@ -1231,6 +1296,8 @@ export default function ChatTab({
                       audio.play().catch(err => {
                         console.error('[TTS] playback failed:', err);
                         setTtsPlaying('idle');
+                        // Speech was the turn notification and it never sounded.
+                        playChime();
                       });
                       setTtsPlaying('playing');
                     })
@@ -1238,7 +1305,17 @@ export default function ChatTab({
                       if (ttsAbortRef.current !== abort) return; // superseded
                       if (err.name !== 'AbortError') console.error('[TTS]', err);
                       setTtsPlaying('idle');
+                      // TTS failed (generation error, server down, bad response)
+                      // — the chime deferred to speech for the viewed session, so
+                      // deliver it here instead. AbortError is a supersede /
+                      // session switch, not a failure: stay silent.
+                      if (err.name !== 'AbortError') playChime();
                     });
+                } else {
+                  // Turn finished but produced no speakable bubble — the chime
+                  // deferred to TTS for the viewed session, and TTS has nothing
+                  // to say. Chime so the completion still makes a sound.
+                  playChime();
                 }
               }
             }
