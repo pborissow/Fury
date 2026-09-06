@@ -44,7 +44,6 @@ interface ChatTabProps {
   onHorizontalLayoutChange: (sizes: number[]) => void;
   onVerticalLayoutChange: (sizes: number[]) => void;
   isActive: boolean; // pause SSE processing when tab is hidden
-  promptSuggestionsEnabled: boolean;
   ttsEnabled: boolean;
   /** When on, stop/rewind route to the persistent SDK session endpoints
    *  (/api/claude-sdk/interrupt, /rewind) instead of the CLI kill + LLM-undo. */
@@ -65,7 +64,6 @@ export default function ChatTab({
   onHorizontalLayoutChange,
   onVerticalLayoutChange,
   isActive,
-  promptSuggestionsEnabled,
   ttsEnabled,
   sdkSessionsEnabled,
   openSessionRequest,
@@ -113,7 +111,6 @@ export default function ChatTab({
   const [streamEvents, setStreamEvents] = useState<StreamEvent[]>([]);
 
   // Smart prompt suggestion for incomplete responses
-  const [suggestedPrompt, setSuggestedPrompt] = useState<{ text: string; context: string } | null>(null);
 
 
   // History transcript viewer state (renders in center panel)
@@ -619,7 +616,6 @@ export default function ChatTab({
     // it from /api/stream-buffer + /api/health below.
     setBackgroundWorking(false);
     setTranscriptPartial(false);
-    setSuggestedPrompt(null);
     // Clear any parked question on switch, UNCONDITIONALLY (P17). The SDK path
     // self-heals (its restore returns pendingAsk:null), but the CLI path never
     // clears a stale dialog — so answering a question carried over from session A
@@ -642,7 +638,6 @@ export default function ChatTab({
         const data = await res.json();
         transcriptMessages = data.messages || [];
         setTranscriptPartial(!!data.partial);
-        setSuggestedPrompt(data.suggestedPrompt || null);
 
         // If the API found a prompt that was sent but never processed
         // (e.g. Claude was interrupted), pre-fill the editor so the user
@@ -1643,7 +1638,6 @@ export default function ChatTab({
     setTranscriptLoading(false);
     setBackgroundWorking(false);
     setTranscriptPartial(false);
-    setSuggestedPrompt(null);
     setIsStuck(false);
     setStuckReason(undefined);
     setHistoryTranscriptLoading(false);
@@ -1772,7 +1766,6 @@ export default function ChatTab({
     setTranscriptStreaming('');
     setStreamEvents([]);
     setSessionError(null);
-    setSuggestedPrompt(null);
     setSubmitStartTime(Date.now());
     setSubmitEndTime(null);
     setTimeout(() => scrollTranscriptToBottom(), 50);
@@ -2531,18 +2524,6 @@ export default function ChatTab({
                               still flows to <McpPanel runtimeFailed=… /> below, which flags the
                               failed row there. (Removed the in-transcript banner per product
                               direction; the state is retained purely to drive the panel.) */}
-                          {suggestedPrompt && !transcriptLoading && promptSuggestionsEnabled && (
-                            <div className="flex justify-start">
-                              <button
-                                onClick={() => chatEditorRef.current?.setContent(suggestedPrompt.text)}
-                                className="max-w-[80%] rounded-lg px-4 py-2 bg-muted border border-amber-600/40 text-sm hover:border-amber-500 transition-colors text-left"
-                                title="Click to fill editor with this prompt"
-                              >
-                                <div className="text-xs text-amber-500 mb-1">{suggestedPrompt.context}</div>
-                                <div className="text-foreground">{suggestedPrompt.text}</div>
-                              </button>
-                            </div>
-                          )}
                           <div ref={transcriptEndRef} />
                         </>
                       )}

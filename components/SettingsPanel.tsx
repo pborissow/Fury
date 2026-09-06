@@ -23,8 +23,6 @@ export interface ServiceSettings {
 }
 
 interface SettingsPanelProps {
-  promptSuggestionsEnabled: boolean;
-  onPromptSuggestionsChange: (enabled: boolean) => void;
   ttsEnabled: boolean;
   onTtsChange: (enabled: boolean) => void;
   imagePersist: boolean;
@@ -39,8 +37,6 @@ interface SettingsPanelProps {
 }
 
 export default function SettingsPanel({
-  promptSuggestionsEnabled,
-  onPromptSuggestionsChange,
   ttsEnabled,
   onTtsChange,
   imagePersist,
@@ -353,18 +349,6 @@ export default function SettingsPanel({
               <Switch
                 checked={!localhostOnly}
                 onCheckedChange={handleExternalToggle}
-              />
-            </div>
-            <div className="flex items-center justify-between py-3">
-              <div className="pr-4">
-                <div className="text-sm font-medium">Prompt suggestions</div>
-                <div className="text-xs text-muted-foreground mt-0.5">
-                  Suggest follow-up prompts for stale or idle sessions with incomplete responses
-                </div>
-              </div>
-              <Switch
-                checked={promptSuggestionsEnabled}
-                onCheckedChange={onPromptSuggestionsChange}
               />
             </div>
             <div className="flex items-center justify-between py-3">

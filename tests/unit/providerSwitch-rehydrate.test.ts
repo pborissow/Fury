@@ -59,7 +59,6 @@ const SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
 const LOG_PATH = join(homedir(), '.fury', 'provider-fallback-log.jsonl');
 
 const BASE_SETTINGS: AppSettings = {
-  promptSuggestionsEnabled: true,
   ttsEnabled: false,
   localhostOnly: true,
   authUsername: null,

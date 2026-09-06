@@ -73,7 +73,6 @@ export default function Home() {
   };
 
   // App settings (persisted to server)
-  const [promptSuggestionsEnabled, setPromptSuggestionsEnabled] = useState(true);
   const [ttsEnabled, setTtsEnabled] = useState(false);
   // Persist pasted/Read-tool images to the on-disk store once they age out of
   // the recent-turn window (vs. discard them). 'ephemeral' | 'persist'. Defaults
@@ -103,7 +102,6 @@ export default function Home() {
   // Load settings on mount
   useEffect(() => {
     fetch('/api/settings').then(r => r.json()).then(s => {
-      if (s.promptSuggestionsEnabled !== undefined) setPromptSuggestionsEnabled(s.promptSuggestionsEnabled);
       if (s.ttsEnabled !== undefined) setTtsEnabled(s.ttsEnabled);
       if (s.imagePersistence !== undefined) setImagePersist(s.imagePersistence === 'persist');
       if (s.sdkSessionsEnabled !== undefined) setSdkSessionsEnabled(s.sdkSessionsEnabled);
@@ -139,10 +137,6 @@ export default function Home() {
       body: JSON.stringify(updates),
     }).catch(err => console.error('[Settings] Failed to save:', err));
   }, []);
-
-  useEffect(() => {
-    saveSettings({ promptSuggestionsEnabled });
-  }, [promptSuggestionsEnabled, saveSettings]);
 
   useEffect(() => {
     saveSettings({ ttsEnabled });
@@ -359,8 +353,6 @@ export default function Home() {
         </Button>
         <Dialog open={settingsOpen} onOpenChange={setSettingsOpen} title="Settings" noPadding>
           <SettingsPanel
-            promptSuggestionsEnabled={promptSuggestionsEnabled}
-            onPromptSuggestionsChange={setPromptSuggestionsEnabled}
             ttsEnabled={ttsEnabled}
             onTtsChange={setTtsEnabled}
             imagePersist={imagePersist}
@@ -434,7 +426,6 @@ export default function Home() {
                   saveLayoutState({ chatVerticalLayout: sizes });
                 }}
                 isActive={activeTab === 'chat'}
-                promptSuggestionsEnabled={promptSuggestionsEnabled}
                 ttsEnabled={ttsEnabled}
                 sdkSessionsEnabled={sdkSessionsEnabled}
                 openSessionRequest={sessionToOpen}

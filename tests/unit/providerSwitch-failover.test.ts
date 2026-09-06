@@ -35,7 +35,6 @@ const mockWriteFile = writeFile as ReturnType<typeof vi.fn>;
 const mockAppendFile = appendFile as ReturnType<typeof vi.fn>;
 
 const BASE_SETTINGS: AppSettings = {
-  promptSuggestionsEnabled: true,
   ttsEnabled: false,
   localhostOnly: true,
   authUsername: null,

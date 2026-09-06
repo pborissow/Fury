@@ -29,7 +29,6 @@ function lastParseError(content: string): unknown {
 }
 
 export interface AppSettings {
-  promptSuggestionsEnabled: boolean;
   ttsEnabled: boolean;
   localhostOnly: boolean;
   authUsername: string | null;
@@ -80,7 +79,6 @@ export interface AppSettings {
  *  defaults by hand-copying them — which had already happened once
  *  (imagePersistence: 'ephemeral' vs this 'persist'). */
 export const DEFAULT_SETTINGS: AppSettings = {
-  promptSuggestionsEnabled: true,
   ttsEnabled: false,
   localhostOnly: true,
   authUsername: null,

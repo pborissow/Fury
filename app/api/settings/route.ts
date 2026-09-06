@@ -24,7 +24,7 @@ export async function GET() {
 }
 
 const ALLOWED_KEYS = [
-  'promptSuggestionsEnabled', 'ttsEnabled', 'localhostOnly',
+  'ttsEnabled', 'localhostOnly',
   'authUsername', 'anthropicApiKey',
   'summarizerProvider', 'ollamaHost', 'ollamaPort',
   'ttsProvider', 'ttsRemoteHost', 'ttsRemotePort',
