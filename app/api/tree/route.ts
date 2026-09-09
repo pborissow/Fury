@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
+import { getBranch } from '@/lib/vcsServer';
 
 export interface FileTreeNode {
   name: string;
@@ -81,6 +82,7 @@ type VcsType = 'git' | 'svn';
 interface VcsResult {
   vcs: VcsType;
   statuses: Record<string, VcsFileStatus>;
+  branch: string | null;
 }
 
 async function detectVcs(dirPath: string): Promise<VcsType | null> {
@@ -190,11 +192,12 @@ async function getVcsStatus(dirPath: string): Promise<VcsResult | null> {
   const vcs = await detectVcs(dirPath);
   if (!vcs) return null;
 
-  const statuses = vcs === 'git'
-    ? await getGitStatus(dirPath)
-    : await getSvnStatus(dirPath);
+  const [statuses, branch] = await Promise.all([
+    vcs === 'git' ? getGitStatus(dirPath) : getSvnStatus(dirPath),
+    getBranch(dirPath, vcs),
+  ]);
 
-  return { vcs, statuses };
+  return { vcs, statuses, branch };
 }
 
 export async function GET(request: NextRequest) {
@@ -238,6 +241,7 @@ export async function GET(request: NextRequest) {
       tree,
       root: dirPath,
       vcs: vcsResult?.vcs || null,
+      branch: vcsResult?.branch || null,
       fileStatuses: vcsResult?.statuses || null,
     });
   } catch (error) {

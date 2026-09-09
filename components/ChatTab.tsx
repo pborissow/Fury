@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import RichTextEditor, { type RichTextEditorHandle } from '@/components/RichTextEditor';
 import FileTree from '@/components/FileTree';
 import CodeViewerDialog, { isCodeFile } from '@/components/CodeViewerDialog';
+import SourceControlDialog from '@/components/SourceControlDialog';
 import AskUserQuestionDialog from '@/components/AskUserQuestionDialog';
 import StreamEventsPanel, { type StreamEvent } from '@/components/StreamEventsPanel';
 import McpPanel from '@/components/McpPanel';
@@ -407,6 +408,7 @@ export default function ChatTab({
     onCancel: () => void;
   } | null>(null);
   const [codeViewerPath, setCodeViewerPath] = useState<string | null>(null);
+  const [sourceControlOpen, setSourceControlOpen] = useState(false);
   const [errorDialog, setErrorDialog] = useState<{ title: string; message?: string } | null>(null);
   // A turn-ending error surfaced by the backend (session:stream {error}) — e.g.
   // "Failed to authenticate: OAuth session expired...". Held as a persistent
@@ -2730,7 +2732,7 @@ export default function ChatTab({
             </Button>
           </div>
           <div className={`flex-1 overflow-hidden ${rightPanelView === 'files' ? '' : 'hidden'}`}>
-            <FileTree projectPath={historyTranscriptProject} onFileDoubleClick={handleFileDoubleClick} />
+            <FileTree projectPath={historyTranscriptProject} onFileDoubleClick={handleFileDoubleClick} onOpenSourceControl={() => setSourceControlOpen(true)} />
           </div>
           {rightPanelView === 'stream' && (
             <StreamEventsPanel
@@ -2790,6 +2792,7 @@ export default function ChatTab({
     />
     <IntermediaryMessagesDialog messages={intermediaryMessages} onClose={() => setIntermediaryMessages([])} />
     <CodeViewerDialog filePath={codeViewerPath} onClose={() => setCodeViewerPath(null)} />
+    <SourceControlDialog open={sourceControlOpen} projectPath={historyTranscriptProject} onClose={() => setSourceControlOpen(false)} />
 
     {askUserQuestion && (
       <AskUserQuestionDialog

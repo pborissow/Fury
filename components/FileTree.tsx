@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { ChevronRight, ChevronDown, Folder, File, Loader2, Search, X } from 'lucide-react';
+import { ChevronRight, ChevronDown, Folder, File, Loader2, Search, X, GitBranch, GitCommitHorizontal } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
 
 export interface FileTreeNode {
@@ -11,10 +11,10 @@ export interface FileTreeNode {
   children?: FileTreeNode[];
 }
 
-type VcsFileStatus = 'M' | 'A' | 'D' | 'R' | '?' | 'C' | '!';
+export type VcsFileStatus = 'M' | 'A' | 'D' | 'R' | '?' | 'C' | '!';
 type VcsStatusMap = Record<string, VcsFileStatus>;
 
-const VCS_STATUS_COLORS: Record<VcsFileStatus, string> = {
+export const VCS_STATUS_COLORS: Record<VcsFileStatus, string> = {
   'M': 'text-yellow-500',
   'A': 'text-green-500',
   'D': 'text-red-500',
@@ -24,7 +24,7 @@ const VCS_STATUS_COLORS: Record<VcsFileStatus, string> = {
   '!': 'text-red-500',
 };
 
-const VCS_STATUS_LABELS: Record<VcsFileStatus, string> = {
+export const VCS_STATUS_LABELS: Record<VcsFileStatus, string> = {
   'M': 'M',
   'A': 'A',
   'D': 'D',
@@ -34,7 +34,7 @@ const VCS_STATUS_LABELS: Record<VcsFileStatus, string> = {
   '!': '!',
 };
 
-function VcsStatusBadge({ status }: { status?: VcsFileStatus }) {
+export function VcsStatusBadge({ status }: { status?: VcsFileStatus }) {
   if (!status) return null;
   return (
     <span className={`ml-auto shrink-0 text-xs font-mono font-semibold ${VCS_STATUS_COLORS[status]}`}>
@@ -141,11 +141,16 @@ interface FileTreeProps {
   projectPath: string | null;
   onFileDoubleClick?: (filePath: string) => void;
   maxDepth?: number;
+  /** When set and the directory is a git/svn working copy, a source-control
+   *  button is shown next to the search box. */
+  onOpenSourceControl?: () => void;
 }
 
-export default function FileTree({ projectPath, onFileDoubleClick, maxDepth }: FileTreeProps) {
+export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onOpenSourceControl }: FileTreeProps) {
   const [tree, setTree] = useState<FileTreeNode[]>([]);
   const [fileStatuses, setFileStatuses] = useState<VcsStatusMap | null>(null);
+  const [vcs, setVcs] = useState<'git' | 'svn' | null>(null);
+  const [branch, setBranch] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
@@ -167,6 +172,8 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth }: F
 
       setTree(data.tree);
       setFileStatuses(data.fileStatuses || null);
+      setVcs(data.vcs || null);
+      setBranch(data.branch || null);
     } catch (err) {
       console.error('Error fetching file tree:', err);
       setError(err instanceof Error ? err.message : 'Failed to load directory tree');
@@ -181,6 +188,8 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth }: F
     if (!projectPath) {
       setTree([]);
       setFileStatuses(null);
+      setVcs(null);
+      setBranch(null);
       return;
     }
 
@@ -318,6 +327,28 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth }: F
           </div>
         )}
       </ScrollArea>
+
+      {/* Source-control toolbar — only when the directory is a git/svn working copy */}
+      {vcs && (
+        <div className="shrink-0 border-t border-border px-3 py-1.5 flex items-center justify-between gap-2 bg-muted/30">
+          <span
+            className="flex items-center gap-1.5 text-xs text-muted-foreground min-w-0"
+            title={branch ? `${vcs}: ${branch}` : vcs}
+          >
+            <GitBranch className="h-3.5 w-3.5 shrink-0" />
+            <span className="truncate">{branch || vcs}</span>
+          </span>
+          {onOpenSourceControl && (
+            <button
+              onClick={onOpenSourceControl}
+              className="shrink-0 flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-medium bg-muted text-muted-foreground hover:text-foreground hover:bg-accent border border-border transition-colors"
+            >
+              <GitCommitHorizontal className="h-3.5 w-3.5" />
+              Stage Changes
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

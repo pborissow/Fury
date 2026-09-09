@@ -2,6 +2,14 @@
 @import "tw-animate-css";
 @import "highlight.js/styles/github-dark.css";
 
+/* Override the github-dark theme's blue-black background (#0d1117) with a
+   neutral near-black across all highlighted code (code viewer, diff view,
+   markdown code blocks). Keep in sync with DiffView's CANVAS_BG and the
+   .prose-chat pre fallback below. */
+.hljs {
+  background: #171717;
+}
+
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
@@ -253,9 +261,10 @@
 
 /* Fallback background for code blocks that highlight.js doesn't detect.
    Outside @layer so it overrides Tailwind Preflight. When highlight.js does
-   apply .hljs, the theme's own background (#0d1117) wins on the inner code element. */
+   apply .hljs, the overridden theme background (#171717, see top of file)
+   wins on the inner code element. */
 .prose-chat pre {
-  background: #0d1117;
+  background: #171717;
   border: 1px solid oklch(1 0 0 / 10%);
 }
 
