@@ -501,7 +501,7 @@ export default React.memo(function SourceControlDialog({ open, projectPath, onCl
                   ? (isSvn ? 'Select files to commit first' : 'Stage files to commit first')
                   : !summary.trim() ? 'Enter a commit message' : undefined
               }
-              className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md text-sm font-medium border border-green-600 bg-green-600/10 text-green-400 hover:bg-green-600/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-green-600/10"
+              className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md text-sm font-medium bg-green-800 hover:bg-green-700 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-green-800"
             >
               {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <GitCommitHorizontal className="h-4 w-4" />}
               Commit Changes{stagedList.length > 0 ? ` to ${stagedList.length} File${stagedList.length === 1 ? '' : 's'}` : ''}
@@ -545,8 +545,10 @@ function FileSection({
   actionDisabled, entries, side, selected, onSelect, onRowAction, rowActionIcon, busy,
 }: FileSectionProps) {
   const Chevron = collapsed ? ChevronRight : ChevronDown;
+  // Green matches the chat send button (bg-green-800/700) for a single
+  // "affirmative action" green across the app.
   const actionCls = actionStyle === 'green'
-    ? 'bg-green-600 hover:bg-green-500 text-white border border-green-700'
+    ? 'bg-green-800 hover:bg-green-700 text-white'
     : 'bg-transparent hover:bg-red-500/10 text-foreground border border-red-500';
   return (
     // Expanded sections share the available height; a collapsed one shrinks to

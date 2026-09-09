@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { detectVcs, getStatus, run } from '@/lib/vcsServer';
+import { log } from '@/lib/logger';
 
 // POST /api/vcs/action
 // Body: { root, op: 'stage'|'unstage'|'stageAll'|'unstageAll'|'commit',
@@ -104,26 +105,32 @@ async function gitAction(
   }
 }
 
+interface SvnCommitResult {
+  failure: ActionError | null;
+  /** Parsed from `svn commit` output ("Committed revision N.") for the audit log. */
+  revision?: string;
+}
+
 async function svnCommit(
   root: string,
   relPaths: string[],
   summary: string,
   description: string
-): Promise<ActionError | null> {
+): Promise<SvnCommitResult> {
   // SVN has no staging area — the client sends the selected files. Untracked
   // selections need `svn add`, missing ones `svn delete`, before commit.
   const status = await getStatus(root);
-  if (!status) return { error: 'Not an svn working copy', httpStatus: 400 };
+  if (!status) return { failure: { error: 'Not an svn working copy', httpStatus: 400 } };
   const byRel = new Map(status.unstaged.map((e) => [e.relPath, e.status]));
 
   for (const rel of relPaths) {
     const st = byRel.get(rel);
     if (st === '?') {
       const res = await run('svn', ['add', '--parents', '--', rel], root);
-      if (res.code !== 0) return { error: res.stderr.trim() || `svn add failed for ${rel}`, httpStatus: 500 };
+      if (res.code !== 0) return { failure: { error: res.stderr.trim() || `svn add failed for ${rel}`, httpStatus: 500 } };
     } else if (st === '!') {
       const res = await run('svn', ['delete', '--', rel], root);
-      if (res.code !== 0) return { error: res.stderr.trim() || `svn delete failed for ${rel}`, httpStatus: 500 };
+      if (res.code !== 0) return { failure: { error: res.stderr.trim() || `svn delete failed for ${rel}`, httpStatus: 500 } };
     }
   }
 
@@ -131,15 +138,20 @@ async function svnCommit(
   const res = await run('svn', ['commit', '-m', message, '--', ...relPaths], root, {
     timeout: NETWORK_TIMEOUT,
   });
-  if (res.code === 0) return null;
+  if (res.code === 0) {
+    const revMatch = res.stdout.match(/Committed revision (\d+)/);
+    return { failure: null, revision: revMatch ? `r${revMatch[1]}` : undefined };
+  }
   if (/out of date/i.test(res.stderr)) {
     return {
-      error: 'Working copy is out of date — run svn update first.',
-      errorCode: 'out-of-date',
-      httpStatus: 409,
+      failure: {
+        error: 'Working copy is out of date — run svn update first.',
+        errorCode: 'out-of-date',
+        httpStatus: 409,
+      },
     };
   }
-  return { error: res.stderr.trim() || 'svn commit failed', httpStatus: 500 };
+  return { failure: { error: res.stderr.trim() || 'svn commit failed', httpStatus: 500 } };
 }
 
 export async function POST(request: NextRequest) {
@@ -182,7 +194,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const started = Date.now();
     let failure: ActionError | null;
+    let svnRevision: string | undefined;
     if (vcs === 'git') {
       failure = await gitAction(root, op, relPaths, summary, description);
     } else {
@@ -193,7 +207,32 @@ export async function POST(request: NextRequest) {
       if (!relPaths) {
         return NextResponse.json({ error: 'paths required for svn commit' }, { status: 400 });
       }
-      failure = await svnCommit(root, relPaths, summary, description);
+      const result = await svnCommit(root, relPaths, summary, description);
+      failure = result.failure;
+      svnRevision = result.revision;
+    }
+
+    // Audit trail for commits made through the UI (daily JSONL via lib/logger).
+    const logData: Record<string, unknown> = {
+      op, vcs, root,
+      durationMs: Date.now() - started,
+      ...(relPaths ? { files: relPaths.length } : {}),
+    };
+    if (failure) {
+      log.warn('vcs.action', `${op} failed: ${failure.error}`, {
+        data: { ...logData, errorCode: failure.errorCode },
+      });
+    } else if (op === 'commit') {
+      if (vcs === 'git') {
+        const rev = await run('git', ['rev-parse', '--short', 'HEAD'], root);
+        if (rev.code === 0) logData.commit = rev.stdout.trim();
+      } else if (svnRevision) {
+        logData.commit = svnRevision;
+      }
+      logData.message = summary.split('\n')[0].slice(0, 120);
+      log.info('vcs.action', 'commit succeeded', { data: logData });
+    } else {
+      log.info('vcs.action', `${op} succeeded`, { data: logData });
     }
 
     const status = await getStatus(root);
@@ -206,6 +245,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ success: true, status });
   } catch (error) {
     console.error('Error in /api/vcs/action:', error);
+    log.error('vcs.action', 'unhandled failure', {
+      data: { error: error instanceof Error ? error.message : String(error) },
+    });
     return NextResponse.json({ error: 'VCS action failed' }, { status: 500 });
   }
 }
