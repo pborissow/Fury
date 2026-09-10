@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "npx tsx server.ts",
+    "clean": "node -e \"require('fs').rmSync('.next',{recursive:true,force:true,maxRetries:5,retryDelay:200})\"",
+    "dev:clean": "npm run clean && npm run dev",
     "build": "next build",
     "start": "NODE_ENV=production npx tsx server.ts",
     "lint": "eslint",

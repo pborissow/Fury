@@ -191,6 +191,8 @@ Open [http://localhost:3879](http://localhost:3879) in your browser.
 | Command | Description |
 |---------|-------------|
 | `npm run dev` | Start dev server with Turbopack on port 3879 |
+| `npm run clean` | Delete the `.next` build/Turbopack cache directory |
+| `npm run dev:clean` | Clean the `.next` cache, then start the dev server (use when a stale Turbopack cache serves outdated CSS/JS after a pull or branch switch) |
 | `npm run build` | Production build |
 | `npm start` | Start production server on port 3879 |
 | `npm run lint` | Run ESLint |
