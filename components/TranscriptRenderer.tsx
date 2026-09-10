@@ -161,20 +161,26 @@ export default function TranscriptRenderer({
     allMessages = [...historyTranscript, ...overlayAsTranscript];
   }
 
-  const turns: { user: TranscriptMsg | null; assistant: TranscriptMsg | null; intermediaries: TranscriptMsg[] }[] = [];
-  let currentTurn: typeof turns[0] = { user: null, assistant: null, intermediaries: [] };
+  // userIndex/assistantIndex: the message's FLAT index in allMessages — the
+  // same indexing the transcript archive stores as `turn_index`, which is what
+  // a Search-result deep link carries. Emitted as data-msg-index on the bubble
+  // wrappers so ChatTab can scroll a hit's bubble into view.
+  const turns: { user: TranscriptMsg | null; assistant: TranscriptMsg | null; intermediaries: TranscriptMsg[]; userIndex: number | null; assistantIndex: number | null }[] = [];
+  let currentTurn: typeof turns[0] = { user: null, assistant: null, intermediaries: [], userIndex: null, assistantIndex: null };
 
-  for (const msg of allMessages) {
+  for (let msgIndex = 0; msgIndex < allMessages.length; msgIndex++) {
+    const msg = allMessages[msgIndex];
     if (msg.role === 'user') {
       if (currentTurn.user || currentTurn.assistant) {
         turns.push(currentTurn);
       }
-      currentTurn = { user: msg, assistant: null, intermediaries: [] };
+      currentTurn = { user: msg, assistant: null, intermediaries: [], userIndex: msgIndex, assistantIndex: null };
     } else {
       if (currentTurn.assistant) {
         currentTurn.intermediaries.push(currentTurn.assistant);
       }
       currentTurn.assistant = msg;
+      currentTurn.assistantIndex = msgIndex;
     }
   }
   if (currentTurn.user || currentTurn.assistant) {
@@ -192,7 +198,7 @@ export default function TranscriptRenderer({
       {turns.map((turn, i) => (
         <div key={`turn-${i}`} className="space-y-3">
           {turn.user && (
-            <div className="flex justify-end items-center group/rewind">
+            <div className="flex justify-end items-center group/rewind" data-msg-index={turn.userIndex ?? undefined}>
               {i > 0 && !transcriptLoading && (
                 <button
                   data-testid={`rewind-turn-${i}`}
@@ -228,7 +234,7 @@ export default function TranscriptRenderer({
             </div>
           )}
           {turn.assistant && (
-            <div className="flex justify-start" data-testid="claude-turn" ref={i === lastAssistantTurnIndex ? lastAssistantRef : undefined}>
+            <div className="flex justify-start" data-testid="claude-turn" data-msg-index={turn.assistantIndex ?? undefined} ref={i === lastAssistantTurnIndex ? lastAssistantRef : undefined}>
               <ChatBubble
                 label="Claude"
                 className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border transition-colors"

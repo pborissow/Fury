@@ -26,6 +26,13 @@ interface UIState {
   statsSortKey: string | null;
   statsSortDir: 1 | -1 | null;
   statsOnlyFlagged: boolean | null;
+  // Search tab view preferences (docs/plan-search-tab.md §6 B4) — same
+  // restore-the-working-view rationale as the Stats prefs above. The QUERY is
+  // restored too: search is usually an interrupted train of thought.
+  searchQuery: string | null;
+  searchIncludeArchived: boolean | null;
+  searchRole: 'all' | 'user' | 'assistant' | null;
+  searchSort: 'relevance' | 'recent' | null;
   lastUpdated: number;
 }
 
@@ -123,6 +130,12 @@ class UIStatePersistence {
         statsSortKey: state.statsSortKey ?? existingState?.statsSortKey ?? null,
         statsSortDir: state.statsSortDir ?? existingState?.statsSortDir ?? null,
         statsOnlyFlagged: state.statsOnlyFlagged ?? existingState?.statsOnlyFlagged ?? null,
+        // `??` again: searchQuery '' (cleared box) and includeArchived false
+        // are meaningful values that must persist.
+        searchQuery: state.searchQuery ?? existingState?.searchQuery ?? null,
+        searchIncludeArchived: state.searchIncludeArchived ?? existingState?.searchIncludeArchived ?? null,
+        searchRole: state.searchRole ?? existingState?.searchRole ?? null,
+        searchSort: state.searchSort ?? existingState?.searchSort ?? null,
         lastUpdated: Date.now(),
       };
 

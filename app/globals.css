@@ -46,6 +46,8 @@
   --color-popover: var(--popover);
   --color-card-foreground: var(--card-foreground);
   --color-card: var(--card);
+  --color-highlight: var(--highlight);
+  --color-highlight-foreground: var(--highlight-foreground);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -85,6 +87,10 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  /* Search-match highlight — amber, the one hue not already spoken for
+     (blue = user, green = live). Soft amber wash + dark amber text. */
+  --highlight: oklch(0.924 0.12 95.746 / 65%);
+  --highlight-foreground: oklch(0.35 0.09 60);
 }
 
 .dark {
@@ -119,7 +125,87 @@
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
+  /* Search-match highlight (dark): translucent amber wash + bright amber text. */
+  --highlight: oklch(0.828 0.189 84.429 / 18%);
+  --highlight-foreground: oklch(0.879 0.169 91.605);
 }
+
+/* Search-hero bokeh drift (after Mamboleoo's "Bokeh effect (CSS)", slower):
+   bubbles TRAVEL through the scene rather than wobbling in place. Near
+   (crisp) bubbles roam 14–34px over 16–23s; far (blurred) bokeh bubbles
+   roam 40–50px over 22–30s with opacity breathing — ~1.5–2.5 px/s, lava-
+   lamp pace. ease-in-out + alternate = no loop seams; staggered NEGATIVE
+   delays start every bubble mid-journey so nothing moves in sync.
+   sh-breathe defines only its 50% frame, so each bubble fades from its OWN
+   base opacity toward 0.2 and back. */
+@keyframes sh-roam-1 { to { transform: translate(26px, -10px); } }
+@keyframes sh-roam-2 { to { transform: translate(-20px, 12px); } }
+@keyframes sh-roam-3 { to { transform: translate(34px, 14px); } }
+@keyframes sh-roam-4 { to { transform: translate(-30px, -12px); } }
+@keyframes sh-roam-5 { to { transform: translate(16px, 10px); } }
+@keyframes sh-roam-6 { to { transform: translate(-6px, -14px); } }
+@keyframes sh-roam-7 { to { transform: translate(-46px, 16px); } }
+@keyframes sh-roam-8 { to { transform: translate(52px, -18px); } }
+@keyframes sh-breathe { 50% { opacity: 0.2; } }
+@keyframes sh-breathe-soft { 50% { opacity: 0.45; } }
+/* Entrance for content that replaces the hero (filter row, result count):
+   a short fade/rise so it doesn't pop while the hero glides away. */
+@keyframes sh-fade-in { from { opacity: 0; transform: translateY(6px); } }
+.sh-fade-in { animation: sh-fade-in 0.3s ease-out both; }
+.sh-roam-1 { animation: sh-roam-1 16s ease-in-out -6s infinite alternate; }
+.sh-roam-2 { animation: sh-roam-2 19s ease-in-out -9s infinite alternate; }
+.sh-roam-3 { animation: sh-roam-3 17s ease-in-out -3s infinite alternate; }
+.sh-roam-4 { animation: sh-roam-4 21s ease-in-out -14s infinite alternate; }
+.sh-roam-5 { animation: sh-roam-5 23s ease-in-out -8s infinite alternate; }
+.sh-roam-6 { animation: sh-roam-6 9s ease-in-out infinite alternate; }
+/* Mid depth — between the in-focus cluster and the far bokeh: light blur,
+   moderate opacity, intermediate travel speed, gentle breathing. */
+.sh-mid-1 {
+  filter: blur(1px); opacity: 0.75;
+  animation: sh-roam-2 20s ease-in-out -5s infinite alternate-reverse,
+             sh-breathe-soft 17s ease-in-out -6s infinite;
+}
+.sh-mid-2 {
+  filter: blur(1.2px); opacity: 0.7;
+  animation: sh-roam-3 24s ease-in-out -13s infinite alternate,
+             sh-breathe-soft 21s ease-in-out -9s infinite;
+}
+.sh-mid-3 {
+  filter: blur(1px); opacity: 0.7;
+  animation: sh-roam-4 22s ease-in-out -2s infinite alternate-reverse,
+             sh-breathe-soft 19s ease-in-out -11s infinite;
+}
+.sh-bokeh-1 {
+  filter: blur(3px); opacity: 0.5;
+  animation: sh-roam-7 26s ease-in-out -12s infinite alternate,
+             sh-breathe 14s ease-in-out -3s infinite;
+}
+.sh-bokeh-2 {
+  filter: blur(4px); opacity: 0.45;
+  animation: sh-roam-8 30s ease-in-out -19s infinite alternate,
+             sh-breathe 18s ease-in-out -7s infinite;
+}
+.sh-bokeh-3 {
+  filter: blur(2px); opacity: 0.6;
+  animation: sh-roam-7 22s ease-in-out -4s infinite alternate-reverse,
+             sh-breathe 16s ease-in-out -11s infinite;
+}
+.sh-bokeh-4 {
+  filter: blur(3.5px); opacity: 0.45;
+  animation: sh-roam-8 28s ease-in-out -8s infinite alternate-reverse,
+             sh-breathe 20s ease-in-out -5s infinite;
+}
+.sh-bokeh-5 {
+  filter: blur(2.5px); opacity: 0.55;
+  animation: sh-roam-1 24s ease-in-out -16s infinite alternate-reverse,
+             sh-breathe 15s ease-in-out -9s infinite;
+}
+/* No prefers-reduced-motion guard, deliberately: the drift is sub-pixel-per-
+   second and the owner runs macOS Reduce Motion for other reasons — they
+   explicitly chose to keep this one moving (2025-09-09). Restore the usual
+   `@media (prefers-reduced-motion: reduce) { animation: none }` block here
+   (covering .sh-roam-* and .sh-bokeh-*) if this app ever grows beyond
+   personal use. */
 
 @layer base {
   * {

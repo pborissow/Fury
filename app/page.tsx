@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import ChatTab from '@/components/ChatTab';
 import CanvasTab from '@/components/CanvasTab';
 import StatsTab, { type StatsPrefs } from '@/components/StatsTab';
+import SearchTab, { type SearchPrefs } from '@/components/SearchTab';
 import { Sun, Moon, EllipsisVertical, CircleUserRound, LogOut } from 'lucide-react';
 import Dialog from '@/components/Dialog';
 import SettingsPanel, { type ServiceSettings } from '@/components/SettingsPanel';
@@ -151,7 +152,7 @@ export default function Home() {
   }, [localhostOnly, saveSettings]);
 
   // Tab control state
-  const [activeTab, setActiveTab] = useState<'chat' | 'canvas' | 'stats'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'canvas' | 'stats' | 'search'>('chat');
 
   // Track which tabs have been mounted at least once (lazy mount + CSS hide)
   const [mountedTabs, setMountedTabs] = useState<Set<string>>(new Set(['chat']));
@@ -167,21 +168,22 @@ export default function Home() {
   // Persisted workflow ID (loaded from UI state, saved on change)
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
 
-  // Deep link from the Stats sessions table into a Chat transcript. Stats can
-  // find the expensive/bloated session but has no way to open it, so the
-  // request is lifted here (the only common ancestor) and handed to ChatTab.
-  // A monotonic `nonce` makes re-opening the SAME session re-fire the effect —
-  // without it, clicking the same row twice after navigating away would be a
-  // no-op, since the payload would be referentially identical.
+  // Deep link from another tab (Stats sessions table, Search results) into a
+  // Chat transcript. Those tabs can find the session but have no way to open
+  // it, so the request is lifted here (the only common ancestor) and handed to
+  // ChatTab. A monotonic `nonce` makes re-opening the SAME session re-fire the
+  // effect — without it, clicking the same row twice after navigating away
+  // would be a no-op, since the payload would be referentially identical.
+  // `turnIndex` (Search only) scrolls the opened transcript to that message.
   const [sessionToOpen, setSessionToOpen] = useState<
-    { sessionId: string; project: string; display: string; nonce: number } | null
+    { sessionId: string; project: string; display: string; nonce: number; turnIndex?: number } | null
   >(null);
   const openSessionNonce = useRef(0);
 
-  const handleOpenSessionFromStats = useCallback(
-    (sessionId: string, project: string, display: string) => {
+  const handleOpenSession = useCallback(
+    (sessionId: string, project: string, display: string, turnIndex?: number) => {
       openSessionNonce.current += 1;
-      setSessionToOpen({ sessionId, project, display, nonce: openSessionNonce.current });
+      setSessionToOpen({ sessionId, project, display, turnIndex, nonce: openSessionNonce.current });
       // Same render as the state set: ChatTab's SSE/effects are gated on
       // isActive, so the tab must already be 'chat' when the open fires.
       setActiveTab('chat');
@@ -200,6 +202,10 @@ export default function Home() {
   // StatsTab as initialPrefs. `undefined` until loaded; StatsTab only mounts
   // after layoutsLoaded, so it always reads the restored value (or defaults).
   const [statsPrefs, setStatsPrefs] = useState<Partial<StatsPrefs>>();
+
+  // Restored Search view prefs — same contract as statsPrefs (populated before
+  // layoutsLoaded flips, read once on SearchTab's first mount).
+  const [searchPrefs, setSearchPrefs] = useState<Partial<SearchPrefs>>();
 
   // Load UI state on mount
   useEffect(() => {
@@ -227,6 +233,12 @@ export default function Home() {
               sortKey: state.statsSortKey ?? undefined,
               sortDir: state.statsSortDir ?? undefined,
               onlyFlagged: state.statsOnlyFlagged ?? undefined,
+            });
+            setSearchPrefs({
+              query: state.searchQuery ?? undefined,
+              includeArchived: state.searchIncludeArchived ?? undefined,
+              role: state.searchRole ?? undefined,
+              sort: state.searchSort ?? undefined,
             });
           }
         }
@@ -272,6 +284,21 @@ export default function Home() {
         statsOnlyFlagged: p.onlyFlagged,
       }),
     }).catch(error => console.error('[App] Failed to save stats prefs:', error));
+  }, []);
+
+  // Persist Search view prefs (query + filters) on change. SearchTab debounces
+  // its calls alongside the search itself, so typing doesn't spam POSTs.
+  const persistSearchPrefs = useCallback((p: SearchPrefs) => {
+    fetch('/api/ui-state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        searchQuery: p.query,
+        searchIncludeArchived: p.includeArchived,
+        searchRole: p.role,
+        searchSort: p.sort,
+      }),
+    }).catch(error => console.error('[App] Failed to save search prefs:', error));
   }, []);
 
   // Debounced save for panel layout changes
@@ -405,6 +432,17 @@ export default function Home() {
               <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
             )}
           </button>
+          <button
+            onClick={() => setActiveTab('search')}
+            className={`relative py-3 text-sm font-medium transition-colors ${
+              activeTab === 'search' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            Search
+            {activeTab === 'search' && (
+              <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
+            )}
+          </button>
         </div>
 
         {/* Tab Content — lazy mount, then CSS hide to preserve state */}
@@ -457,9 +495,23 @@ export default function Home() {
             >
               <StatsTab
                 isActive={activeTab === 'stats'}
-                onOpenSession={handleOpenSessionFromStats}
+                onOpenSession={handleOpenSession}
                 initialPrefs={statsPrefs}
                 onPrefsChange={persistStatsPrefs}
+              />
+            </div>
+          )}
+
+          {layoutsLoaded && mountedTabs.has('search') && (
+            <div
+              className="absolute inset-0"
+              style={activeTab !== 'search' ? { visibility: 'hidden', pointerEvents: 'none' } : undefined}
+            >
+              <SearchTab
+                isActive={activeTab === 'search'}
+                onOpenSession={handleOpenSession}
+                initialPrefs={searchPrefs}
+                onPrefsChange={persistSearchPrefs}
               />
             </div>
           )}

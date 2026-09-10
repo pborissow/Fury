@@ -27,7 +27,7 @@ const REMIGRATE_KEY = '__fury_db_remigrate__';
 // (which reuses the globalThis-cached DB client and would NOT re-run initDb) applies
 // it without a full restart — otherwise the reloaded archiver could INSERT/SELECT a
 // column the live schema still lacks. initDb is idempotent, so re-running it is safe.
-const SCHEMA_VERSION = 2; // 2: usage_events.agent_id + subagent-usage backfill
+const SCHEMA_VERSION = 3; // 3: messages_fts full-text index (Search tab)
 
 // Under vitest, skip the startup scan (which walks the user's REAL ~/.claude and
 // re-archives sessions) so importing the DB in a test has no side effects. Tests
@@ -200,6 +200,44 @@ async function initDb(client: Client): Promise<void> {
     );
     CREATE INDEX IF NOT EXISTS idx_model_checks_at ON model_checks(checked_at DESC);
   `);
+
+  // Migration (v3): full-text index over archived message prose — the Search
+  // tab's backend (docs/plan-search-tab.md). External-content FTS5 shadowing
+  // `messages`, kept in sync by triggers, so the archiver's per-session
+  // delete-then-reinsert cycle needs ZERO archiver changes. Tokenizer:
+  // unicode61 with '-_.' as token chars keeps file names like
+  // `plan-fury-home-migration.md` as ONE token (paths split only on '/'), so
+  // phrase queries match whole paths and prefix queries match partial ones.
+  try {
+    const ftsExisted = (await client.execute(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages_fts'"
+    )).rows.length > 0;
+    await client.executeMultiple(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+        content,
+        content='messages', content_rowid='id',
+        tokenize="unicode61 remove_diacritics 2 tokenchars '-_.'"
+      );
+      CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+        INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+      END;
+    `);
+    if (!ftsExisted) {
+      // One-time backfill of rows that predate the index (new rows arrive via
+      // the triggers). ~23 ms over the full corpus at probe time.
+      await client.execute('INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages');
+    }
+  } catch (err) {
+    // FTS5 unavailable would disable Search, but must never block the archiver.
+    console.error('[DB] messages_fts migration failed:', err);
+  }
 
   // Migration: add metadata column to existing databases
   try {
