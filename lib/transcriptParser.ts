@@ -276,13 +276,41 @@ export function parseTranscriptJsonl(content: string): {
 
         // Internal user strings — slash-command markers, system reminders, and
         // the synthetic <task-notification> injected when a background task
-        // finishes — are hidden and must NOT act as a turn boundary. A
-        // task-notification is a mid-turn internal event, not a new prompt: the
-        // assistant's real reply to it flows through the pendingAssistant path
-        // below and renders as the turn's completion, exactly like any other
-        // assistant message. (Any synthetic stub it emits — e.g. "No response
-        // requested." — is dropped by provenance in the assistant branch.)
-        if (isInternalString) continue;
+        // finishes — are hidden and never render as a user bubble.
+        //
+        // But they MUST still flush a pending assistant message. In the current
+        // runtime each <task-notification> drives its OWN turn, so one can land
+        // AFTER the assistant already produced a completed turn's final text. If
+        // we merely `continue`d here (leaving pendingAssistant intact), the NEXT
+        // turn's assistant text would OVERWRITE pendingAssistant (see the single
+        // assignment below) and the earlier turn's message would be silently
+        // dropped from the transcript entirely — gone from the main flow AND
+        // unreachable via the intermediary dialog. (Observed 2026-09-05: a long
+        // end-of-turn summary replaced by the short "file monitor timing out"
+        // reply to the notification that followed it.)
+        //
+        // This can't split a normal turn: within a turn, successive assistant
+        // texts are already separated by tool_result deliveries (array-form user
+        // entries that flush at the block below), so a pendingAssistant surviving
+        // up to an internal string is only ever a genuine turn-final message.
+        //
+        // DELIBERATELY flushing on EVERY internal string, not just known turn
+        // boundaries (<task-notification> / interrupt / slash markers). The
+        // residual over-flush case — a non-meta empty/'<system-reminder>' string
+        // landing between two assistant texts with no tool_result between them —
+        // is rare (mid-turn reminders are isMeta, caught above) and merely
+        // SPLITS committed text cosmetically. Narrowing the flush would trade
+        // that for the failure mode this fix exists to kill: any narrowed-away
+        // string reverts to continue-without-flush, silently DROPPING the prior
+        // turn's final. Fail toward the split, never the drop.
+        if (isInternalString) {
+          if (pendingAssistant) {
+            pendingAssistant.turnMeta = snapshotTurnMeta();
+            messages.push(pendingAssistant);
+            pendingAssistant = null;
+          }
+          continue;
+        }
 
         // Tool results are arrays (never displayed as user messages) but must
         // still flow through to flush the pending assistant turn below.

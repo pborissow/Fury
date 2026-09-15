@@ -45,6 +45,14 @@ const bgChangedTyped = (tasks: Array<{ id: string; type: string }>) => ({
   tasks: tasks.map((t) => ({ task_id: t.id, task_type: t.type, description: 'work' })),
 });
 
+/** Terminal task_notification edge — the per-task end-of-life signal (2.1.26x). */
+const notifEdge = (id: string, status: string) => ({
+  type: 'system',
+  subtype: 'task_notification',
+  task_id: id,
+  status,
+});
+
 afterEach(() => {
   const sessions = (sdkSessionManager as unknown as { sessions: Map<string, unknown> }).sessions;
   for (const id of createdIds.splice(0)) sessions.delete(id);
@@ -71,18 +79,80 @@ describe('background_tasks_changed → liveness', () => {
     expect([...s.backgroundTasks]).toEqual(['t3']);
   });
 
-  it('an empty payload clears liveness (last task completed)', () => {
+  it('a task completion (level shrink + terminal edge) HOLDS liveness for its notification turn, then clears', () => {
+    // 2.1.26x turn model (docs/ticket-subagent-notification-turns-intermediate-
+    // bubbles.md), wire shape pinned live 2026-09-09: a completing task emits a
+    // level shrink followed by a terminal task_notification edge, and its
+    // notification turn starts ~1-2s later. Neither boundary beat may read idle
+    // (the dark-dot gap): the level→edge beat is covered by the NOTIF_BRIDGE
+    // micro-hold, the edge→turn gap by the expected-notification hold.
     const s = newSession('bg-3');
     mgr.handle(s, bgChanged(['t1']));
     expect(mgr.isBackgroundActive('bg-3')).toBe(true);
-    const cap = captureHealth();
-    mgr.handle(s, bgChanged([]));
-    cap.stop();
 
+    mgr.handle(s, bgChanged([])); // level shrink first…
     expect(s.backgroundTasks.size).toBe(0);
+    expect(mgr.isBackgroundActive('bg-3')).toBe(true); // bridge holds the beat
+    mgr.handle(s, notifEdge('t1', 'completed')); // …then the terminal edge
+    expect(s.pendingNotifications).toBe(1);
+    expect(mgr.isBackgroundActive('bg-3')).toBe(true); // held for the imminent turn
+
+    // The expected notification turn arrives (re-assert consumes the hold)…
+    mgr.handle(s, {
+      type: 'stream_event',
+      parent_tool_use_id: null,
+      event: { type: 'message_start', message: { id: 'm-notif', usage: {} } },
+    });
+    expect(s.pendingNotifications).toBe(0);
+    // …and completes: NOW everything is quiescent (bridge notwithstanding —
+    // its 2s stamp is measured from the shrink, expire it to assert the state).
+    mgr.handle(s, { type: 'result', parent_tool_use_id: null, subtype: 'success' });
+    s.notifBridgeUntil = 0;
     expect(mgr.isBackgroundActive('bg-3')).toBe(false);
     expect(mgr.getBackgroundActiveSessionIds()).not.toContain('bg-3');
-    expect(cap.events.find((e) => e.sessionId === 'bg-3')?.backgroundActive).toBe(false);
+  });
+
+  it('a TERMINAL task_notification edge removes the task from the set (level signal lost)', () => {
+    // The "Form Refinement" wedge (2026-09-09): a task terminal-notified 16s
+    // before turn end sat in the set until the 120s wedge-heal because the
+    // clearing level signal never came. The edge is authoritative for that task.
+    const s = newSession('bg-edge-remove');
+    mgr.handle(s, bgChanged(['t1', 't2']));
+    mgr.handle(s, notifEdge('t1', 'completed'));
+    expect([...s.backgroundTasks]).toEqual(['t2']); // t1 gone without a level signal
+    // Non-terminal / malformed statuses leave membership to the level/wedge-heal.
+    mgr.handle(s, { type: 'system', subtype: 'task_notification', task_id: 't2', status: 'running' });
+    expect([...s.backgroundTasks]).toEqual(['t2']);
+  });
+
+  it('a MID-MAIN-TURN bash notification is absorbed — no expected-turn hold accrues (the +7 leak)', () => {
+    const s = newSession('bg-absorbed');
+    // A real user turn is streaming (userPrompt non-empty = main turn).
+    s.isProcessing = true;
+    s.streamBuffer = { userPrompt: 'do the thing', accumulatedText: '', events: [], isActive: true, startedAt: Date.now() };
+    mgr.handle(s, bgChangedTyped([{ id: 'b1', type: 'local_bash' }]));
+    mgr.handle(s, notifEdge('b1', 'completed'));
+    expect(s.backgroundTasks.size).toBe(0);
+    expect(s.pendingNotifications ?? 0).toBe(0); // absorbed by the running turn — no phantom hold
+
+    // The turn ends: nothing predicted, bridge aside — no 120s answer-hiding tail.
+    mgr.handle(s, { type: 'result', parent_tool_use_id: null, subtype: 'success' });
+    s.notifBridgeUntil = 0;
+    expect(mgr.isBackgroundActive('bg-absorbed')).toBe(false);
+  });
+
+  it('the expected-notification hold self-heals once its grace expires (killed task, no turn)', () => {
+    const s = newSession('bg-3-heal');
+    mgr.handle(s, bgChanged(['t1']));
+    mgr.handle(s, bgChanged([]));
+    mgr.handle(s, notifEdge('t1', 'completed')); // → pendingNotifications = 1, grace stamped
+    expect(mgr.isBackgroundActive('bg-3-heal')).toBe(true);
+
+    // No notification turn ever arrives (batched away / lost).
+    s.notifExpectedUntil = Date.now() - 1;
+    s.notifBridgeUntil = 0;
+    expect(mgr.isBackgroundActive('bg-3-heal')).toBe(false);
+    expect(s.pendingNotifications).toBe(0); // healed, can't wedge the dots on
   });
 
   it('self-heals a WEDGED set: idle main turn + stale + no activity clears it (lost clearing signal)', () => {
@@ -99,6 +169,30 @@ describe('background_tasks_changed → liveness', () => {
 
     expect(mgr.isBackgroundActive('bg-wedge')).toBe(false); // healed
     expect(s.backgroundTasks.size).toBe(0); // wedged set dropped
+  });
+
+  it('a lazy self-heal observed by a PULL converges the PUSH record immediately (no reconcile lag)', () => {
+    // Pre-v40, the wedge-heal fired lazily inside computeBackgroundActive on a
+    // PULL/heartbeat that never emitted the drop — PULL said idle while the
+    // last PUSH said 'background' until the 8s reconcile tick (the owner-
+    // session PULL/PUSH drift in dual-session-liveness, 2026-09-08 run).
+    const s = newSession('bg-heal-converge');
+    mgr.handle(s, bgChanged(['t1']));
+    s.isProcessing = false;
+    mgr.reconcileBackgroundActivity(); // registers the active level (lastBgActive true)
+    s.lastBgActivityAt = Date.now() - 4 * 60_000; // …then silence past the grace
+
+    const cap = captureHealth();
+    const lv = mgr.getLiveness('bg-heal-converge'); // this PULL triggers the heal
+    const lv2 = mgr.getLiveness('bg-heal-converge'); // later observers must no-op
+    cap.stop();
+
+    expect(lv?.backgroundActive).toBe(false);
+    expect(lv2?.backgroundActive).toBe(false);
+    const emits = cap.events.filter((e) => e.sessionId === 'bg-heal-converge');
+    expect(emits, 'exactly ONE converging PUSH, from the first observer').toHaveLength(1);
+    expect(emits[0].backgroundActive).toBe(false);
+    expect(emits[0].liveness?.phase).toBe('idle');
   });
 
   it('does NOT over-clear while signals are still fresh (a genuinely live task stays live)', () => {

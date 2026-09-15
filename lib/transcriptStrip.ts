@@ -39,3 +39,41 @@ export function stripInFlightPartials<T extends { role: string; timestamp?: stri
   while (end > 0 && messages[end - 1].role === 'assistant') end--;
   return messages.slice(0, end);
 }
+
+/**
+ * The COMMITTED intermediate assistant messages of an open logical-task
+ * ENVELOPE (docs/ticket-subagent-notification-turns-intermediate-bubbles.md).
+ *
+ * Since Claude Code 2.1.26x, one user send can span many result-terminated
+ * turns (each background-task <task-notification> drives its own turn). While
+ * the envelope is open the main transcript flow hides everything committed
+ * at/after `envelopeStartedAt` (via stripInFlightPartials with that anchor);
+ * THIS selects the subset the dots-bubble modal shows on demand:
+ *
+ *  - assistant messages only (the envelope's opening user send is represented
+ *    by the overlay bubble; internal <task-notification> user strings never
+ *    leave the parser);
+ *  - committed at/after the envelope's opening turn start;
+ *  - EXCLUDING the currently-streaming turn's own in-flight partials
+ *    (timestamp ≥ `turnStartedAt`, when a main turn is active) — those are
+ *    exactly what stripInFlightPartials has always kept off screen mid-turn,
+ *    and they'd render as half-finished duplicates of the turn's final. Pass
+ *    `turnStartedAt: null` outside the main-turn phase (liveness.startedAt is
+ *    null there) so every committed message of the envelope is shown.
+ *
+ * Pure so it can be unit-tested and shared (same contract style as
+ * stripInFlightPartials above).
+ */
+export function envelopeHiddenMessages<T extends { role: string; timestamp?: string }>(
+  messages: T[],
+  envelopeStartedAt: number,
+  turnStartedAt: number | null,
+): T[] {
+  return messages.filter((m) => {
+    if (m.role !== 'assistant' || !m.timestamp) return false;
+    const t = Date.parse(m.timestamp);
+    if (!Number.isFinite(t) || t < envelopeStartedAt) return false;
+    if (typeof turnStartedAt === 'number' && t >= turnStartedAt) return false;
+    return true;
+  });
+}

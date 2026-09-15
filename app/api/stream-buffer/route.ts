@@ -36,6 +36,14 @@ export async function GET(req: NextRequest) {
   // the main turn is idle — docs/ticket-live-badge-dark-during-background-subagent.md.
   const backgroundActive = sdkSessionManager.isBackgroundActive(sessionId);
 
+  // The SSOT liveness projection — carried here (in addition to /api/health and
+  // the session:health PUSH) so a session switch/restore mid-task can rebuild
+  // the envelope view (hidden intermediate messages + dots-bubble badge) from
+  // `liveness.envelopeStartedAt` on the very first paint, instead of waiting for
+  // the next heartbeat beat. Null for CLI-only sessions — client falls back to
+  // the legacy fields (docs/ticket-subagent-notification-turns-intermediate-bubbles.md).
+  const liveness = sdkSessionManager.getLiveness(sessionId);
+
   // A question the SDK session is parked on, awaiting this user. Server-held
   // state is the ONLY source of a pending question on the SDK path — the JSONL
   // replay that serves the CLI path can't answer one (it has no toolUseID), so
@@ -63,6 +71,7 @@ export async function GET(req: NextRequest) {
       hasBuffer: false,
       isProcessing,
       backgroundActive,
+      liveness,
       pendingAsk,
       mcpFailed,
       pendingLimit,
@@ -73,6 +82,7 @@ export async function GET(req: NextRequest) {
     hasBuffer: true,
     isProcessing,
     backgroundActive,
+    liveness,
     userPrompt: buffer.userPrompt,
     accumulatedText: buffer.accumulatedText,
     events: buffer.events,

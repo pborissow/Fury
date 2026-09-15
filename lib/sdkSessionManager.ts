@@ -169,6 +169,17 @@ interface SdkSession {
   // wedge a stale "live". Per-process — reset to empty whenever a new CLI is spawned
   // (startQuery) and on teardown (stop/kill).
   backgroundTasks: Set<string>;
+  // task_id → task_type for the CURRENT set, maintained alongside it (level
+  // REPLACE rebuilds it; a terminal task_notification deletes its entry; all
+  // clear sites clear both). Consumed ONLY by the ENVELOPE-hold predicate
+  // (envelopeHoldActive): a wait that consists solely of detached shells
+  // ('local_bash') does not hide the finished answer — liveness itself still
+  // never branches on task kind (2026-08-21 decision unchanged). Wire values
+  // pinned live 2026-09-09: 'local_agent' (Task subagents), 'local_bash'
+  // (backgrounded shells); anything unknown counts as agentic (fail toward
+  // hiding, the ticket's behavior). Optional so adopted pre-v41 records read
+  // as "unknown" rather than crash.
+  backgroundTaskTypes?: Map<string, string>;
   // Whether a background_tasks_changed LEVEL signal has arrived for the CURRENT CLI
   // process. Until it has, backgroundActive falls back to a durable scan of the
   // session's subagent transcripts on disk — so a subagent already in flight when
@@ -205,6 +216,38 @@ interface SdkSession {
   // level (emitHealth) so the client can ignore an out-of-order/duplicate beat.
   // A PULL (/api/health) reads the current value without bumping it.
   livenessSeq?: number;
+  // --- Logical-task ENVELOPE (docs/ticket-subagent-notification-turns-
+  // intermediate-bubbles.md). One user send can now span MANY result-terminated
+  // turns (each <task-notification> completion drives its own turn), so "the
+  // turn" is no longer the user-facing unit of work. The envelope is: from the
+  // first turn of the task (sendMessage, or a notification turn re-asserting
+  // while idle) until the session is quiescent (smoothed phase `idle`). The
+  // client hides assistant messages committed at/after this anchor while the
+  // envelope is open (they surface via the dots-bubble modal instead).
+  //
+  // Opened by sendMessage/reassertProcessing (only when null — a notification
+  // turn mid-envelope must NOT move the anchor), closed by deriveLiveness the
+  // moment the smoothed phase resolves to `idle`, and by interrupt() (the user
+  // ended the task on purpose). Nullable number, not just number, so an adopted
+  // pre-v39 session record reads as "no envelope" and heals on its next turn.
+  envelopeStartedAt?: number | null;
+  // How many task-notification turns are still EXPECTED but not yet started:
+  // incremented when a task leaves the `backgroundTasks` set (its notification
+  // turn is imminent) and by a result's `queued_turn_count`; decremented when a
+  // turn re-asserts while idle (the expected turn arrived). Never trusted
+  // unboundedly — see notifExpectedUntil.
+  pendingNotifications?: number;
+  // Deadline for the pendingNotifications smoothing (NOTIF_TURN_GRACE_MS past
+  // the last boundary signal, re-stamped at each turn end while notifications
+  // are pending so the grace measures from when the wait actually starts). Past
+  // it with no turn, the counter self-heals to 0 — a killed task / a CLI that
+  // batched notifications can't wedge the dots on.
+  notifExpectedUntil?: number;
+  // Departure→terminal-edge micro-bridge (NOTIF_BRIDGE_MS): stamped when tasks
+  // leave the level set, so the beat before their terminal task_notification
+  // edge lands can't flash idle. Self-expiring; zeroed with pendingNotifications
+  // on the deliberate teardowns.
+  notifBridgeUntil?: number;
   // The user's chosen model for this session, or undefined for the CLI default.
   // Load-bearing in TWO places, because the query object comes and goes:
   //   1. Pushed live via Query.setModel() when a query is open (no restart).
@@ -310,6 +353,29 @@ const SUBAGENT_RUNNING_WINDOW_MS = 120_000;
  *  clock via task_* edges / subagent writes well inside this, so only a truly
  *  silent (wedged) set reaches it. */
 const WEDGED_BG_GRACE_MS = SUBAGENT_RUNNING_WINDOW_MS;
+
+/** Boundary smoothing for the notification-turn model
+ *  (docs/ticket-subagent-notification-turns-intermediate-bubbles.md): when a
+ *  background task completes, its <task-notification> drives a NEW turn moments
+ *  later — but between the previous turn's `result` and that turn's first
+ *  stream event the raw projection reads `idle` for a tick or two (the dark-dot
+ *  gap / PULL-vs-PUSH drift the live suite pinned). While a notification turn
+ *  is expected (`pendingNotifications > 0`), the projection holds `background`
+ *  for up to this long past the last boundary signal; if no turn arrives the
+ *  counter self-heals to zero so a lost/killed notification can't pin the dots
+ *  on. Grace, not correctness: the imminent turn normally lands well within it. */
+const NOTIF_TURN_GRACE_MS = Number(process.env.FURY_NOTIF_TURN_GRACE_MS ?? '10000');
+
+/** Micro-bridge between a `background_tasks_changed` DEPARTURE and its terminal
+ *  `task_notification` edge. The two arrive as separate messages (level first —
+ *  wire evidence 2026-09-09), so for a beat the set can be empty while
+ *  `pendingNotifications` is still 0: an emit or PULL landing in that beat would
+ *  flash `idle`, tear down the dots, and flash-reveal the envelope — then re-hide
+ *  milliseconds later. Departures stamp this short self-expiring hold instead of
+ *  touching the counter (which is what leaked under mid-turn absorption); the
+ *  edge that follows takes over with the real expected-turn hold. A departure
+ *  with NO edge (killed task) costs at most this long of phantom background. */
+const NOTIF_BRIDGE_MS = 2_000;
 
 /** Liveness probe: signal 0 throws iff the pid is gone (or not ours to signal). */
 function pidAlive(pid: number): boolean {
@@ -544,6 +610,14 @@ class SdkSessionManager {
       isActive: true,
       startedAt: Date.now(),
     };
+
+    // Open the logical-task ENVELOPE at this turn's start — but only when one
+    // isn't already open: a send issued during the background phase (scouts
+    // still running) continues the SAME logical task, and moving the anchor
+    // forward would reveal the earlier intermediate turns' bubbles above the
+    // still-lit dots (the exact forbidden visual). Closed by deriveLiveness on
+    // quiescence / by interrupt().
+    if (s.envelopeStartedAt == null) s.envelopeStartedAt = s.streamBuffer.startedAt;
 
     // Reset the per-turn tally. eventBus's SessionUsageEvent documents
     // turnTokens as "accrued so far in the in-flight turn", but this map lives
@@ -1114,6 +1188,21 @@ class SdkSessionManager {
       // if the user resends first, must be ignored (P2). Gating on this flag is what
       // stops the guard from swallowing a fresh turn's own output-less error (R2).
       if (wasProcessing) s.expectStaleResult = true;
+      // The user ended this logical task on purpose — close the ENVELOPE and drop
+      // any expected-notification hold, so the transcript reveals what happened
+      // instead of hiding it behind a modal for a task that is no longer running.
+      //
+      // backgroundTasks is deliberately NOT cleared (interrupt ≠ stop: the query
+      // and its dispatched subagents may genuinely live on), so the emitHealth
+      // below can land in phase `background` — where deriveLiveness's backstop
+      // re-opens a fresh envelope anchored at NOW. That is the intended shape:
+      // everything committed up to this interrupt is revealed (an at-NOW anchor
+      // hides nothing that exists yet), while any LATER notification-turn output
+      // is enveloped as usual. The backstop must never anchor at the closed
+      // buffer's startedAt or it would re-hide the reveal (see deriveLiveness).
+      s.envelopeStartedAt = null;
+      s.pendingNotifications = 0;
+      s.notifBridgeUntil = 0;
       this.closeBuffer(s);
       this.emitHealth(s, false);
     }
@@ -1142,8 +1231,14 @@ class SdkSessionManager {
     s.abortController = undefined;
     s.isProcessing = false;
     // The process is being torn down, so any background work it hosted is gone —
-    // drop the set so it can't keep the session reading "live".
+    // drop the set so it can't keep the session reading "live". Same for the
+    // expected-notification hold and the logical-task envelope: no process, no
+    // imminent notification turn, and the transcript should read as settled.
     s.backgroundTasks.clear();
+    s.backgroundTaskTypes?.clear();
+    s.pendingNotifications = 0;
+    s.notifBridgeUntil = 0;
+    s.envelopeStartedAt = null;
     this.closeBuffer(s);
     this.emitHealth(s, false);
   }
@@ -1174,6 +1269,10 @@ class SdkSessionManager {
     s.abortController = undefined;
     s.isProcessing = false;
     s.backgroundTasks.clear();
+    s.backgroundTaskTypes?.clear();
+    s.pendingNotifications = 0;
+    s.notifBridgeUntil = 0;
+    s.envelopeStartedAt = null;
     // Drop the Anthropic pin, in memory and on disk, so neither this turn nor a
     // later restart replays it into the new provider.
     s.model = undefined;
@@ -1204,6 +1303,10 @@ class SdkSessionManager {
       s.abortController = undefined;
       s.isProcessing = false;
       s.backgroundTasks.clear();
+      s.backgroundTaskTypes?.clear();
+      s.pendingNotifications = 0;
+      s.notifBridgeUntil = 0;
+      s.envelopeStartedAt = null;
     }
     // Hard-kill any CLI process registered to this session by PID. The
     // abortController only references the CURRENT query, but interrupt/rewind
@@ -1577,7 +1680,15 @@ class SdkSessionManager {
   getBackgroundActiveSessionIds(): string[] {
     const ids: string[] = [];
     for (const [id, s] of this.sessions) {
-      if (s.q && this.computeBackgroundActive(s)) ids.push(id);
+      if (!s.q) continue;
+      if (this.computeBackgroundActive(s)) {
+        this.lastBgActive.set(id, true);
+        ids.push(id);
+      } else {
+        // The live-set recompute is another frequent lazy-heal trigger — make
+        // it converge the PUSH record too (see noteBackgroundDrop).
+        this.noteBackgroundDrop(s);
+      }
     }
     return ids;
   }
@@ -1645,9 +1756,57 @@ class SdkSessionManager {
         data: { count: s.backgroundTasks.size, staleForMs },
       });
       s.backgroundTasks.clear();
+      s.backgroundTaskTypes?.clear();
     }
+    // Notification-turn boundary smoothing (docs/ticket-subagent-notification-
+    // turns-intermediate-bubbles.md): a task that just left the set (or a
+    // result's queued_turn_count) predicts a NEW turn moments from now. Holding
+    // background-active across that result→next-turn gap is what keeps the dots
+    // lit and the phase non-idle mid-envelope instead of flashing idle for a
+    // tick at every boundary. Only while the main turn is IDLE: mid-turn the
+    // main-turn phase owns liveness, and the grace clock must not run (the
+    // queued notification waits behind the turn — the `result` handler
+    // re-stamps the deadline when the wait actually starts). Past the grace
+    // with no turn (killed task, batched notifications), self-heal to zero so
+    // the dots can't wedge on.
+    if (!s.isProcessing && (s.pendingNotifications ?? 0) > 0) {
+      if (Date.now() < (s.notifExpectedUntil ?? 0)) return true;
+      log.info('sdk.bg', 'cleared expected-notification hold (grace expired, no turn)', {
+        sessionId: s.sessionId,
+        corrId: s.sessionId,
+        data: { pendingNotifications: s.pendingNotifications },
+      });
+      s.pendingNotifications = 0;
+    }
+    // Departure→terminal-edge micro-bridge (see NOTIF_BRIDGE_MS): a task just
+    // left the level set and its terminal notification edge is a beat away —
+    // don't flash idle in between. Self-expiring, no heal/log needed.
+    if (!s.isProcessing && Date.now() < (s.notifBridgeUntil ?? 0)) return true;
     if (s.sawBackgroundLevelSignal) return false;
     return this.hasRecentSubagentActivity(s);
+  }
+
+  /**
+   * Should the logical-task ENVELOPE stay open for the current background state?
+   * True while more MODEL output is genuinely expected: a notification turn is
+   * pending, or a non-shell background task (a 'local_agent' scout, a workflow,
+   * anything of unknown kind — fail toward hiding) is still registered. False
+   * for a wait sustained ONLY by detached 'local_bash' shells: their eventual
+   * notification opens a FRESH envelope via reassertProcessing, but the answer
+   * that already landed must not hide behind them (the "Form Refinement"
+   * incident, 2026-09-09). DELIBERATELY scoped to the envelope: liveness/phase
+   * still never branches on task kind (2026-08-21 decision) — this only decides
+   * what the transcript hides, not whether the session reads live.
+   */
+  private envelopeHoldActive(s: SdkSession): boolean {
+    if ((s.pendingNotifications ?? 0) > 0) return true;
+    // Bridge counts too: the departed task's terminal edge (and possibly its
+    // notification turn) is a beat away — don't flash-reveal in the gap.
+    if (Date.now() < (s.notifBridgeUntil ?? 0)) return true;
+    for (const id of s.backgroundTasks) {
+      if ((s.backgroundTaskTypes?.get(id) ?? 'unknown') !== 'local_bash') return true;
+    }
+    return false;
   }
 
   /**
@@ -1735,8 +1894,48 @@ class SdkSessionManager {
   private heartbeatTick(): void {
     for (const [, s] of this.sessions) {
       if (!s.q) continue;
-      if (s.isProcessing || this.computeBackgroundActive(s)) this.emitHealth(s, s.isProcessing);
+      const active = this.computeBackgroundActive(s);
+      if (s.isProcessing || active) {
+        if (active) this.lastBgActive.set(s.sessionId, true);
+        this.emitHealth(s, s.isProcessing);
+      } else {
+        // computeBackgroundActive may have JUST self-healed (wedged set /
+        // expired notification hold) in the call above. The old "emit only if
+        // still active" shape swallowed that edge — the PUSH record kept saying
+        // 'background' until the 8s reconcile tick noticed. Converge it now.
+        this.noteBackgroundDrop(s);
+      }
     }
+  }
+
+  /**
+   * Converge the PUSH record when backgroundActive is OBSERVED to have dropped
+   * outside an emitting path. computeBackgroundActive self-heals lazily (the
+   * wedged-set clear, the expected-notification hold expiry) on whichever
+   * caller touches it first — and until this existed, two frequent callers
+   * never emitted the drop: the heartbeat (gated on "still active") and the
+   * PULL accessors (getLiveness / getBackgroundActiveSessionIds). Until the 8s
+   * reconcile tick noticed the transition, a PULL said `idle` while the last
+   * PUSH still said `background` — the exact PULL-vs-PUSH drift
+   * dual-session-liveness pins (owner session, 4 consecutive ticks at the
+   * wedge-grace boundary, 2026-09-08 run).
+   *
+   * Transition-gated on the SAME lastBgActive map reconcile uses, so whoever
+   * observes the drop first emits exactly once and every later observer
+   * no-ops; mirrors reconcile's rules — a processing main turn drives its own
+   * health (map update only), and the true→false edge fires the
+   * trailing-subagent-usage archival that used to hang solely off reconcile.
+   * Callers that observe the level ACTIVE set the map true for the same
+   * reason: a surface that told the world 'background' takes on the obligation
+   * to converge the drop later.
+   */
+  private noteBackgroundDrop(s: SdkSession): void {
+    const id = s.sessionId;
+    if (!this.lastBgActive.get(id)) return; // wasn't background-live — nothing to converge
+    this.lastBgActive.set(id, false);
+    if (s.isProcessing) return; // the main turn's own emits carry the level
+    this.emitHealth(s, false);
+    this.archiveTrailingSubagentUsage(s);
   }
 
   private reconcileBackgroundActivity(): void {
@@ -2114,7 +2313,13 @@ class SdkSessionManager {
     // let the fresh process repopulate it — otherwise a stale task from the prior
     // process would pin the session "live" until the next membership change.
     s.backgroundTasks.clear();
+    s.backgroundTaskTypes?.clear();
     s.sawBackgroundLevelSignal = false;
+    // Stale notification predictions die with the old process too — a fresh CLI
+    // re-announces its own task lifecycle. (The ENVELOPE is deliberately left
+    // alone: sendMessage opens/keeps it for the turn this spawn serves.)
+    s.pendingNotifications = 0;
+    s.notifBridgeUntil = 0;
 
     const cwd = s.projectPath || process.cwd();
     const existing = findSessionJsonlDir(s.sessionId, cwd) !== null;
@@ -2319,9 +2524,32 @@ class SdkSessionManager {
           // badge + dots lit across the WHOLE background window, not just its main
           // turns (docs/ticket-live-badge-dark-during-background-subagent.md).
           const tasks = Array.isArray(anyMsg.tasks) ? anyMsg.tasks : [];
-          s.backgroundTasks = new Set<string>(
-            tasks.map((t: { task_id?: unknown }) => t?.task_id).filter((id: unknown): id is string => typeof id === 'string'),
-          );
+          const nextTasks = new Set<string>();
+          const nextTypes = new Map<string, string>();
+          for (const t of tasks as Array<{ task_id?: unknown; task_type?: unknown }>) {
+            if (typeof t?.task_id !== 'string') continue;
+            nextTasks.add(t.task_id);
+            // Task KIND, kept for the ENVELOPE-hold predicate ONLY (never for
+            // liveness — that decision stands, 2026-08-21). Live-pinned wire
+            // values (2026-09-09): 'local_agent' for Task subagents,
+            // 'local_bash' for backgrounded shells.
+            if (typeof t.task_type === 'string') nextTypes.set(t.task_id, t.task_type);
+          }
+          // NOTE: departures are deliberately NOT counted toward
+          // pendingNotifications here anymore. The 2026-09-09 wire evidence
+          // (session 9f894cd2, "Form Refinement") showed set departures and
+          // terminal task_notification edges arrive in the same batch — and that
+          // notifications delivered MID-main-turn are ABSORBED by the running
+          // turn (no dedicated turn ever follows), so departure-counting leaked
+          // the counter upward (observed +7) and manufactured phantom
+          // expected-turn holds after the turn ended. The terminal-edge handler
+          // below is the accurate signal; departures here only stamp the
+          // NOTIF_BRIDGE_MS micro-hold so the level→edge beat can't flash idle.
+          let departed = 0;
+          for (const id of s.backgroundTasks) if (!nextTasks.has(id)) departed++;
+          if (departed > 0) s.notifBridgeUntil = Date.now() + NOTIF_BRIDGE_MS;
+          s.backgroundTasks = nextTasks;
+          s.backgroundTaskTypes = nextTypes;
           // The live level is now authoritative for this process; stop using the
           // durable disk fallback (it would otherwise linger for the staleness window
           // after the last task completes).
@@ -2343,6 +2571,7 @@ class SdkSessionManager {
             data: {
               count: s.backgroundTasks.size,
               types: tasks.map((t: { task_type?: unknown }) => t?.task_type),
+              pendingNotifications: s.pendingNotifications ?? 0,
             },
           });
           // Re-emit health so the events route recomputes the live set and the
@@ -2350,18 +2579,68 @@ class SdkSessionManager {
           // (unchanged); emitHealth attaches the current backgroundActive flag.
           this.emitHealth(s, s.isProcessing);
         } else if (typeof anyMsg.subtype === 'string' && anyMsg.subtype.startsWith('task_')) {
-          // Observability for the background-task lifecycle EDGES: task_started /
-          // task_notification / task_updated / task_progress. The v24 liveness fix
-          // keys on the background_tasks_changed LEVEL signal above (confirmed to
-          // fire for real CLI subagents — tests/live-sessions/background-subagent-
-          // liveness.spec.ts); these edges are logged for diagnosis and are the
-          // fallback signal if the level ever proves unreliable. Low-noise: scoped
-          // to task_* so per-token `status`/`thinking_tokens` don't spam the log.
+          // Background-task lifecycle EDGES: task_started / task_notification /
+          // task_updated / task_progress. Membership still keys primarily on the
+          // background_tasks_changed LEVEL above — but the TERMINAL notification
+          // edge is now load-bearing too (below), because the level signal
+          // demonstrably fails to remove finished tasks near turn end (2026-09-09,
+          // session 9f894cd2: a task terminal-notified at 08:50:16 sat in the set
+          // until the 120s wedge-heal, pinning dots + the envelope over a finished
+          // answer). Low-noise: scoped to task_* so per-token `status` spam stays out.
           //
           // Also a liveness heartbeat for the wedge-heal: an active background task
           // emits these edges, so refreshing the clock here keeps a genuinely-live
           // task's dots lit even if a membership-level signal is sparse.
           s.lastBgActivityAt = Date.now();
+          // TERMINAL task_notification {task_id, status: completed|failed|stopped}
+          // — the per-task end-of-life fact the level signal sometimes never
+          // reflects. Two duties (wire evidence 2026-09-09):
+          //   1. MEMBERSHIP: drop the task from the set/types now, so a finished
+          //      task can't wedge the projection for the whole grace after its
+          //      turn ends. The next level payload (REPLACE) stays authoritative;
+          //      unknown/other statuses are left for the level/wedge-heal.
+          //   2. EXPECTED-TURN counting (replaces the old departure counting):
+          //      a notification delivered while IDLE starts its own turn within
+          //      ~1-2s (scout runs) — count it so the boundary doesn't flash
+          //      idle. Delivered mid-NOTIFICATION-turn (userPrompt ''), reports
+          //      queue their own turns — count. Delivered mid-MAIN-turn, a
+          //      local_bash report is ABSORBED by the running turn (session
+          //      9f894cd2's 7-min turn) — do NOT count; an agentic
+          //      (non-local_bash) report is counted anyway: if it too gets
+          //      absorbed, the cost is one ≤NOTIF_TURN_GRACE_MS hold, vs a
+          //      flash-reveal + dark tick if it queues and we didn't count it.
+          if (
+            anyMsg.subtype === 'task_notification' &&
+            typeof anyMsg.task_id === 'string' &&
+            (anyMsg.status === 'completed' || anyMsg.status === 'failed' || anyMsg.status === 'stopped')
+          ) {
+            const taskType = s.backgroundTaskTypes?.get(anyMsg.task_id);
+            const removed = s.backgroundTasks.delete(anyMsg.task_id);
+            s.backgroundTaskTypes?.delete(anyMsg.task_id);
+            const mainTurnAbsorbs =
+              s.isProcessing && (s.streamBuffer?.userPrompt ?? '') !== '' && taskType === 'local_bash';
+            if (!mainTurnAbsorbs) {
+              s.pendingNotifications = (s.pendingNotifications ?? 0) + 1;
+              s.notifExpectedUntil = Date.now() + NOTIF_TURN_GRACE_MS;
+            }
+            log.info('sdk.bg', 'task terminal notification', {
+              sessionId: s.sessionId,
+              corrId: s.sessionId,
+              data: {
+                taskId: anyMsg.task_id,
+                status: anyMsg.status,
+                taskType: taskType ?? null,
+                removedFromSet: removed,
+                counted: !mainTurnAbsorbs,
+                pendingNotifications: s.pendingNotifications ?? 0,
+                remaining: s.backgroundTasks.size,
+              },
+            });
+            // Re-project promptly: membership/pending just moved, and while idle
+            // this is what flips a drained shell-only wait to a revealed answer
+            // (envelope close) without waiting for the next heartbeat.
+            this.emitHealth(s, s.isProcessing);
+          }
           log.debug('sdk.sys', anyMsg.subtype, {
             sessionId: s.sessionId,
             corrId: s.sessionId,
@@ -2582,10 +2861,16 @@ class SdkSessionManager {
         // `if (anyMsg.parent_tool_use_id != null) break;` was ALWAYS dead code:
         // the value is forever undefined and the guard never fired. It was added
         // in v18 for a hypothetical top-level subagent result that the SDK never
-        // emits. Every result ends the current turn; the re-assert on the next
-        // turn's stream activity (above) is what keeps a burst of background-task
-        // turns live. If a real subagent-result discriminator ever appears in the
-        // SDK, key on THAT — don't resurrect the parent_tool_use_id check.
+        // emits. Every result ends the current turn — but since Claude Code
+        // 2.1.26x a TURN is no longer the user-facing unit of work: Task
+        // subagents run as background tasks and each <task-notification>
+        // completion drives its own turn, so one user send produces MANY results
+        // (docs/ticket-subagent-notification-turns-intermediate-bubbles.md). The
+        // re-assert on the next turn's stream activity (above) plus the
+        // logical-task ENVELOPE (deriveLiveness) are what keep that burst of
+        // turns reading as ONE in-progress task. If a real subagent-result
+        // discriminator ever appears in the SDK, key on THAT — don't resurrect
+        // the parent_tool_use_id check.
         //
         // TURN-IDENTITY GUARD (P2): interrupt() intentionally leaves the query
         // alive, so a stopped turn's trailing `result` can still arrive here AFTER
@@ -2650,8 +2935,20 @@ class SdkSessionManager {
               ttftMs: anyMsg.ttft_ms ?? null,
               warmSpare: anyMsg.warm_spare_claimed ?? false,
               costUsd: anyMsg.total_cost_usd ?? null,
+              queuedTurnCount: anyMsg.queued_turn_count ?? null,
             },
           });
+          // `queued_turn_count > 0` means at least one more user turn (and
+          // result) follows WITHOUT further input (sdk.d.ts) — the logical task
+          // is not done. Fold it into the pending count so the projection holds
+          // the envelope open across that boundary too. Max, not add: queued
+          // sends and already-counted task departures overlap and this counter
+          // only needs to predict "another turn is imminent", not the exact
+          // number (reassert decrements; the grace self-heals any excess).
+          if (typeof anyMsg.queued_turn_count === 'number' && anyMsg.queued_turn_count > 0) {
+            s.pendingNotifications = Math.max(s.pendingNotifications ?? 0, anyMsg.queued_turn_count);
+            s.notifExpectedUntil = Date.now() + NOTIF_TURN_GRACE_MS;
+          }
           // The SDK can report `subtype: 'success'` on a result that is actually an
           // error — it sets `is_error: true` (+ `api_error_status`) on it. Error
           // surfacing lives entirely in the `else` (non-success) branch, so without
@@ -2759,6 +3056,15 @@ class SdkSessionManager {
           // boundary is a real liveness event, not the idle-noise that criterion 3
           // guards against.
           s.lastBgActivityAt = Date.now();
+          // Same anchoring principle for the NOTIFICATION grace: a task that
+          // completed while this turn was still processing stamped
+          // notifExpectedUntil at the completion edge, and it aged while the
+          // turn kept running — by the time the boundary wait actually begins
+          // (here), part of the grace is spent. Re-stamp so the smoothing
+          // measures from the moment the projection would otherwise flash idle.
+          if ((s.pendingNotifications ?? 0) > 0) {
+            s.notifExpectedUntil = Date.now() + NOTIF_TURN_GRACE_MS;
+          }
           this.emitHealth(s, false);
           // The turn has settled — scrub/externalize this session's older-turn
           // images (B4a) to keep the LIVE JSONL lean and populate the store for
@@ -2805,6 +3111,14 @@ class SdkSessionManager {
     // A background/auto-continue turn is a new turn — bump the epoch so its
     // trailing result is distinguishable from any earlier turn's (P2).
     s.turnEpoch++;
+    // Envelope bookkeeping (docs/ticket-subagent-notification-turns-intermediate-
+    // bubbles.md): the expected notification turn has ARRIVED — consume one
+    // pending slot so the boundary smoothing can't outlive the turns it predicts.
+    // And if no envelope is open (a notification turn starting from true idle,
+    // e.g. a detached shell finishing long after the last turn), this turn opens
+    // its own: its output is an intermediate until its task settles.
+    if ((s.pendingNotifications ?? 0) > 0) s.pendingNotifications!--;
+    if (s.envelopeStartedAt == null) s.envelopeStartedAt = now;
     // A background turn has no user-typed prompt; the client strips its partials
     // by the startedAt anchor, not userPrompt, so an empty prompt is correct here.
     s.streamBuffer = {
@@ -2922,8 +3236,13 @@ class SdkSessionManager {
    * self-heal), a PULL snapshot may be fresher than its seq implies; the client MUST
    * therefore apply a PULL unconditionally and only gate SSE beats on `seq > current`
    * (design doc §3). Not otherwise side-effect-free: `computeBackgroundActive` may
-   * self-heal a wedged task set (an idempotent maintenance write that already fired
-   * on every isBackgroundActive pull — unchanged by this projection).
+   * self-heal a wedged task set / an expired notification hold, and the ENVELOPE
+   * maintenance below closes/opens `s.envelopeStartedAt` — all idempotent
+   * maintenance writes that converge to the same state on PUSH or PULL, so a plain
+   * poll can only ever apply a transition that was already due, never invent one.
+   * (A read path that derives without persisting would be cleaner; kept here so
+   * PUSH and PULL cannot disagree about the envelope — the one property the
+   * client's hide/reveal logic depends on.)
    */
   private deriveLiveness(s: SdkSession, mainTurnActive: boolean = s.isProcessing): Liveness {
     // The ONE place the "does a detached shell count?" question is answered — reused
@@ -2941,10 +3260,53 @@ class SdkSessionManager {
     // answer (review-dots-desync-fix Finding 2 reborn); in `idle` there is no turn.
     // Gating on mainTurnActive (not just !idle) keeps the anchor off a finished turn.
     const startedAt = mainTurnActive ? (s.streamBuffer?.startedAt ?? null) : null;
+    // Logical-task ENVELOPE maintenance (docs/ticket-subagent-notification-turns-
+    // intermediate-bubbles.md). It closes on quiescence (phase `idle`) — AND, since
+    // 2026-09-09, on a SHELL-ONLY background wait: phase `background` sustained
+    // solely by detached local_bash tasks / a wedged remnant, with no main turn
+    // and no expected notification turn (envelopeHoldActive false). In that state
+    // the logical task's MODEL output is finished — hiding it reproduced the
+    // "Form Refinement" incident, where two dead tasks pinned the envelope over a
+    // completed answer for the whole 120s wedge grace. Closing the envelope there
+    // restores the pre-envelope UX for background shells (answer visible, dots
+    // below, per docs/ticket-live-badge-dark-during-background-subagent.md);
+    // liveness/phase is untouched. Agentic waits (scouts — 'local_agent' /
+    // unknown types) and pending notification turns keep hiding, per the ticket.
+    // Closing here (the one projection everybody reads) means PUSH and PULL agree
+    // on the envelope by construction.
+    //
+    // The backstop's anchor obeys the SAME rule as `startedAt` above: NEVER
+    // `s.streamBuffer?.startedAt` on its own — closeBuffer() keeps the buffer
+    // object, so outside the main-turn phase it holds a FINISHED turn's start,
+    // and anchoring there hides already-revealed committed output (Finding 2's
+    // third life, caught in review 2026-09-08). Two confirmed shapes:
+    //   1. interrupt() nulls the envelope to REVEAL the stopped turn, then its
+    //      own emitHealth lands here with scouts still registered (interrupt
+    //      deliberately doesn't clear backgroundTasks — they may genuinely
+    //      still run) → phase `background` → a buffer-anchored backstop would
+    //      re-hide the very output the null just revealed;
+    //   2. an idle session whose answer is on screen goes non-idle on a late
+    //      background signal → a buffer-anchored backstop would slice that
+    //      settled answer out of the main flow.
+    // `startedAt` (non-null only while mainTurnActive, when the buffer IS the
+    // current turn) covers the mid-turn adoption heal; everything else anchors
+    // at NOW — a fresh span that can only ever hide FUTURE commits. The backstop
+    // is gated on the same hold predicate, so a shell-only phase can't flip-flop
+    // the envelope it just declined to hold.
+    if (phase === 'idle') {
+      if (s.envelopeStartedAt != null) s.envelopeStartedAt = null;
+      if (s.pendingNotifications) s.pendingNotifications = 0;
+    } else if (mainTurnActive || this.envelopeHoldActive(s)) {
+      if (s.envelopeStartedAt == null) s.envelopeStartedAt = startedAt ?? Date.now();
+    } else if (s.envelopeStartedAt != null) {
+      // Shell-only background wait — model output done; reveal while dots stay.
+      s.envelopeStartedAt = null;
+    }
     const { isStuck, stuckReason } = this.computeStuck(s, mainTurnActive, backgroundActive);
     return {
       phase,
       startedAt,
+      envelopeStartedAt: s.envelopeStartedAt ?? null,
       mainTurnActive,
       backgroundActive,
       // The sidebar LIVE badge's source is PID-liveness, NOT the query object: `s.q`
@@ -2967,7 +3329,15 @@ class SdkSessionManager {
   getLiveness(sessionId: string, mainTurnActive?: boolean): Liveness | null {
     const s = this.sessions.get(sessionId);
     if (!s) return null;
-    return this.deriveLiveness(s, mainTurnActive ?? s.isProcessing);
+    const liveness = this.deriveLiveness(s, mainTurnActive ?? s.isProcessing);
+    // A PULL that observes a background self-heal must converge the PUSH record
+    // too, or PULL and PUSH disagree until the reconcile tick (see
+    // noteBackgroundDrop). The emit carries a NEWER seq than this snapshot —
+    // correct: the client applies the PULL unconditionally and the fresher beat
+    // lands right behind it.
+    if (liveness.backgroundActive) this.lastBgActive.set(sessionId, true);
+    else this.noteBackgroundDrop(s);
+    return liveness;
   }
 
   private emitHealth(s: SdkSession, isProcessing: boolean): void {
@@ -2983,8 +3353,13 @@ class SdkSessionManager {
     const backgroundActive = liveness.backgroundActive;
     const { isStuck, stuckReason } = liveness;
     // Keep the reconcile tick's transition tracking in step with what we emit, so
-    // it only re-emits on a real stuck-state flip (P7).
+    // it only re-emits on a real stuck-state flip (P7). Same for the background
+    // level: lastBgActive means "backgroundActive as of the last PUSH", so
+    // noteBackgroundDrop fires ONLY for a drop that was never pushed (a lazy
+    // self-heal) — a result's own idle emit clears the map here and later
+    // observers correctly no-op instead of pushing a redundant second idle.
     this.lastStuck.set(s.sessionId, isStuck);
+    this.lastBgActive.set(s.sessionId, backgroundActive);
     log.debug('sdk.health', isProcessing ? 'processing' : 'idle', {
       sessionId: s.sessionId,
       corrId: s.sessionId,
@@ -3171,7 +3546,36 @@ class SdkSessionManager {
 //     amplifier). startHeartbeat/stopHeartbeat are wired into the HMR swap alongside
 //     reconcile; without this bump the live instance keeps only the transition-only
 //     emits and the mid-turn dark gap (screenshot3) never self-heals.
-const SINGLETON_VERSION = 38; // 38: durable pendingLimit + provider-switch recycle + getManagedModel
+// 38: durable pendingLimit + provider-switch recycle + getManagedModel
+// 39: logical-task ENVELOPE + notification-turn boundary smoothing
+//     (docs/ticket-subagent-notification-turns-intermediate-bubbles.md). Tracks
+//     envelopeStartedAt/pendingNotifications on the session, holds the liveness
+//     projection `background` across result→notification-turn boundaries
+//     (NOTIF_TURN_GRACE_MS), and ships `liveness.envelopeStartedAt` so the client
+//     hides intermediate turn output behind the dots-bubble modal. Without this
+//     bump the live instance keeps flashing idle at every notification-turn
+//     boundary and never carries the envelope anchor.
+// 40: noteBackgroundDrop — converge the PUSH record when a lazy background
+//     self-heal (wedged set / expired notification hold) is observed by a
+//     non-emitting path (heartbeat's inactive edge, getLiveness,
+//     getBackgroundActiveSessionIds). Pre-fix, PULL read idle while the last
+//     PUSH said 'background' for up to the 8s reconcile interval — the owner-
+//     session PULL/PUSH drift dual-session-liveness pinned (4 ticks at the
+//     wedge-grace boundary, 2026-09-08). Without this bump the live instance
+//     keeps the emit-only-if-active heartbeat and the drift window stays.
+// 41: task-lifecycle accuracy + shell-only envelope release (the "Form
+//     Refinement" incident, 2026-09-09: two dead tasks + a leaked hold pinned
+//     dots AND hid a finished answer for the full 120s wedge grace). Terminal
+//     task_notification edges (status completed/failed/stopped) now remove the
+//     task from the set/types map; pendingNotifications counts terminal EDGES
+//     (idle-time, or non-bash mid-turn) instead of level departures (the leak);
+//     departures stamp a 2s NOTIF_BRIDGE so the level→edge beat can't flash
+//     idle; and the ENVELOPE releases during shell-only background waits
+//     (envelopeHoldActive: pending / bridge / any non-'local_bash' task) so a
+//     finished answer reveals while the dots stay per the 2026-08-21 liveness
+//     decision. Without this bump the live instance keeps the leaky counters
+//     and the answer-hiding wedge.
+const SINGLETON_VERSION = 41;
 const globalForSdk = globalThis as unknown as {
   __sdkSessionManager?: SdkSessionManager;
   __sdkSessionManagerV?: number;

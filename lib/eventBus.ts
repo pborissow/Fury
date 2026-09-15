@@ -59,6 +59,20 @@ export interface Liveness {
   /** The CURRENT turn's start (ms), or null when idle. The strip anchor — null
    *  when idle so it can never point at a finished turn (review Finding 2). */
   startedAt: number | null;
+  /** The LOGICAL-TASK ENVELOPE's opening turn-start (ms), or null when idle.
+   *
+   *  Since Claude Code 2.1.26x, Task subagents run as background tasks and each
+   *  <task-notification> completion drives its OWN turn — one user send can
+   *  produce many result-terminated turns before the task is really done
+   *  (docs/ticket-subagent-notification-turns-intermediate-bubbles.md). The
+   *  envelope spans them all: it opens at the first turn of the task (the user
+   *  send, or a notification turn arriving while idle) and closes only when the
+   *  session is quiescent (phase `idle` after boundary smoothing). The client
+   *  hides assistant messages committed at/after this anchor from the main
+   *  transcript flow while the envelope is open (they're reachable via the
+   *  dots-bubble modal), and reveals them when it closes. Unlike `startedAt`
+   *  this survives across the envelope's intermediate turn boundaries. */
+  envelopeStartedAt: number | null;
   /** Main thread is emitting this session's own turn (not a subagent's). */
   mainTurnActive: boolean;
   /** A Claude subagent / monitor / workflow is running between/around the main

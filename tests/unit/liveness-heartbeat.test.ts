@@ -100,17 +100,28 @@ describe('liveness heartbeat — re-emits the level while non-idle', () => {
     expect(cap.events.some((e) => e.sessionId === 'hb-shell')).toBe(true);
   });
 
-  it('a WEDGED background set stops beating once the grace expires (self-heal)', () => {
+  it('a WEDGED background set stops beating once the grace expires — after ONE converging idle', () => {
     // The counterpart to the above: liveness no longer branches on task kind, so the
     // grace is the ONLY thing that stops a lost-terminal-signal set beating forever.
+    //
+    // v40: the first tick that OBSERVES the heal must push exactly one idle
+    // level (noteBackgroundDrop) — the last PUSH said 'background', and leaving
+    // the drop unpushed until the reconcile tick is the PULL-vs-PUSH drift
+    // dual-session-liveness pinned (owner, 4 ticks at the wedge-grace boundary,
+    // 2026-09-08). Every tick after that stays silent, as before.
     const s = newSession('hb-wedged');
-    mgr.handle(s, bg([{ id: 'sh1', type: 'local_bash' }]));
+    mgr.handle(s, bg([{ id: 'sh1', type: 'local_bash' }])); // emits background → lastBgActive true
     s.isProcessing = false;
     s.lastBgActivityAt = Date.now() - 4 * 60_000;
     const cap = captureHealth();
-    mgr.heartbeatTick();
+    mgr.heartbeatTick(); // heals → one converging idle
+    mgr.heartbeatTick(); // silent
+    mgr.heartbeatTick(); // silent
     cap.stop();
-    expect(cap.events.some((e) => e.sessionId === 'hb-wedged')).toBe(false);
+    const emits = cap.events.filter((e) => e.sessionId === 'hb-wedged');
+    expect(emits, 'exactly one converging idle, then silence').toHaveLength(1);
+    expect(emits[0].backgroundActive).toBe(false);
+    expect(emits[0].liveness?.phase).toBe('idle');
   });
 
   it('each beat advances the level seq (a fresh level, so the client can order them)', () => {

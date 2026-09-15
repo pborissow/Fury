@@ -24,7 +24,7 @@ import NewSessionModelStep from '@/components/NewSessionModelStep';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
 import { getRecentDirectories } from '@/lib/recent-directories';
 import { uiLog } from '@/lib/clientTelemetry';
-import { stripInFlightPartials } from '@/lib/transcriptStrip';
+import { stripInFlightPartials, envelopeHiddenMessages } from '@/lib/transcriptStrip';
 import type { Message, TranscriptMsg, HistoryEntry, PendingSession, AskUserQuestionState, TranscriptImagePart } from '@/lib/types';
 import { normalizeImage, type AttachedImage } from '@/lib/clientImage';
 import type { TurnMeta } from '@/lib/transcriptParser';
@@ -142,6 +142,28 @@ export default function ChatTab({
   // (and reseeds the dots when `live` is null / flag off). Reset to null on session switch.
   const [live, setLive] = useState<Liveness | null>(null);
   const liveRef = useRef<Liveness | null>(null);
+  // Apply an incoming liveness LEVEL. An SSE beat (PUSH) advances state only when
+  // its seq is NEWER — a late/duplicate beat can't move the level backward. A PULL
+  // (/api/health, /api/stream-buffer, reconnect/poll) is an authoritative snapshot
+  // applied UNCONDITIONALLY: state can move without a push (a wedge self-heal), so
+  // a fresh pull may legitimately carry the SAME seq as the last push (design §3
+  // seq contract). Component-scoped (not effect-local) so the fetchTranscript
+  // restore path can seed `live` — incl. the envelope anchor — on first paint.
+  const applyLiveness = useCallback((next: Liveness | undefined | null, fromPull: boolean) => {
+    if (!next || typeof next.seq !== 'number') return;
+    const cur = liveRef.current;
+    if (!fromPull && cur && next.seq <= cur.seq) return;
+    liveRef.current = next;
+    setLive(next);
+  }, []);
+  // Whether the dots-bubble's intermediary-messages modal is open (the agreed
+  // product direction in docs/ticket-subagent-notification-turns-intermediate-
+  // bubbles.md: intermediate turn output is hidden from the main flow while the
+  // logical-task envelope is open, and reachable by clicking the dots bubble).
+  // The modal's CONTENT is derived at render time from (historyTranscript, live),
+  // so it live-updates while open and empties (closing itself) when the envelope
+  // closes and the main flow reveals the committed history.
+  const [envelopeModalOpen, setEnvelopeModalOpen] = useState(false);
   // Opt-in for the projection-driven dots (localStorage `fury.livenessDots`). Off by
   // default so the legacy path is untouched until this is proven in the app; flip it in
   // the browser console to verify. Step 3 makes it the default and deletes the legacy path.
@@ -775,6 +797,11 @@ export default function ChatTab({
           // Show the background-work dots immediately when opening a session whose
           // main turn is idle but which is still driving a background subagent.
           setBackgroundWorking(!!bufData.backgroundActive);
+          // Seed the SSOT projection from the restore snapshot (a PULL — applied
+          // unconditionally). Load-bearing for the envelope: opening a session
+          // mid-logical-task must hide its intermediate turn output on the FIRST
+          // paint via liveness.envelopeStartedAt, not after the next SSE beat.
+          applyLiveness(bufData.liveness, true);
           if (bufData.hasBuffer && bufData.isActive) {
             // The JSONL contains partial assistant messages for the in-flight
             // turn that the stream buffer is handling. Strip everything this
@@ -832,6 +859,7 @@ export default function ChatTab({
               setTranscriptLoading(true);
             }
             setBackgroundWorking(!!healthData.backgroundActive);
+            applyLiveness(healthData.liveness, true);
           }
         } catch {
           // Health check is best-effort
@@ -999,20 +1027,10 @@ export default function ChatTab({
 
     // --- SSOT liveness projection (step 2b) ---
     // Reset on session switch so a prior session's phase can't leak into this view.
+    // (applyLiveness itself is component-scoped now — see its declaration — so the
+    // fetchTranscript restore can seed `live` from /api/stream-buffer's snapshot.)
     setLive(null);
     liveRef.current = null;
-    // Apply an incoming liveness LEVEL. An SSE beat (PUSH) advances state only when its
-    // seq is NEWER — a late/duplicate beat can't move the level backward. A PULL
-    // (/api/health, reconnect/poll) is an authoritative snapshot applied
-    // UNCONDITIONALLY: state can move without a push (a wedge self-heal), so a fresh
-    // pull may legitimately carry the SAME seq as the last push (design §3 seq contract).
-    const applyLiveness = (next: Liveness | undefined | null, fromPull: boolean) => {
-      if (!next || typeof next.seq !== 'number') return;
-      const cur = liveRef.current;
-      if (!fromPull && cur && next.seq <= cur.seq) return;
-      liveRef.current = next;
-      setLive(next);
-    };
 
     // On SSE connect, re-fetch the stream buffer to close the gap between the
     // initial restore in fetchTranscript and when the EventSource connected.
@@ -1037,6 +1055,10 @@ export default function ChatTab({
 
           // Sync background-work dots on connect (SSE may have missed the change).
           setBackgroundWorking(!!bufData.backgroundActive);
+          // Re-sync the SSOT projection too (a PULL — unconditional). Covers the
+          // initial-restore→SSE-connect gap for the envelope anchor the same way
+          // the buffer re-fetch covers streamed text.
+          applyLiveness(bufData.liveness, true);
 
           if (bufData.hasBuffer) {
             // Only update if the buffer has more data than what we currently have
@@ -1421,9 +1443,25 @@ export default function ChatTab({
     // Handle transcript:updated events (replaces transcript polling for external live sessions)
     es.addEventListener('transcript-updated', () => {
       if (!shouldProcess()) return;
-      // Don't refresh while any processing is in flight — the JSONL contains
+      // Legacy guard: don't refresh while a turn is in flight — the JSONL contains
       // partial assistant messages that would render as intermediary bubbles.
-      if (transcriptLoadingRef.current) return;
+      //
+      // UNDER THE PROJECTION with an open logical-task ENVELOPE, refreshing is
+      // safe AND required: the DISPLAYED transcript is a pure function of
+      // (historyTranscript, live) — everything committed at/after
+      // live.envelopeStartedAt is sliced off at render, so raw mid-task commits
+      // can't paint bubbles above the dots. And those commits are exactly what
+      // feeds the dots-bubble modal's intermediate messages + badge count
+      // (docs/ticket-subagent-notification-turns-intermediate-bubbles.md):
+      // without this, completed notification turns never reach the client until
+      // the task ends and the modal stays empty.
+      if (transcriptLoadingRef.current) {
+        const envelopeProjected =
+          livenessDotsEnabledRef.current &&
+          typeof liveRef.current?.envelopeStartedAt === 'number' &&
+          liveRef.current.phase !== 'idle';
+        if (!envelopeProjected) return;
+      }
 
       fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
         .then(res => res.json())
@@ -1548,8 +1586,9 @@ export default function ChatTab({
     // sdkSessionsEnabled is read inside the handlers here (applyPendingAskFromBuffer,
     // the AskUserQuestion routing guard); include it (P19) so toggling the setting at
     // runtime rebinds the handlers instead of leaving them capturing the stale value
-    // until the next session switch.
-  }, [viewingTranscriptId, historyTranscriptProject, sdkSessionsEnabled]);
+    // until the next session switch. applyLiveness is a stable useCallback — listed
+    // for lint completeness, it never re-triggers this effect.
+  }, [viewingTranscriptId, historyTranscriptProject, sdkSessionsEnabled, applyLiveness]);
 
   // --- Catch-up when tab becomes visible again ---
   // SSE events were skipped while hidden; re-fetch stream buffer + transcript
@@ -2411,6 +2450,63 @@ export default function ChatTab({
     handleRewind(mode);
   };
 
+  // --- Logical-task ENVELOPE projection ---
+  // (docs/ticket-subagent-notification-turns-intermediate-bubbles.md.) Since
+  // Claude Code 2.1.26x one user send spans MANY result-terminated turns (each
+  // background-task <task-notification> drives its own turn), so a completed
+  // intermediate turn's assistant message is a REAL committed message — the
+  // in-flight-partials strip must not (and does not) remove it. Per the agreed
+  // product direction, while the envelope is open those messages are hidden from
+  // the main flow (nothing may render above the bouncing dots) and surfaced via
+  // a modal opened by clicking the dots bubble. Everything here is a pure
+  // function of (historyTranscript, live), same as the SSOT strip below.
+  const envelopeOpen =
+    livenessDotsEnabled &&
+    !!live &&
+    live.phase !== 'idle' &&
+    typeof live.envelopeStartedAt === 'number';
+  // The main-flow cut: the envelope anchor when open (hides ALL of the task's
+  // turns, current and completed); otherwise the current turn's startedAt (the
+  // pre-envelope behavior — in-flight partials only). The envelope anchor is ≤
+  // startedAt by construction, so it subsumes the partials strip.
+  const displayCutAt = envelopeOpen
+    ? (live!.envelopeStartedAt as number)
+    : (livenessDotsEnabled && live && typeof live.startedAt === 'number' ? live.startedAt : null);
+  const displayedTranscript =
+    displayCutAt != null ? stripInFlightPartials(historyTranscript, displayCutAt) : historyTranscript;
+  // What the dots-bubble modal shows: the envelope's COMMITTED intermediate
+  // assistant messages (current turn's in-flight partials excluded — same policy
+  // as the main flow has always had for them). Derived at render so the open
+  // modal live-updates as notification turns complete.
+  const envelopeHidden: TranscriptMsg[] = envelopeOpen
+    ? envelopeHiddenMessages(
+        historyTranscript,
+        live!.envelopeStartedAt as number,
+        typeof live!.startedAt === 'number' ? live!.startedAt : null,
+      )
+    : [];
+  // The envelope slice removes the task's committed USER send(s) too (they sit
+  // inside the envelope, and on the send path the optimistic overlay covers the
+  // prompt — rendering both would duplicate it). On a switch/restore mid-task
+  // there IS no overlay, so resurface the committed user sends through the same
+  // overlay slot: the main flow keeps reading "your prompt + dots" instead of
+  // the prompt vanishing until the reveal. (Task-notification user strings never
+  // leave the parser, so only real prompts can appear here.)
+  const envelopeUserEcho =
+    envelopeOpen && transcriptOverlayMessages.length === 0
+      ? historyTranscript.filter((m) => {
+          if (m.role !== 'user' || !m.timestamp) return false;
+          const t = Date.parse(m.timestamp);
+          return Number.isFinite(t) && t >= (live!.envelopeStartedAt as number);
+        })
+      : null;
+  // When the envelope closes (task done, session switch, interrupt) the main
+  // flow reveals the committed history — drop the modal-open flag so the NEXT
+  // task's first update can't silently re-open a dialog nobody asked for.
+  useEffect(() => {
+    if (!envelopeOpen) setEnvelopeModalOpen(false);
+  }, [envelopeOpen]);
+
   return (
     <>
     <PanelGroup direction="horizontal" onLayout={onHorizontalLayoutChange}>
@@ -2499,22 +2595,24 @@ export default function ChatTab({
                             </div>
                           )}
                           <TranscriptRenderer
-                            // SSOT strip (step 3): under the flag, the DISPLAYED
-                            // transcript is a pure function of (historyTranscript, live)
-                            // — while the main turn streams (`live.startedAt` set), slice
-                            // off this turn's in-flight partials so a raw-committed
-                            // partial can't render as a bubble above the dots (scenario
-                            // 1). Non-main-turn (startedAt null) shows the raw final
-                            // answer. This anchors on the SAME `live.startedAt` the design
-                            // built in step 1 (null unless main-turn), replacing the
-                            // legacy latch/teardown strip for the projection path.
-                            historyTranscript={
-                              (livenessDotsEnabled && live && typeof live.startedAt === 'number')
-                                ? stripInFlightPartials(historyTranscript, live.startedAt)
-                                : historyTranscript
-                            }
-                            transcriptOverlayMessages={transcriptOverlayMessages}
-                            overlayInsertPoint={overlayInsertPoint}
+                            // SSOT strip (step 3) + logical-task ENVELOPE: the DISPLAYED
+                            // transcript is a pure function of (historyTranscript, live),
+                            // computed above the return. While the envelope is open the
+                            // slice anchors on `live.envelopeStartedAt` — hiding the
+                            // task's committed intermediate turns AND the current turn's
+                            // in-flight partials, so nothing can render above the dots
+                            // (docs/ticket-subagent-notification-turns-intermediate-
+                            // bubbles.md); with no envelope it falls back to the
+                            // per-turn `live.startedAt` partials strip (step-1 anchor).
+                            historyTranscript={displayedTranscript}
+                            transcriptOverlayMessages={envelopeUserEcho ?? transcriptOverlayMessages}
+                            // The echo is chronologically LAST in the displayed flow by
+                            // construction (its messages postdate the envelope cut), so it
+                            // must always append at the end — never at overlayInsertPoint,
+                            // which was computed against a different (unsliced) transcript
+                            // for the rewind overlay and would splice the prompt into a
+                            // stale index if it were ever non-null here.
+                            overlayInsertPoint={envelopeUserEcho ? null : overlayInsertPoint}
                             sessionId={viewingTranscriptId ?? undefined}
                             transcriptLoading={transcriptLoading}
                             onRewindConfirm={setRewindConfirm}
@@ -2615,11 +2713,38 @@ export default function ChatTab({
                                 </div>
                               ) : (
                                 <button
-                                  onClick={() => setRightPanelView('stream')}
+                                  // With hidden envelope updates, the bubble's click
+                                  // opens the intermediary-messages modal (agreed
+                                  // product direction, docs/ticket-subagent-
+                                  // notification-turns-intermediate-bubbles.md);
+                                  // otherwise it keeps the legacy behavior (live
+                                  // stream panel).
+                                  onClick={() => {
+                                    if (envelopeHidden.length > 0) setEnvelopeModalOpen(true);
+                                    else setRightPanelView('stream');
+                                  }}
                                   className="max-w-[80%] rounded-lg pl-4 pr-2 py-2 bg-muted text-foreground border border-border cursor-pointer hover:border-ring transition-colors text-left"
-                                  title="View live stream"
+                                  title={envelopeHidden.length > 0 ? 'View progress updates' : 'View live stream'}
                                 >
-                                  <div className="text-xs opacity-70 mb-1">Claude</div>
+                                  <div className="text-xs mb-1 flex items-center gap-2">
+                                    <span className="opacity-70">Claude</span>
+                                    {/* Same chip TranscriptRenderer puts on settled bubbles
+                                        ("+N intermediary"), minus the word — just "+N" (user
+                                        direction 2026-09-09; replaced the earlier full-width
+                                        "N updates — click to view" line). Count live-updates:
+                                        envelopeHidden derives per render as notification turns
+                                        commit. A span, not a nested button — the whole dots
+                                        bubble is already the click target that opens the
+                                        intermediary-messages modal when updates exist. */}
+                                    {envelopeHidden.length > 0 && (
+                                      <span
+                                        data-testid="envelope-updates-chip"
+                                        className="text-[10px] text-muted-foreground bg-background border border-border rounded px-1.5 py-0.5 cursor-pointer hover:border-ring hover:text-foreground transition-colors"
+                                      >
+                                        +{envelopeHidden.length}
+                                      </span>
+                                    )}
+                                  </div>
                                   <div data-testid="processing-dots" className="flex items-center gap-1 py-2">
                                     <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
                                     <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
@@ -2826,6 +2951,16 @@ export default function ChatTab({
       error={limitError}
     />
     <IntermediaryMessagesDialog messages={intermediaryMessages} onClose={() => setIntermediaryMessages([])} />
+    {/* The dots-bubble modal for an OPEN logical-task envelope. Content is
+        derived per render (envelopeHidden), so it live-updates as notification
+        turns commit and empties (auto-closing: the dialog opens on
+        messages.length > 0) when the envelope closes and the main flow reveals
+        the committed history. Distinct instance from the settled-transcript
+        dialog above — that one shows a FINISHED turn's intermediaries on demand. */}
+    <IntermediaryMessagesDialog
+      messages={envelopeModalOpen ? envelopeHidden : []}
+      onClose={() => setEnvelopeModalOpen(false)}
+    />
     <CodeViewerDialog filePath={codeViewerPath} onClose={() => setCodeViewerPath(null)} />
     <SourceControlDialog open={sourceControlOpen} projectPath={historyTranscriptProject} onClose={() => setSourceControlOpen(false)} />
 

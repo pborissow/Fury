@@ -1,30 +1,32 @@
 /**
- * Live drive to REPRODUCE the two in-flight rendering defects the user hits on a
- * real work machine during scout-heavy PLANNING sessions (distinct from the two
- * existing drives, which use a background-orchestrator + simple writes):
+ * Live drive guarding the two rendering invariants during scout-heavy PLANNING
+ * sessions (distinct from the two existing drives, which use a
+ * background-orchestrator + simple writes):
  *
- *   (1) An intermediary Claude bubble renders ABOVE the bouncing dots — the dots
- *       are correct, the bubble is a leaked in-flight partial that should have
- *       been stripped.  → symptom: `claude-turn` count > 0 WHILE dots are visible.
- *   (2) An intermediary Claude message shows with NO bouncing dots even though the
- *       turn is still working.  → symptom: `isProcessing` (or backgroundActive)
- *       true while `processing-dots` is hidden.
+ *   (1) No Claude bubble may render in the MAIN transcript flow ABOVE the
+ *       bouncing dots while the logical task is in progress.
+ *       → symptom: `claude-turn` count > 0 WHILE dots are visible.
+ *   (2) No dark gap: the dots must stay lit for the whole logical task.
+ *       → symptom: `processing-dots` hidden while the task is still working.
  *
- * Hypothesis being tested (grounded in the code map + docs/ticket-inflight-*.md and
- * docs/ticket-live-badge-dark-during-background-subagent.md):
- *   - PLANNING fans out PARALLEL FOREGROUND `scout` subagents. These run inside the
- *     awaiting main turn, so they do NOT emit `background_tasks_changed` — meaning
- *     `backgroundWorking` can't keep the dots lit; only `transcriptLoading` can.
- *   - The `case 'result'` handler in sdkSessionManager dropped its sidechain guard
- *     (v18 → removed as "dead code"). If a scout completion surfaces a top-level
- *     `result`, `emitHealth(s,false)` fires MID-turn → a transient isProcessing:false
- *     → dots torn down (scenario 2) and the health-idle refetch commits the prior
- *     main-thread assistant partial un-stripped → it leaks as a bubble once
- *     reassertProcessing relights the dots (scenario 1).
+ * TURN MODEL (2.1.26x — docs/ticket-subagent-notification-turns-intermediate-
+ * bubbles.md): PLANNING's `scout` Task subagents run as BACKGROUND tasks. The
+ * dispatching turn ENDS with a real committed `result` ("scouts dispatched,
+ * waiting…"), and each scout completion's <task-notification> drives its OWN
+ * turn — one user send produces MANY results (the 2026-09-04 repro: 1 send,
+ * 7 results). Those intermediate turn-finals are REAL committed messages, so
+ * the in-flight-partials strip cannot (and must not) remove them. The fix under
+ * test is the logical-task ENVELOPE:
+ *   - server: the liveness projection holds phase non-idle ('background') across
+ *     result→notification-turn boundaries and carries `envelopeStartedAt`;
+ *   - client: while the envelope is open, everything committed at/after that
+ *     anchor is hidden from the main flow (reachable via the dots-bubble modal
+ *     — which is EXEMPT from scenario 1: it renders no `claude-turn` nodes);
+ *   - when the envelope closes, the transcript reveals the committed history.
  *
- * This spec is written as a REPRODUCTION: the invariant assertions are expected to
- * FAIL on current code when the bug fires, pinning the exact tick + correlating the
- * fury-log flip. It doubles as the regression guard once the fix lands.
+ * Originally written as a REPRODUCTION of the pre-envelope failure (wall-to-wall
+ * scenario-1/2 hits: hits=261 / darkGap ticks at every boundary); the identical
+ * assertions now serve as the regression guard for the envelope work.
  *
  * The read target is the FURY REPO ITSELF (the codebase these tests live in), so
  * the spec is PORTABLE — no machine-specific project needed — while the scouts
@@ -286,16 +288,31 @@ test('scout-planning turn: dots stay lit and no partial leaks as a bubble', asyn
   expect(sawWork, 'the SDK reported the session working at some point').toBe(true);
   expect(dotsFirstIdx, 'the dots appeared at some point during the turn').toBeGreaterThanOrEqual(0);
 
-  // ---- Invariants (REPRO: these FAIL on current code when the bug fires) ----
-  // A mid-turn processing↔idle flip (more than one processing/idle pair for a
-  // single user prompt) is the server-side smoking gun for scenario 2; logged for
-  // correlation but the DOM samples are what the assertions bind to.
+  // ---- Invariants (the envelope regression guard) ----
+  // NOTE on the log counts above: MANY turn starts/dones per user send is NORMAL
+  // under the 2.1.26x turn model (each task-notification is its own turn) — the
+  // health flip sequence is expected to run processing↔background↔processing, and
+  // is logged purely for correlation. The DOM samples are what the assertions
+  // bind to: while the logical task runs, its committed intermediate turn output
+  // must stay OUT of the main flow (scenario 1 — the dots-bubble modal, which
+  // renders no `claude-turn` nodes, is the sanctioned way to see it) and the
+  // dots must never go dark at a notification-turn boundary (scenario 2 — the
+  // server's expected-notification hold smooths those ticks).
   expect(
     bubbleAboveDots,
-    `scenario 1: an intermediary bubble rendered above the dots (first at ${JSON.stringify(firstBubbleAboveDotsAt)}s) — an in-flight partial leaked past stripInFlightPartials`,
+    `scenario 1: an assistant bubble rendered in the MAIN flow above the dots while the envelope was open (first at ${JSON.stringify(firstBubbleAboveDotsAt)}s) — an in-flight partial leaked OR a committed notification-turn message escaped the envelope slice`,
   ).toBe(0);
   expect(
     darkMidTurn,
-    `scenario 2: the dots went dark mid-turn after having appeared (first at ${JSON.stringify(firstDarkMidTurnAt)}s, ${msgWhileDark} of those with a message showing) — dots torn down while the turn was still working`,
+    `scenario 2: the dots went dark mid-task after having appeared (first at ${JSON.stringify(firstDarkMidTurnAt)}s, ${msgWhileDark} of those with a message showing) — an idle flash at a notification-turn boundary escaped the smoothing`,
   ).toBe(0);
+
+  // ---- Envelope close: the committed history is REVEALED once the task settles ----
+  // The intermediate messages are part of the JSONL; final rendering is normal
+  // (agreed direction §3). After the settle window the main flow must show the
+  // conversation's Claude bubbles again — hiding must not outlive the envelope.
+  await expect(
+    bubbles.first(),
+    'committed turns revealed in the main flow after the envelope closed',
+  ).toBeVisible({ timeout: 30_000 });
 });

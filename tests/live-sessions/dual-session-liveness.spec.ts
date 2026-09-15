@@ -26,11 +26,13 @@
  * EXPECTATIONS vs current code (post step-1 + its review follow-ups):
  *   - Assertions 1, 3, 4, 5, 6 assert PROJECTION-level invariants that MUST hold on
  *     current code; they are hard.
- *   - Assertion 2's PROJECTION check (T stays main-turn) is hard. Its DOM check (dots
- *     lit / no bubble) is the STEP-2 acceptance gate — the client isn't wired to
- *     `liveness` yet, so DOM still follows the legacy path. It is recorded always and
- *     asserted only under STEP2=1, so this suite stays green pre-step-2 and becomes
- *     the gate once the client switch lands.
+ *   - Assertion 2's PROJECTION check (T never reads 'idle' mid-task) is hard. Its
+ *     DOM check (dots lit / no bubble in the main flow) is asserted by default now
+ *     that the client renders `liveness` (STEP2=0 opts out for a legacy-path run).
+ *     Under the 2.1.26x turn model T's phase alternates main-turn ↔ background —
+ *     each scout <task-notification> is its own turn; the logical-task envelope
+ *     work (docs/ticket-subagent-notification-turns-intermediate-bubbles.md) is
+ *     what keeps the boundaries from flashing idle.
  *   - Assertion 1 records the raw `task_type` a `run_in_background` Bash arrives as,
  *     and asserts such a set reads as LIVE once the main turn is idle. It formerly
  *     asserted the opposite (Defect A) and formerly failed if the set was classified
@@ -51,7 +53,10 @@ import {
   sleep, reapPidFiles, furyLogLinesFor, resetProjectDir, driveTurn, cleanupSession, BASE_URL,
 } from './drive-helpers';
 
-const STEP2 = process.env.STEP2 === '1'; // when the client renders `liveness`, gate the DOM checks
+// The client renders the `liveness` projection by default since step 2b landed
+// (localStorage `fury.livenessDots` !== '0'), so the DOM acceptance checks are ON
+// by default now; STEP2=0 opts out for a legacy-path (flag-off) investigation run.
+const STEP2 = process.env.STEP2 !== '0';
 
 // Repo-parent scratch dirs (same convention as the sibling drives).
 const PROJECT_T = join(__dirname, '..', '..', '..', 'fury-e2e-dual-driven');
@@ -404,10 +409,15 @@ test('dual-session liveness: owner-idle-with-bash + driven-scout-planning stay h
   }
 
   // ---------------------------------------------------------------------------
-  // Assertion 2 — DRIVEN / scenario 2 (Finding 1). PROJECTION: T's phase stays
-  // 'main-turn' continuously once it starts — no idle gap mid-turn. DOM: dots lit /
-  // no bubble-above-dots — the STEP-2 acceptance gate (client not wired to liveness
-  // yet), recorded always, asserted only under STEP2=1.
+  // Assertion 2 — DRIVEN / scenario 2 (Finding 1). PROJECTION: once T's task
+  // starts, its phase must never read 'idle' mid-window. Under the 2.1.26x turn
+  // model the phase legitimately ALTERNATES main-turn ↔ background (each scout
+  // notification is its own turn; the logical-task envelope + the expected-
+  // notification hold cover the boundaries — docs/ticket-subagent-notification-
+  // turns-intermediate-bubbles.md), so only 'idle' counts as dark. DOM: dots lit /
+  // no bubble in the MAIN flow above the dots (the dots-bubble modal is exempt:
+  // it renders no `claude-turn` nodes) — asserted by default now that the client
+  // renders the projection (STEP2=0 opts out).
   // ---------------------------------------------------------------------------
   // Trim the trailing fully-idle run; [0,endIdx) is the mid-turn window.
   let endIdx = samplesT.length;
