@@ -561,6 +561,70 @@ export default function ChatTab({
     viewingIdRef.current = viewingTranscriptId;
   }, [viewingTranscriptId]);
 
+  // --- Logical-task ENVELOPE projection ---
+  // (docs/ticket-subagent-notification-turns-intermediate-bubbles.md.) Since
+  // Claude Code 2.1.26x one user send spans MANY result-terminated turns (each
+  // background-task <task-notification> drives its own turn), so a completed
+  // intermediate turn's assistant message is a REAL committed message — the
+  // in-flight-partials strip must not (and does not) remove it. Per the agreed
+  // product direction, while the envelope is open those messages are hidden from
+  // the main flow (nothing may render above the bouncing dots) and surfaced via
+  // a modal opened by clicking the dots bubble. Everything here is a pure
+  // function of (historyTranscript, live), same as the SSOT strip.
+  //
+  // Declared ABOVE the scroll effects on purpose: the DISPLAYED transcript is
+  // what user-visible reactions (auto-scroll) must key on — the raw
+  // historyTranscript now legitimately grows mid-envelope (the transcript-
+  // updated refetch that feeds the modal), and reacting to the raw growth is
+  // what scrolled the panel to the previous turn instead of the dots
+  // (the 2026-09-14 macOS report — see the assistant-scroll effect below).
+  const envelopeOpen =
+    livenessDotsEnabled &&
+    !!live &&
+    live.phase !== 'idle' &&
+    typeof live.envelopeStartedAt === 'number';
+  // The main-flow cut: the envelope anchor when open (hides ALL of the task's
+  // turns, current and completed); otherwise the current turn's startedAt (the
+  // pre-envelope behavior — in-flight partials only). The envelope anchor is ≤
+  // startedAt by construction, so it subsumes the partials strip.
+  const displayCutAt = envelopeOpen
+    ? (live!.envelopeStartedAt as number)
+    : (livenessDotsEnabled && live && typeof live.startedAt === 'number' ? live.startedAt : null);
+  const displayedTranscript =
+    displayCutAt != null ? stripInFlightPartials(historyTranscript, displayCutAt) : historyTranscript;
+  // What the dots-bubble modal shows: the envelope's COMMITTED intermediate
+  // assistant messages (current turn's in-flight partials excluded — same policy
+  // as the main flow has always had for them). Derived at render so the open
+  // modal live-updates as notification turns complete.
+  const envelopeHidden: TranscriptMsg[] = envelopeOpen
+    ? envelopeHiddenMessages(
+        historyTranscript,
+        live!.envelopeStartedAt as number,
+        typeof live!.startedAt === 'number' ? live!.startedAt : null,
+      )
+    : [];
+  // The envelope slice removes the task's committed USER send(s) too (they sit
+  // inside the envelope, and on the send path the optimistic overlay covers the
+  // prompt — rendering both would duplicate it). On a switch/restore mid-task
+  // there IS no overlay, so resurface the committed user sends through the same
+  // overlay slot: the main flow keeps reading "your prompt + dots" instead of
+  // the prompt vanishing until the reveal. (Task-notification user strings never
+  // leave the parser, so only real prompts can appear here.)
+  const envelopeUserEcho =
+    envelopeOpen && transcriptOverlayMessages.length === 0
+      ? historyTranscript.filter((m) => {
+          if (m.role !== 'user' || !m.timestamp) return false;
+          const t = Date.parse(m.timestamp);
+          return Number.isFinite(t) && t >= (live!.envelopeStartedAt as number);
+        })
+      : null;
+  // When the envelope closes (task done, session switch, interrupt) the main
+  // flow reveals the committed history — drop the modal-open flag so the NEXT
+  // task's first update can't silently re-open a dialog nobody asked for.
+  useEffect(() => {
+    if (!envelopeOpen) setEnvelopeModalOpen(false);
+  }, [envelopeOpen]);
+
   // Auto-scroll transcript viewer during streaming
   useEffect(() => {
     if (transcriptStreaming) {
@@ -594,13 +658,24 @@ export default function ChatTab({
   // When a new assistant response lands (post-streaming), scroll so that the
   // start of the response is at the top of the panel — letting the user see
   // as much of the response as possible. Skip on initial transcript loads.
+  //
+  // Counts the DISPLAYED transcript, NOT the raw historyTranscript. The raw
+  // array now grows mid-task (the transcript-updated handler refetches inside
+  // an open envelope to feed the dots-bubble modal), but every one of those
+  // messages is sliced out of display — so a raw-count trigger fired
+  // scrollIntoView on `lastAssistantRef`, which points at the last VISIBLE
+  // bubble: Claude's PREVIOUS answer, not the bouncing dots (reported on macOS
+  // 2026-09-14; masked elsewhere by the streaming bottom-scroll racing it).
+  // Keyed on the projection, the count is static while the envelope is open
+  // (dots keep the viewport via the streaming/bottom scrolls) and jumps ONCE at
+  // the reveal — landing exactly one scroll at the start of the final answer.
   useEffect(() => {
     if (historyTranscriptLoading) {
       skipNextAssistantScrollRef.current = true;
       prevAssistantCountRef.current = 0;
       return;
     }
-    const assistantCount = historyTranscript.reduce(
+    const assistantCount = displayedTranscript.reduce(
       (n, m) => (m.role === 'assistant' ? n + 1 : n),
       0,
     );
@@ -611,7 +686,7 @@ export default function ChatTab({
     }
     prevAssistantCountRef.current = assistantCount;
     skipNextAssistantScrollRef.current = false;
-  }, [historyTranscript, historyTranscriptLoading]);
+  }, [displayedTranscript, historyTranscriptLoading]);
 
   const HISTORY_PAGE_SIZE = 25;
 
@@ -2449,63 +2524,6 @@ export default function ChatTab({
     setRewindConfirm(null);
     handleRewind(mode);
   };
-
-  // --- Logical-task ENVELOPE projection ---
-  // (docs/ticket-subagent-notification-turns-intermediate-bubbles.md.) Since
-  // Claude Code 2.1.26x one user send spans MANY result-terminated turns (each
-  // background-task <task-notification> drives its own turn), so a completed
-  // intermediate turn's assistant message is a REAL committed message — the
-  // in-flight-partials strip must not (and does not) remove it. Per the agreed
-  // product direction, while the envelope is open those messages are hidden from
-  // the main flow (nothing may render above the bouncing dots) and surfaced via
-  // a modal opened by clicking the dots bubble. Everything here is a pure
-  // function of (historyTranscript, live), same as the SSOT strip below.
-  const envelopeOpen =
-    livenessDotsEnabled &&
-    !!live &&
-    live.phase !== 'idle' &&
-    typeof live.envelopeStartedAt === 'number';
-  // The main-flow cut: the envelope anchor when open (hides ALL of the task's
-  // turns, current and completed); otherwise the current turn's startedAt (the
-  // pre-envelope behavior — in-flight partials only). The envelope anchor is ≤
-  // startedAt by construction, so it subsumes the partials strip.
-  const displayCutAt = envelopeOpen
-    ? (live!.envelopeStartedAt as number)
-    : (livenessDotsEnabled && live && typeof live.startedAt === 'number' ? live.startedAt : null);
-  const displayedTranscript =
-    displayCutAt != null ? stripInFlightPartials(historyTranscript, displayCutAt) : historyTranscript;
-  // What the dots-bubble modal shows: the envelope's COMMITTED intermediate
-  // assistant messages (current turn's in-flight partials excluded — same policy
-  // as the main flow has always had for them). Derived at render so the open
-  // modal live-updates as notification turns complete.
-  const envelopeHidden: TranscriptMsg[] = envelopeOpen
-    ? envelopeHiddenMessages(
-        historyTranscript,
-        live!.envelopeStartedAt as number,
-        typeof live!.startedAt === 'number' ? live!.startedAt : null,
-      )
-    : [];
-  // The envelope slice removes the task's committed USER send(s) too (they sit
-  // inside the envelope, and on the send path the optimistic overlay covers the
-  // prompt — rendering both would duplicate it). On a switch/restore mid-task
-  // there IS no overlay, so resurface the committed user sends through the same
-  // overlay slot: the main flow keeps reading "your prompt + dots" instead of
-  // the prompt vanishing until the reveal. (Task-notification user strings never
-  // leave the parser, so only real prompts can appear here.)
-  const envelopeUserEcho =
-    envelopeOpen && transcriptOverlayMessages.length === 0
-      ? historyTranscript.filter((m) => {
-          if (m.role !== 'user' || !m.timestamp) return false;
-          const t = Date.parse(m.timestamp);
-          return Number.isFinite(t) && t >= (live!.envelopeStartedAt as number);
-        })
-      : null;
-  // When the envelope closes (task done, session switch, interrupt) the main
-  // flow reveals the committed history — drop the modal-open flag so the NEXT
-  // task's first update can't silently re-open a dialog nobody asked for.
-  useEffect(() => {
-    if (!envelopeOpen) setEnvelopeModalOpen(false);
-  }, [envelopeOpen]);
 
   return (
     <>

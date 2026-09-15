@@ -17,9 +17,16 @@ process.env.FURY_DB_PATH = join(TEMP_ROOT, 'test.db');
 import { getDb } from '../../lib/db';
 import { buildSearchQuery, RENDERED_BUBBLES_FILTER } from '../../lib/searchQuery';
 
-afterAll(() => {
+afterAll(async () => {
   delete process.env.FURY_DB_PATH;
-  rmSync(TEMP_ROOT, { recursive: true, force: true });
+  // Close the libSQL client BEFORE unlinking: Windows locks an open db file,
+  // so rmSync deterministically EBUSYs otherwise (harmless no-op elsewhere).
+  // Safe to close for good — vitest forks one process per test file, so no
+  // later suite can be handed this (now closed) singleton.
+  try { (await getDb()).close(); } catch { /* best effort */ }
+  // Belt and braces: if the handle release is still settling, leave the temp
+  // dir to the OS rather than failing an otherwise-green suite.
+  try { rmSync(TEMP_ROOT, { recursive: true, force: true }); } catch { /* temp dir */ }
 });
 
 async function seedSession(sessionId: string, contents: string[], status = 'active') {
