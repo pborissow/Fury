@@ -1,14 +1,14 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { ChevronRight, ChevronDown, Folder, File, Loader2, Search, X, GitBranch, GitCommitHorizontal } from 'lucide-react';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { dirHasChange } from '@/lib/treePaths';
 
 export interface FileTreeNode {
   name: string;
   path: string;
   type: 'file' | 'directory';
-  children?: FileTreeNode[];
 }
 
 export type VcsFileStatus = 'M' | 'A' | 'D' | 'R' | '?' | 'C' | '!';
@@ -43,32 +43,43 @@ export function VcsStatusBadge({ status }: { status?: VcsFileStatus }) {
   );
 }
 
+/** Shared per-render state threaded to every FileTreeItem — the normalized store
+ *  plus the expand/open handlers. Passed as one object to avoid prop drilling. */
+interface TreeCtx {
+  expanded: Set<string>;
+  childrenByPath: Map<string, FileTreeNode[]>;
+  loadingPaths: Set<string>;
+  fileStatuses: VcsStatusMap | null;
+  onToggle: (dir: string) => void;
+  onFileDoubleClick?: (filePath: string) => void;
+}
+
 interface FileTreeItemProps {
   node: FileTreeNode;
   depth: number;
-  onFileDoubleClick?: (filePath: string) => void;
-  fileStatuses: VcsStatusMap | null;
+  ctx: TreeCtx;
 }
 
-function FileTreeItem({ node, depth, onFileDoubleClick, fileStatuses }: FileTreeItemProps) {
-  const [isExpanded, setIsExpanded] = useState(false);
+function FileTreeItem({ node, depth, ctx }: FileTreeItemProps) {
   const isDirectory = node.type === 'directory';
-  const hasChildren = isDirectory && node.children && node.children.length > 0;
+  const isExpanded = isDirectory && ctx.expanded.has(node.path);
+  const isLoading = isDirectory && ctx.loadingPaths.has(node.path);
+  const children = isDirectory ? ctx.childrenByPath.get(node.path) : undefined;
 
   const handleClick = () => {
     if (isDirectory) {
-      setIsExpanded(!isExpanded);
-    } else if (onFileDoubleClick) {
-      onFileDoubleClick(node.path);
+      ctx.onToggle(node.path);
+    } else if (ctx.onFileDoubleClick) {
+      ctx.onFileDoubleClick(node.path);
     }
   };
 
-  const fileStatus = !isDirectory && fileStatuses ? fileStatuses[node.path] : undefined;
+  const fileStatus = !isDirectory && ctx.fileStatuses ? ctx.fileStatuses[node.path] : undefined;
 
-  // Check if a directory contains any changed files
-  const dirHasChanges = isDirectory && fileStatuses && hasChildren
-    ? hasChangedDescendant(node, fileStatuses)
-    : false;
+  // Folder "has changes" dot: derived from the full-repo status map (a prefix
+  // test), NOT from loaded children — so it's correct even while the folder is
+  // collapsed and its subtree isn't in memory.
+  const dirHasChanges = isDirectory && dirHasChange(node.path, ctx.fileStatuses);
 
   return (
     <div>
@@ -83,16 +94,16 @@ function FileTreeItem({ node, depth, onFileDoubleClick, fileStatuses }: FileTree
       >
         {isDirectory ? (
           <>
-            {hasChildren ? (
-              isExpanded ? (
-                <ChevronDown className="h-4 w-4 text-muted-foreground" />
-              ) : (
-                <ChevronRight className="h-4 w-4 text-muted-foreground" />
-              )
+            {isExpanded ? (
+              <ChevronDown className="h-4 w-4 text-muted-foreground" />
             ) : (
-              <div className="w-4" />
+              <ChevronRight className="h-4 w-4 text-muted-foreground" />
             )}
-            <Folder className={`h-4 w-4 ${dirHasChanges ? 'text-yellow-500' : 'text-blue-500'}`} />
+            {isLoading ? (
+              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+            ) : (
+              <Folder className={`h-4 w-4 ${dirHasChanges ? 'text-yellow-500' : 'text-blue-500'}`} />
+            )}
           </>
         ) : (
           <>
@@ -104,95 +115,112 @@ function FileTreeItem({ node, depth, onFileDoubleClick, fileStatuses }: FileTree
         <VcsStatusBadge status={fileStatus} />
       </div>
 
-      {isDirectory && isExpanded && hasChildren && (
-        <div>
-          {node.children!.map((child) => (
-            <FileTreeItem key={child.path} node={child} depth={depth + 1} onFileDoubleClick={onFileDoubleClick} fileStatuses={fileStatuses} />
-          ))}
-        </div>
+      {isDirectory && isExpanded && children && (
+        children.length === 0 ? (
+          <div
+            className="px-2 py-1 text-xs text-muted-foreground/60 italic"
+            style={{ paddingLeft: `${(depth + 1) * 16 + 8}px` }}
+          >
+            empty
+          </div>
+        ) : (
+          <div>
+            {children.map((child) => (
+              <FileTreeItem key={child.path} node={child} depth={depth + 1} ctx={ctx} />
+            ))}
+          </div>
+        )
       )}
     </div>
   );
 }
 
-function hasChangedDescendant(node: FileTreeNode, fileStatuses: VcsStatusMap): boolean {
-  if (!node.children) return false;
-  for (const child of node.children) {
-    if (child.type === 'file' && fileStatuses[child.path]) return true;
-    if (child.type === 'directory' && hasChangedDescendant(child, fileStatuses)) return true;
-  }
-  return false;
-}
-
-function collectFiles(nodes: FileTreeNode[]): FileTreeNode[] {
-  const files: FileTreeNode[] = [];
-  for (const node of nodes) {
-    if (node.type === 'file') {
-      files.push(node);
-    }
-    if (node.children) {
-      files.push(...collectFiles(node.children));
-    }
-  }
-  return files;
-}
-
 interface FileTreeProps {
   projectPath: string | null;
   onFileDoubleClick?: (filePath: string) => void;
-  maxDepth?: number;
   /** When set and the directory is a git/svn working copy, a source-control
    *  button is shown next to the search box. */
   onOpenSourceControl?: () => void;
 }
 
-export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onOpenSourceControl }: FileTreeProps) {
-  const [tree, setTree] = useState<FileTreeNode[]>([]);
+const enc = encodeURIComponent;
+
+export default function FileTree({ projectPath, onFileDoubleClick, onOpenSourceControl }: FileTreeProps) {
+  // Normalized, lazily-populated store — replaces the old single recursive tree.
+  const [childrenByPath, setChildrenByPath] = useState<Map<string, FileTreeNode[]>>(new Map());
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
+
   const [fileStatuses, setFileStatuses] = useState<VcsStatusMap | null>(null);
   const [vcs, setVcs] = useState<'git' | 'svn' | null>(null);
   const [branch, setBranch] = useState<string | null>(null);
-  const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
   const [search, setSearch] = useState('');
+  const [searchResults, setSearchResults] = useState<FileTreeNode[] | null>(null);
+  const [searchTruncated, setSearchTruncated] = useState(false);
+
   const initialLoadDone = useRef(false);
 
-  const fetchTree = useCallback(async (showLoading: boolean) => {
+  // Refs mirrored from state so the (stable) SSE handlers can read the current
+  // open set / store without re-subscribing the EventSource on every change.
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+  const childrenRef = useRef(childrenByPath);
+  childrenRef.current = childrenByPath;
+
+  // ---- Root load -----------------------------------------------------------
+  const fetchRoot = useCallback(async (showLoading: boolean) => {
     if (!projectPath) return;
     if (showLoading) setLoading(true);
     setError(null);
-
     try {
-      const depthParam = maxDepth ? `&depth=${maxDepth}` : '';
-      const response = await fetch(`/api/tree?path=${encodeURIComponent(projectPath)}${depthParam}`);
+      const response = await fetch(`/api/tree?path=${enc(projectPath)}`);
       const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Failed to fetch directory tree');
-      }
-
-      setTree(data.tree);
+      if (!response.ok) throw new Error(data.error || 'Failed to fetch directory tree');
+      setChildrenByPath(new Map([[projectPath, data.tree as FileTreeNode[]]]));
       setFileStatuses(data.fileStatuses || null);
       setVcs(data.vcs || null);
       setBranch(data.branch || null);
-      setTruncated(!!data.truncated);
     } catch (err) {
       console.error('Error fetching file tree:', err);
       setError(err instanceof Error ? err.message : 'Failed to load directory tree');
     } finally {
       if (showLoading) setLoading(false);
     }
-  }, [projectPath, maxDepth]);
+  }, [projectPath]);
 
-  // Refresh only the VCS badges. Used when repository metadata changed (commit,
-  // stage, branch switch): the tree itself is unaffected, so walking it again
-  // would be wasted work — and on a big project a visible stall.
+  // Fetch (or refetch) a single directory's immediate children.
+  //  - `force`  refetch even if already cached (re-expand / watcher event).
+  //  - `silent` skip the per-node spinner (background refresh over stale cache).
+  const loadChildren = useCallback(async (dir: string, force = false, silent = false) => {
+    if (!force && childrenRef.current.has(dir)) return;
+    if (!silent) setLoadingPaths((prev) => new Set(prev).add(dir));
+    try {
+      const response = await fetch(`/api/tree?path=${enc(dir)}&childrenOnly=1`);
+      const data = await response.json();
+      if (response.ok) {
+        setChildrenByPath((prev) => new Map(prev).set(dir, data.tree as FileTreeNode[]));
+      }
+    } catch {
+      // Transient — the next expand or watcher event will retry.
+    } finally {
+      if (!silent) {
+        setLoadingPaths((prev) => {
+          const next = new Set(prev);
+          next.delete(dir);
+          return next;
+        });
+      }
+    }
+  }, []);
+
+  // Refresh only the VCS badges (status-only; the tree structure is untouched).
   const fetchVcsStatus = useCallback(async () => {
     if (!projectPath) return;
     try {
-      const response = await fetch(
-        `/api/tree?path=${encodeURIComponent(projectPath)}&statusOnly=1`
-      );
+      const response = await fetch(`/api/tree?path=${enc(projectPath)}&statusOnly=1`);
       if (!response.ok) return;
       const data = await response.json();
       setFileStatuses(data.fileStatuses || null);
@@ -203,61 +231,197 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
     }
   }, [projectPath]);
 
-  // Initial fetch
+  // Coalesce VCS-status refreshes: a branch switch (or a burst of saves across
+  // several open folders) can fire many change/vcs-change events in quick
+  // succession, each of which would otherwise spawn its own `git status` exec.
+  // At most one refresh per window.
+  const vcsStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleVcsStatus = useCallback(() => {
+    if (vcsStatusTimerRef.current) return; // one already pending — fold into it
+    vcsStatusTimerRef.current = setTimeout(() => {
+      vcsStatusTimerRef.current = null;
+      void fetchVcsStatus();
+    }, 200);
+  }, [fetchVcsStatus]);
+
+  // ---- Watch control channel (POST add/remove) -----------------------------
+  const subscriptionIdRef = useRef<string | null>(null);
+  const pendingAddRef = useRef<Set<string>>(new Set());
+  const pendingRemoveRef = useRef<Set<string>>(new Set());
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const flushWatch = useCallback(() => {
+    flushTimerRef.current = null;
+    const id = subscriptionIdRef.current;
+    if (!id) {
+      // Not connected yet — retry once the SSE `connected` message lands.
+      flushTimerRef.current = setTimeout(flushWatch, 120);
+      return;
+    }
+    const add = [...pendingAddRef.current];
+    const remove = [...pendingRemoveRef.current];
+    if (!add.length && !remove.length) return;
+    pendingAddRef.current.clear();
+    pendingRemoveRef.current.clear();
+    fetch('/api/tree/watch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subscriptionId: id, add, remove }),
+    }).catch(() => { /* the connection will re-sync on reconnect */ });
+  }, []);
+
+  // Coalesce rapid expand/collapse toggles into one POST (add cancels a pending
+  // remove of the same dir and vice versa).
+  const queueWatch = useCallback((op: 'add' | 'remove', dir: string) => {
+    if (op === 'add') {
+      pendingRemoveRef.current.delete(dir);
+      pendingAddRef.current.add(dir);
+    } else {
+      pendingAddRef.current.delete(dir);
+      pendingRemoveRef.current.add(dir);
+    }
+    if (!flushTimerRef.current) flushTimerRef.current = setTimeout(flushWatch, 120);
+  }, [flushWatch]);
+
+  // ---- Expand / collapse ---------------------------------------------------
+  // Side effects (fetch, watch POST) run OUTSIDE the state updater: React may
+  // double-invoke an updater (StrictMode dev, concurrent features), and a
+  // duplicated fetch is a real network call — the updater must stay pure.
+  const onToggle = useCallback((dir: string) => {
+    const isOpen = expandedRef.current.has(dir);
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (isOpen) next.delete(dir);
+      else next.add(dir);
+      return next;
+    });
+    if (isOpen) {
+      queueWatch('remove', dir);
+    } else {
+      queueWatch('add', dir);
+      // First expand → spinner. Re-expand → show cached instantly but refresh
+      // in the background (it may have changed while collapsed/unwatched).
+      const cached = childrenRef.current.has(dir);
+      void loadChildren(dir, cached, cached);
+    }
+  }, [queueWatch, loadChildren]);
+
+  // ---- Initial fetch -------------------------------------------------------
   useEffect(() => {
     initialLoadDone.current = false;
+    // Reset the store and any queued watch ops for the previous project.
+    setChildrenByPath(new Map());
+    setExpanded(new Set());
+    setLoadingPaths(new Set());
+    pendingAddRef.current.clear();
+    pendingRemoveRef.current.clear();
+
     if (!projectPath) {
-      setTree([]);
       setFileStatuses(null);
       setVcs(null);
       setBranch(null);
-      setTruncated(false);
       return;
     }
 
-    fetchTree(true).then(() => {
+    fetchRoot(true).then(() => {
       initialLoadDone.current = true;
     });
-  }, [projectPath, fetchTree]);
+  }, [projectPath, fetchRoot]);
 
-  // Subscribe to file system changes via SSE
+  // ---- SSE subscription ----------------------------------------------------
+  // Stable handler refs, reassigned each render so they close over current state
+  // without forcing the EventSource effect (below) to re-run on every change.
+  const onConnected = (id: string) => {
+    subscriptionIdRef.current = id;
+    // A fresh subscription only watches root + VCS meta; re-add every open
+    // folder so a reconnect (or HMR) restores the watched set.
+    for (const dir of expandedRef.current) pendingAddRef.current.add(dir);
+    if (expandedRef.current.size && !flushTimerRef.current) {
+      flushTimerRef.current = setTimeout(flushWatch, 0);
+    }
+  };
+
+  const onServerEvent = (data: { type: string; dir?: string }) => {
+    if (!initialLoadDone.current) return;
+    if (data.type === 'change') {
+      const dir = data.dir || projectPath || '';
+      // Only refetch a directory that's actually visible (the root, or open).
+      // Silent: a save shouldn't flicker the folder icon to a spinner.
+      if (dir === projectPath || expandedRef.current.has(dir)) {
+        void loadChildren(dir, true, true);
+      }
+      // Keep working-file badges in visible folders live.
+      scheduleVcsStatus();
+    } else if (data.type === 'vcs-change') {
+      scheduleVcsStatus();
+    }
+  };
+
+  const handlersRef = useRef({ onConnected, onServerEvent });
+  handlersRef.current = { onConnected, onServerEvent };
+
   useEffect(() => {
     if (!projectPath) return;
-
-    const eventSource = new EventSource(
-      `/api/tree/watch?path=${encodeURIComponent(projectPath)}`
-    );
+    const eventSource = new EventSource(`/api/tree/watch?root=${enc(projectPath)}`);
 
     eventSource.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (!initialLoadDone.current) return;
-        if (data.type === 'change') {
-          fetchTree(false);
-        } else if (data.type === 'vcs-change') {
-          fetchVcsStatus();
+        if (data.type === 'connected') {
+          handlersRef.current.onConnected(data.subscriptionId);
+          return;
         }
+        handlersRef.current.onServerEvent(data);
       } catch {
         // Ignore malformed messages
       }
     };
-
     eventSource.onerror = () => {
-      // EventSource will auto-reconnect
+      // EventSource auto-reconnects; a new `connected` will re-sync the set.
     };
 
     return () => {
       eventSource.close();
+      subscriptionIdRef.current = null;
+      if (flushTimerRef.current) {
+        clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = null;
+      }
+      if (vcsStatusTimerRef.current) {
+        clearTimeout(vcsStatusTimerRef.current);
+        vcsStatusTimerRef.current = null;
+      }
     };
-  }, [projectPath, fetchTree, fetchVcsStatus]);
+  }, [projectPath]);
 
-  const allFiles = useMemo(() => collectFiles(tree), [tree]);
+  // ---- Search (server-side, debounced) -------------------------------------
+  useEffect(() => {
+    if (!projectPath) return;
+    const q = search.trim();
+    if (!q) {
+      setSearchResults(null);
+      setSearchTruncated(false);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const response = await fetch(`/api/tree/search?path=${enc(projectPath)}&q=${enc(q)}`);
+        const data = await response.json();
+        if (cancelled || !response.ok) return;
+        setSearchResults((data.matches as FileTreeNode[]) || []);
+        setSearchTruncated(!!data.truncated);
+      } catch {
+        // Transient — a later keystroke will retry.
+      }
+    }, 180);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [search, projectPath]);
 
-  const filteredFiles = useMemo(() => {
-    if (!search.trim()) return null;
-    const query = search.trim().toLowerCase();
-    return allFiles.filter((f) => f.name.toLowerCase().startsWith(query));
-  }, [search, allFiles]);
+  const rootChildren = projectPath ? childrenByPath.get(projectPath) : undefined;
 
   if (!projectPath) {
     return (
@@ -284,7 +448,7 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
     );
   }
 
-  if (tree.length === 0) {
+  if (rootChildren && rootChildren.length === 0) {
     return (
       <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
         Empty directory
@@ -292,15 +456,17 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
     );
   }
 
+  const ctx: TreeCtx = {
+    expanded,
+    childrenByPath,
+    loadingPaths,
+    fileStatuses,
+    onToggle,
+    onFileDoubleClick,
+  };
+
   return (
     <div className="flex flex-col h-full select-none">
-      {truncated && (
-        <div className="px-3 py-2 shrink-0 text-xs text-muted-foreground border-b border-border">
-          This directory is too large to list in full — only part of the tree is
-          shown. Start the session in a project folder rather than a drive root.
-        </div>
-      )}
-
       {/* Search bar */}
       <div className="px-2 pt-2 pb-1 shrink-0">
         <div className="relative">
@@ -325,36 +491,43 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
 
       {/* Tree or search results */}
       <ScrollArea className="flex-1 overflow-hidden">
-        {filteredFiles !== null ? (
+        {searchResults !== null ? (
           <div className="py-1">
-            {filteredFiles.length === 0 ? (
+            {searchResults.length === 0 ? (
               <div className="px-4 py-6 text-center text-muted-foreground text-sm">
                 No files found
               </div>
             ) : (
-              filteredFiles.map((file) => {
-                const fileStatus = fileStatuses ? fileStatuses[file.path] : undefined;
-                return (
-                  <div
-                    key={file.path}
-                    className="flex items-center gap-2 px-3 py-1 cursor-pointer hover:bg-accent rounded-sm text-sm transition-colors"
-                    onClick={() => onFileDoubleClick?.(file.path)}
-                  >
-                    <File className={`h-4 w-4 shrink-0 ${fileStatus ? VCS_STATUS_COLORS[fileStatus] : 'text-muted-foreground'}`} />
-                    <span className={`truncate ${fileStatus ? VCS_STATUS_COLORS[fileStatus] : ''}`}>{file.name}</span>
-                    <span className="text-xs text-muted-foreground/60 truncate ml-auto">
-                      {file.path.replace(/\\/g, '/').split('/').slice(-2, -1)[0]}
-                    </span>
-                    <VcsStatusBadge status={fileStatus} />
+              <>
+                {searchResults.map((file) => {
+                  const fileStatus = fileStatuses ? fileStatuses[file.path] : undefined;
+                  return (
+                    <div
+                      key={file.path}
+                      className="flex items-center gap-2 px-3 py-1 cursor-pointer hover:bg-accent rounded-sm text-sm transition-colors"
+                      onClick={() => onFileDoubleClick?.(file.path)}
+                    >
+                      <File className={`h-4 w-4 shrink-0 ${fileStatus ? VCS_STATUS_COLORS[fileStatus] : 'text-muted-foreground'}`} />
+                      <span className={`truncate ${fileStatus ? VCS_STATUS_COLORS[fileStatus] : ''}`}>{file.name}</span>
+                      <span className="text-xs text-muted-foreground/60 truncate ml-auto">
+                        {file.path.replace(/\\/g, '/').split('/').slice(-2, -1)[0]}
+                      </span>
+                      <VcsStatusBadge status={fileStatus} />
+                    </div>
+                  );
+                })}
+                {searchTruncated && (
+                  <div className="px-4 py-2 text-center text-xs text-muted-foreground/70">
+                    Results truncated — narrow your search.
                   </div>
-                );
-              })
+                )}
+              </>
             )}
           </div>
         ) : (
           <div className="py-2">
-            {tree.map((node) => (
-              <FileTreeItem key={node.path} node={node} depth={0} onFileDoubleClick={onFileDoubleClick} fileStatuses={fileStatuses} />
+            {(rootChildren || []).map((node) => (
+              <FileTreeItem key={node.path} node={node} depth={0} ctx={ctx} />
             ))}
           </div>
         )}

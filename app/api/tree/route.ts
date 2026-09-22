@@ -3,30 +3,23 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
 import { getBranch } from '@/lib/vcsServer';
-import { IGNORED_ITEMS, MAX_TREE_NODES, DEFAULT_MAX_DEPTH } from '@/lib/fileTree';
+import { IGNORED_ITEMS } from '@/lib/fileTree';
 
 export interface FileTreeNode {
   name: string;
   path: string;
   type: 'file' | 'directory';
-  children?: FileTreeNode[];
 }
 
-interface WalkBudget {
-  remaining: number;
-  truncated: boolean;
-}
-
-async function buildFileTree(
-  dirPath: string,
-  maxDepth: number,
-  currentDepth: number,
-  budget: WalkBudget,
-): Promise<FileTreeNode[]> {
-  if (currentDepth >= maxDepth || budget.remaining <= 0) {
-    return [];
-  }
-
+/**
+ * List the IMMEDIATE children of `dirPath` (one level only).
+ *
+ * The tree is lazy-loaded: the client fetches the top level on load and each
+ * folder's children on expand, so there is no recursive walk and no node cap
+ * here anymore — depth is naturally 1 per request, which scales to any project
+ * size. (See docs/ticket-filetree-lazy-load-and-watcher-dedup.md.)
+ */
+async function listDirectory(dirPath: string): Promise<FileTreeNode[]> {
   try {
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
     const nodes: FileTreeNode[] = [];
@@ -37,29 +30,11 @@ async function buildFileTree(
         continue;
       }
 
-      if (budget.remaining <= 0) {
-        budget.truncated = true;
-        break;
-      }
-      budget.remaining--;
-
-      const fullPath = path.join(dirPath, entry.name);
-
-      if (entry.isDirectory()) {
-        const children = await buildFileTree(fullPath, maxDepth, currentDepth + 1, budget);
-        nodes.push({
-          name: entry.name,
-          path: fullPath,
-          type: 'directory',
-          children,
-        });
-      } else {
-        nodes.push({
-          name: entry.name,
-          path: fullPath,
-          type: 'file',
-        });
-      }
+      nodes.push({
+        name: entry.name,
+        path: path.join(dirPath, entry.name),
+        type: entry.isDirectory() ? 'directory' : 'file',
+      });
     }
 
     // Sort: directories first, then files, both alphabetically
@@ -249,24 +224,25 @@ export async function GET(request: NextRequest) {
       });
     }
 
-    const depthParam = searchParams.get('depth');
-    const maxDepth = depthParam ? Math.max(1, Math.min(50, parseInt(depthParam, 10) || DEFAULT_MAX_DEPTH)) : DEFAULT_MAX_DEPTH;
+    // Expand mode: fetching one folder's children on demand. The tree structure
+    // is all the caller needs — skip the (repo-wide, unchanged) VCS query.
+    if (searchParams.get('childrenOnly') === '1') {
+      const tree = await listDirectory(dirPath);
+      return NextResponse.json({ success: true, tree, root: dirPath });
+    }
 
-    const budget: WalkBudget = { remaining: MAX_TREE_NODES, truncated: false };
+    // Root load: the top level plus the full-repo VCS payload (cheap, and
+    // independent of the walk). Both badge status and folder "has changes" dots
+    // derive from `fileStatuses`, so it must accompany the initial load.
     const [tree, vcsResult] = await Promise.all([
-      buildFileTree(dirPath, maxDepth, 0, budget),
+      listDirectory(dirPath),
       getVcsStatus(dirPath),
     ]);
-
-    if (budget.truncated) {
-      console.warn(`/api/tree: ${dirPath} exceeded ${MAX_TREE_NODES} entries; tree truncated`);
-    }
 
     return NextResponse.json({
       success: true,
       tree,
       root: dirPath,
-      truncated: budget.truncated,
       vcs: vcsResult?.vcs || null,
       branch: vcsResult?.branch || null,
       fileStatuses: vcsResult?.statuses || null,

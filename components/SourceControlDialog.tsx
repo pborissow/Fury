@@ -206,10 +206,15 @@ export default React.memo(function SourceControlDialog({ open, projectPath, onCl
     }
   }, [open, projectPath, fetchStatus]);
 
-  // Live refresh while open: reuse the file-watcher SSE (same as FileTree)
+  // Live refresh while open: reuse the file-watcher SSE (same as FileTree).
+  // A bare GET watches the root + its VCS metadata dir (.git/.svn) through the
+  // shared, ref-counted registry — so this shares one OS-level watcher with any
+  // FileTree open on the same root instead of attaching its own. The dialog only
+  // needs the VCS-meta signal (commit/stage/branch); it never expands folders,
+  // so it doesn't drive the POST control channel.
   useEffect(() => {
     if (!open || !projectPath) return;
-    const es = new EventSource(`/api/tree/watch?path=${encodeURIComponent(projectPath)}`);
+    const es = new EventSource(`/api/tree/watch?root=${encodeURIComponent(projectPath)}`);
     es.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);

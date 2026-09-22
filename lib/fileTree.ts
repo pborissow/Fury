@@ -1,6 +1,3 @@
-import { promises as fs } from 'fs';
-import path from 'path';
-
 /** Directories and files never shown in the tree, and never counted or watched. */
 export const IGNORED_ITEMS = new Set([
   'node_modules',
@@ -89,72 +86,15 @@ export function classifyChange(relPath: string): ChangeKind | null {
 }
 
 /**
- * Upper bound on the number of nodes a single /api/tree response may contain,
- * and the ceiling above which we refuse to attach a recursive file watcher.
+ * Upper bound on how many entries a single bounded tree WALK may visit.
  *
- * A directory bigger than this (a drive root, a large network share, a
- * monorepo with generated output) is the failure mode this guards against:
- * the walk takes tens of seconds, and a recursive watch on it means every
- * write anywhere underneath triggers another full walk.
+ * NOTE: the /api/tree listing is no longer node-capped — it returns one
+ * directory level per request (lazy loading), so depth is naturally 1 and there
+ * is nothing to truncate (see
+ * docs/ticket-filetree-lazy-load-and-watcher-dedup.md). This constant now bounds
+ * only the one walk that genuinely recurses: the server-side filename search
+ * (/api/tree/search). A directory bigger than this (a drive root, a large
+ * network share, a monorepo with generated output) is the failure mode it
+ * guards against — the walk would otherwise take tens of seconds.
  */
 export const MAX_TREE_NODES = 20000;
-
-/** Depth limit used when no explicit depth is requested. */
-export const DEFAULT_MAX_DEPTH = 20;
-
-export interface EntryCount {
-  count: number;
-  /** True if the walk stopped early because `limit` was passed. */
-  exceeded: boolean;
-}
-
-/**
- * Counts the entries under `dirPath` that the tree walk would include, giving
- * up as soon as the total passes `limit`.
- *
- * This is deliberately bounded: it never visits more than ~`limit` entries, so
- * it stays cheap even when pointed at a whole volume. It applies the same
- * ignore rules and depth cap as buildFileTree, so the count reflects what would
- * actually be listed — without that, any project with a node_modules would
- * look oversized.
- *
- * Unreadable directories contribute 0 rather than throwing; a permission error
- * partway through shouldn't make a large tree look small enough to watch.
- */
-export async function countTreeEntries(
-  dirPath: string,
-  limit: number = MAX_TREE_NODES,
-  maxDepth: number = DEFAULT_MAX_DEPTH,
-): Promise<EntryCount> {
-  let count = 0;
-  // Iterative walk: a drive root can nest deeper than a comfortable recursion.
-  const stack: Array<{ dir: string; depth: number }> = [{ dir: dirPath, depth: 0 }];
-
-  while (stack.length > 0) {
-    const { dir, depth } = stack.pop()!;
-    if (depth >= maxDepth) continue;
-
-    let entries;
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      // Permission denied / vanished mid-walk — skip, same as the tree walk.
-      continue;
-    }
-
-    for (const entry of entries) {
-      if (IGNORED_ITEMS.has(entry.name)) continue;
-
-      count++;
-      if (count > limit) {
-        return { count, exceeded: true };
-      }
-
-      if (entry.isDirectory()) {
-        stack.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
-      }
-    }
-  }
-
-  return { count, exceeded: false };
-}
