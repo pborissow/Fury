@@ -1,25 +1,12 @@
 import { NextRequest } from 'next/server';
 import fs from 'fs';
 import path from 'path';
+import { classifyChange, countTreeEntries, MAX_TREE_NODES, type ChangeKind } from '@/lib/fileTree';
 
-const IGNORED_ITEMS = new Set([
-  'node_modules',
-  '.next',
-  '.git',
-  '.svn',
-  'dist',
-  'build',
-  'out',
-  '.DS_Store',
-  'coverage',
-  '.turbo',
-  '.cache',
-]);
-
-function isIgnored(filePath: string): boolean {
-  const parts = filePath.split(/[\\/]/);
-  return parts.some((part) => IGNORED_ITEMS.has(part));
-}
+// Metadata bursts are longer than a file save: a commit writes the index, then
+// objects, then refs. Waiting a little longer avoids reading a half-done commit.
+const FILE_DEBOUNCE_MS = 300;
+const VCS_DEBOUNCE_MS = 500;
 
 export const dynamic = 'force-dynamic';
 
@@ -40,10 +27,25 @@ export async function GET(request: NextRequest) {
     return new Response('Directory does not exist', { status: 404 });
   }
 
+  // Size sanity check before attaching a recursive watcher. On a directory this
+  // large every write underneath triggers a full tree refetch, and the refetch
+  // itself takes tens of seconds — together that's enough to take the server
+  // down. Drive roots are the obvious case, but any large share or monorepo
+  // hits it too. Bounded: gives up as soon as the cap is passed.
+  const { exceeded } = await countTreeEntries(dirPath, MAX_TREE_NODES);
+  if (exceeded) {
+    console.warn(`/api/tree/watch: refusing to watch ${dirPath} (over ${MAX_TREE_NODES} entries)`);
+    // A non-2xx status makes EventSource fail permanently rather than
+    // reconnecting in a loop.
+    return new Response('Directory too large to watch', { status: 413 });
+  }
+
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
-      let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+      // One debounce timer per event kind, so a burst of file saves can't keep
+      // postponing a pending vcs refresh (or the reverse).
+      const debounceTimers = new Map<ChangeKind, ReturnType<typeof setTimeout>>();
 
       const send = (data: string) => {
         try {
@@ -64,18 +66,25 @@ export async function GET(request: NextRequest) {
       let watcher: fs.FSWatcher;
       try {
         watcher = fs.watch(dirPath, { recursive: true }, (_eventType, filename) => {
-          if (filename && isIgnored(filename)) return;
+          if (!filename) return;
 
-          // Debounce: batch rapid changes into a single event
-          if (debounceTimer) clearTimeout(debounceTimer);
-          debounceTimer = setTimeout(() => {
-            const changedPath = filename ? path.join(dirPath, filename) : null;
+          // A commit/stage/branch-switch only ever touches .git or .svn, so
+          // those events are the sole signal that status badges went stale.
+          const kind = classifyChange(filename);
+          if (!kind) return;
+
+          // Debounce per kind: batch rapid changes into a single event. A
+          // commit fires ~70 raw events, nearly all of them metadata.
+          const pending = debounceTimers.get(kind);
+          if (pending) clearTimeout(pending);
+          debounceTimers.set(kind, setTimeout(() => {
+            debounceTimers.delete(kind);
             send(JSON.stringify({
-              type: 'change',
-              path: changedPath,
-              filename: filename || null,
+              type: kind === 'vcs' ? 'vcs-change' : 'change',
+              path: path.join(dirPath, filename),
+              filename,
             }));
-          }, 300);
+          }, kind === 'vcs' ? VCS_DEBOUNCE_MS : FILE_DEBOUNCE_MS));
         });
       } catch (err) {
         console.error('Error starting fs.watch:', err);
@@ -87,7 +96,8 @@ export async function GET(request: NextRequest) {
 
       // Clean up when the client disconnects
       request.signal.addEventListener('abort', () => {
-        if (debounceTimer) clearTimeout(debounceTimer);
+        for (const t of debounceTimers.values()) clearTimeout(t);
+        debounceTimers.clear();
         clearInterval(keepAlive);
         watcher.close();
         try {

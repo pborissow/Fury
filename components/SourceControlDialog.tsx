@@ -213,7 +213,9 @@ export default React.memo(function SourceControlDialog({ open, projectPath, onCl
     es.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.type === 'change') {
+        // 'vcs-change' covers commits/stages made outside Fury, which touch
+        // only .git|.svn and so never emit a plain 'change'.
+        if (data.type === 'change' || data.type === 'vcs-change') {
           fetchStatus();
           setFsVersion((v) => v + 1);
         }

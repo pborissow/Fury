@@ -3,6 +3,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
 import { getBranch } from '@/lib/vcsServer';
+import { IGNORED_ITEMS, MAX_TREE_NODES, DEFAULT_MAX_DEPTH } from '@/lib/fileTree';
 
 export interface FileTreeNode {
   name: string;
@@ -11,23 +12,18 @@ export interface FileTreeNode {
   children?: FileTreeNode[];
 }
 
-// List of directories and files to ignore
-const IGNORED_ITEMS = new Set([
-  'node_modules',
-  '.next',
-  '.git',
-  '.svn',
-  'dist',
-  'build',
-  'out',
-  '.DS_Store',
-  'coverage',
-  '.turbo',
-  '.cache',
-]);
+interface WalkBudget {
+  remaining: number;
+  truncated: boolean;
+}
 
-async function buildFileTree(dirPath: string, maxDepth: number = 20, currentDepth: number = 0): Promise<FileTreeNode[]> {
-  if (currentDepth >= maxDepth) {
+async function buildFileTree(
+  dirPath: string,
+  maxDepth: number,
+  currentDepth: number,
+  budget: WalkBudget,
+): Promise<FileTreeNode[]> {
+  if (currentDepth >= maxDepth || budget.remaining <= 0) {
     return [];
   }
 
@@ -41,10 +37,16 @@ async function buildFileTree(dirPath: string, maxDepth: number = 20, currentDept
         continue;
       }
 
+      if (budget.remaining <= 0) {
+        budget.truncated = true;
+        break;
+      }
+      budget.remaining--;
+
       const fullPath = path.join(dirPath, entry.name);
 
       if (entry.isDirectory()) {
-        const children = await buildFileTree(fullPath, maxDepth, currentDepth + 1);
+        const children = await buildFileTree(fullPath, maxDepth, currentDepth + 1, budget);
         nodes.push({
           name: entry.name,
           path: fullPath,
@@ -70,7 +72,12 @@ async function buildFileTree(dirPath: string, maxDepth: number = 20, currentDept
 
     return nodes;
   } catch (error) {
-    console.error(`Error reading directory ${dirPath}:`, error);
+    // Permission-denied directories (e.g. "System Volume Information" on a
+    // Windows drive root) are expected; don't spam the log with stack traces.
+    const code = (error as NodeJS.ErrnoException)?.code;
+    if (code !== 'EPERM' && code !== 'EACCES') {
+      console.error(`Error reading directory ${dirPath}:`, error);
+    }
     return [];
   }
 }
@@ -228,18 +235,38 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const depthParam = searchParams.get('depth');
-    const maxDepth = depthParam ? Math.max(1, Math.min(50, parseInt(depthParam, 10) || 20)) : 20;
+    // Status-only mode: a commit or branch switch leaves the tree untouched but
+    // makes every badge stale. Re-walking the whole tree to learn that would be
+    // pure waste, so skip it and return just the VCS fields.
+    if (searchParams.get('statusOnly') === '1') {
+      const vcsOnly = await getVcsStatus(dirPath);
+      return NextResponse.json({
+        success: true,
+        root: dirPath,
+        vcs: vcsOnly?.vcs || null,
+        branch: vcsOnly?.branch || null,
+        fileStatuses: vcsOnly?.statuses || null,
+      });
+    }
 
+    const depthParam = searchParams.get('depth');
+    const maxDepth = depthParam ? Math.max(1, Math.min(50, parseInt(depthParam, 10) || DEFAULT_MAX_DEPTH)) : DEFAULT_MAX_DEPTH;
+
+    const budget: WalkBudget = { remaining: MAX_TREE_NODES, truncated: false };
     const [tree, vcsResult] = await Promise.all([
-      buildFileTree(dirPath, maxDepth),
+      buildFileTree(dirPath, maxDepth, 0, budget),
       getVcsStatus(dirPath),
     ]);
+
+    if (budget.truncated) {
+      console.warn(`/api/tree: ${dirPath} exceeded ${MAX_TREE_NODES} entries; tree truncated`);
+    }
 
     return NextResponse.json({
       success: true,
       tree,
       root: dirPath,
+      truncated: budget.truncated,
       vcs: vcsResult?.vcs || null,
       branch: vcsResult?.branch || null,
       fileStatuses: vcsResult?.statuses || null,

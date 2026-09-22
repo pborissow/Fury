@@ -151,6 +151,7 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
   const [fileStatuses, setFileStatuses] = useState<VcsStatusMap | null>(null);
   const [vcs, setVcs] = useState<'git' | 'svn' | null>(null);
   const [branch, setBranch] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
@@ -174,6 +175,7 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
       setFileStatuses(data.fileStatuses || null);
       setVcs(data.vcs || null);
       setBranch(data.branch || null);
+      setTruncated(!!data.truncated);
     } catch (err) {
       console.error('Error fetching file tree:', err);
       setError(err instanceof Error ? err.message : 'Failed to load directory tree');
@@ -181,6 +183,25 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
       if (showLoading) setLoading(false);
     }
   }, [projectPath, maxDepth]);
+
+  // Refresh only the VCS badges. Used when repository metadata changed (commit,
+  // stage, branch switch): the tree itself is unaffected, so walking it again
+  // would be wasted work — and on a big project a visible stall.
+  const fetchVcsStatus = useCallback(async () => {
+    if (!projectPath) return;
+    try {
+      const response = await fetch(
+        `/api/tree?path=${encodeURIComponent(projectPath)}&statusOnly=1`
+      );
+      if (!response.ok) return;
+      const data = await response.json();
+      setFileStatuses(data.fileStatuses || null);
+      setVcs(data.vcs || null);
+      setBranch(data.branch || null);
+    } catch {
+      // Transient; the next event will retry.
+    }
+  }, [projectPath]);
 
   // Initial fetch
   useEffect(() => {
@@ -190,6 +211,7 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
       setFileStatuses(null);
       setVcs(null);
       setBranch(null);
+      setTruncated(false);
       return;
     }
 
@@ -209,8 +231,11 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
     eventSource.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        if (data.type === 'change' && initialLoadDone.current) {
+        if (!initialLoadDone.current) return;
+        if (data.type === 'change') {
           fetchTree(false);
+        } else if (data.type === 'vcs-change') {
+          fetchVcsStatus();
         }
       } catch {
         // Ignore malformed messages
@@ -224,7 +249,7 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
     return () => {
       eventSource.close();
     };
-  }, [projectPath, fetchTree]);
+  }, [projectPath, fetchTree, fetchVcsStatus]);
 
   const allFiles = useMemo(() => collectFiles(tree), [tree]);
 
@@ -269,6 +294,13 @@ export default function FileTree({ projectPath, onFileDoubleClick, maxDepth, onO
 
   return (
     <div className="flex flex-col h-full select-none">
+      {truncated && (
+        <div className="px-3 py-2 shrink-0 text-xs text-muted-foreground border-b border-border">
+          This directory is too large to list in full — only part of the tree is
+          shown. Start the session in a project folder rather than a drive root.
+        </div>
+      )}
+
       {/* Search bar */}
       <div className="px-2 pt-2 pb-1 shrink-0">
         <div className="relative">

@@ -610,8 +610,18 @@ export default function ChatTab({
   // overlay slot: the main flow keeps reading "your prompt + dots" instead of
   // the prompt vanishing until the reveal. (Task-notification user strings never
   // leave the parser, so only real prompts can appear here.)
+  //
+  // The echo defers only to an overlay with ACTUAL content — not to a blank
+  // one. A restore that overlaid a notification-turn buffer's empty userPrompt
+  // used to both paint a blank "You" bubble and (via a bare length check here)
+  // suppress the echo, leaving the task's real prompt invisible (2026-09-19
+  // report). The restore no longer sets that overlay, and this guard keeps any
+  // other empty-overlay path from re-creating the hole.
+  const overlayHasContent = transcriptOverlayMessages.some(
+    (m) => (m.content && m.content.trim() !== '') || (m.images?.length ?? 0) > 0,
+  );
   const envelopeUserEcho =
-    envelopeOpen && transcriptOverlayMessages.length === 0
+    envelopeOpen && !overlayHasContent
       ? historyTranscript.filter((m) => {
           if (m.role !== 'user' || !m.timestamp) return false;
           const t = Date.parse(m.timestamp);
@@ -896,7 +906,16 @@ export default function ChatTab({
               stripInFlightPartials(prev, typeof bufData.startedAt === 'number' ? bufData.startedAt : 0),
             );
 
-            setTranscriptOverlayMessages([{ role: 'user' as const, content: bufData.userPrompt }]);
+            // Only overlay a REAL prompt. A notification/auto turn's buffer
+            // carries userPrompt '' (reassertProcessing — no user-typed prompt),
+            // and overlaying that painted a blank "You" bubble AND suppressed
+            // envelopeUserEcho (which defers to any overlay), leaving the
+            // task's real opening prompt invisible when a session is opened
+            // mid-notification-turn (screenshot report, 2026-09-19). With no
+            // overlay, the echo resurfaces the committed prompt instead.
+            if (bufData.userPrompt) {
+              setTranscriptOverlayMessages([{ role: 'user' as const, content: bufData.userPrompt }]);
+            }
             setTranscriptStreaming(bufData.accumulatedText || '');
             setStreamEvents(bufData.events || []);
             setTranscriptLoading(true);
