@@ -10,6 +10,13 @@ import { type ChangeKind } from '@/lib/fileTree';
 const FILE_DEBOUNCE_MS = 300;
 const VCS_DEBOUNCE_MS = 500;
 
+const KEEPALIVE_MS = 30_000;
+/** Queued-but-undrained chunks tolerated before the peer is presumed gone. */
+const MAX_QUEUED_CHUNKS = 256;
+/** Consecutive keepalives that go undrained before the peer is presumed gone.
+ *  At KEEPALIVE_MS this is ~2 minutes of a reader that never pulls. */
+const MAX_STALLED_PINGS = 4;
+
 export const dynamic = 'force-dynamic';
 
 /**
@@ -192,13 +199,43 @@ export async function GET(request: NextRequest) {
   }
 
   let subscriptionId = '';
+  let teardown: (() => void) | null = null;
 
   const stream = new ReadableStream({
     start(controller) {
       const encoder = new TextEncoder();
+      let keepAlive: ReturnType<typeof setInterval> | null = null;
+      let torn = false;
+
+      // Unsubscribe ALL of this subscription's dirs (decrementing registry
+      // refcounts, closing any watcher no other subscription needs) and drop
+      // the registry entry. Idempotent: reachable from abort, stream cancel,
+      // and the liveness probe below.
+      const release = () => {
+        if (torn) return;
+        torn = true;
+        if (keepAlive) clearInterval(keepAlive);
+        registry.close(subscriptionId);
+        try {
+          controller.close();
+        } catch {
+          // Already closed
+        }
+      };
+      teardown = release;
 
       const send = (data: string) => {
+        if (torn) return;
         try {
+          // enqueue() does NOT throw when nobody is reading — it silently grows
+          // an internal queue. Without this cap a client that stops draining is
+          // an unbounded sink, and because the subscription also pins refcounts
+          // on SHARED watchers, it keeps those alive for every other viewer too.
+          if (controller.desiredSize !== null && controller.desiredSize < -MAX_QUEUED_CHUNKS) {
+            console.warn(`/api/tree/watch: client for ${root} stopped draining; closing`);
+            release();
+            return;
+          }
           controller.enqueue(encoder.encode(`data: ${data}\n\n`));
         } catch {
           // Stream closed
@@ -210,23 +247,31 @@ export async function GET(request: NextRequest) {
       // Tell the client its subscriptionId so it can drive the control channel.
       send(JSON.stringify({ type: 'connected', subscriptionId }));
 
-      // Keep-alive ping every 30s to prevent timeout
-      const keepAlive = setInterval(() => {
-        send(JSON.stringify({ type: 'ping' }));
-      }, 30000);
-
-      // Clean up when the client disconnects: unsubscribe ALL of this
-      // subscription's dirs (decrement registry refcounts, closing any watcher
-      // no other subscription needs).
-      request.signal.addEventListener('abort', () => {
-        clearInterval(keepAlive);
-        registry.close(subscriptionId);
-        try {
-          controller.close();
-        } catch {
-          // Already closed
+      // Keep-alive ping every 30s to prevent timeout — and double as a liveness
+      // probe. A half-open socket (laptop sleep, Wi-Fi drop, NAT eviction) never
+      // emits a FIN, so `request.signal` never aborts and the subscription would
+      // otherwise live forever. If our own pings stop being drained, the peer is
+      // gone regardless of what the socket claims.
+      let stalledPings = 0;
+      keepAlive = setInterval(() => {
+        if (controller.desiredSize !== null && controller.desiredSize < 0) {
+          if (++stalledPings >= MAX_STALLED_PINGS) {
+            console.warn(`/api/tree/watch: no reader for ${root} across ` +
+              `${MAX_STALLED_PINGS} pings; closing`);
+            release();
+            return;
+          }
+        } else {
+          stalledPings = 0;
         }
-      });
+        send(JSON.stringify({ type: 'ping' }));
+      }, KEEPALIVE_MS);
+
+      request.signal.addEventListener('abort', release);
+    },
+    // The consumer went away without aborting the request.
+    cancel() {
+      teardown?.();
     },
   });
 

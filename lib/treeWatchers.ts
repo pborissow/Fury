@@ -92,12 +92,22 @@ class TreeWatchers {
         rearmTimer: null,
       };
       const watcher = this.createWatcher(dir, entry);
-      if (!watcher) {
-        // Could not attach (dir gone, unsupported recursive on Linux, ...).
-        return () => { /* nothing to tear down */ };
-      }
       entry.watcher = watcher;
       this.entries.set(dir, entry);
+
+      if (!watcher) {
+        // Could not attach yet — commonly EMFILE under descriptor pressure
+        // (macOS defaults are low), or the dir is mid-rename.
+        //
+        // Do NOT hand back a no-op handle: callers record the handle and then
+        // skip re-subscribing that dir, so a transient failure would silently
+        // disable it for the life of the connection. Keep the entry and retry
+        // with the same backoff used for a watcher that dies later. The retry
+        // is deferred by a timer, so the subscriber added below is already in
+        // place when it runs (rearm drops an entry with no subscribers).
+        entry.rearmRetries = 1;
+        entry.rearmTimer = setTimeout(() => this.rearm(dir), 1000);
+      }
     }
 
     entry.subscribers.add(onChange);
@@ -184,9 +194,16 @@ class TreeWatchers {
     return this.entries.get(dir)?.subscribers.size ?? 0;
   }
 
-  /** Whether `dir` currently has an attached watcher (test/introspection). */
+  /** Whether `dir` is currently subscribed (test/introspection). Note this is
+   *  true while an entry is between rearm attempts, i.e. registered but not
+   *  attached; use `isAttached` when that distinction matters. */
   isWatching(dir: string): boolean {
     return this.entries.has(dir);
+  }
+
+  /** Whether `dir` has a live OS-level watcher right now (test/introspection). */
+  isAttached(dir: string): boolean {
+    return !!this.entries.get(dir)?.watcher;
   }
 
   /** Close every watcher. Call on server shutdown. */
