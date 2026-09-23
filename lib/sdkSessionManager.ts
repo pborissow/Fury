@@ -24,6 +24,7 @@ import { detectUsageLimit } from './providerSwitch';
 import { findSessionJsonlDir } from './sessionPaths';
 import { scrubSessionFile } from './imageScrubber';
 import { settingsPersistence } from './settingsPersistence';
+import { recordServedWindow } from './modelWindows';
 // Type-only (erased at compile time) — no runtime coupling to the CLI manager.
 // Reusing its shapes keeps /api/stream-buffer and ChatTab identical for both
 // backends.
@@ -2905,6 +2906,12 @@ class SdkSessionManager {
           const win = this.windowForMainModel(s, mu);
           if (win > 0) {
             s.contextWindow = win;
+            // Enrich the empirical window store (lib/model-windows.json) from
+            // this REAL capture — the runtime layer lib/modelWindows.ts's doc
+            // describes but that nothing else wired. A window seen below the 1M
+            // ceiling confirms the model's base; recordServedWindow merges
+            // (lowers base / raises ceiling) and no-ops when it learns nothing.
+            void recordServedWindow(s.model, win, 'observed');
             // Persist on EVERY result, not only when the value changes: at the
             // first result the sessions row usually doesn't exist yet (the
             // archiver creates it), so that write is a no-op and a change-gated

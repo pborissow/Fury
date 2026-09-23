@@ -17,7 +17,7 @@ import { readdir, readFile, stat } from 'fs/promises';
 import { furyDbPath } from './furyHome';
 import { parseTranscriptJsonl } from './transcriptParser';
 import { PRICING, PRICING_AS_OF } from './pricing';
-import { hasAnyConfirmedWindow } from './modelWindows';
+import { hasAnyConfirmedWindow, enrichWindowsFromHistory } from './modelWindows';
 
 const GLOBAL_KEY = '__fury_db__';
 const PROMISE_KEY = '__fury_db_promise__';
@@ -625,13 +625,25 @@ async function initDb(client: Client): Promise<void> {
   // don't scan the archive at all; sessions stay unstamped and get processed
   // once a probe confirms a window.
   try {
-    if (!IN_TEST && hasAnyConfirmedWindow()) {
-      // Branching lives in lib/baseWindowBackfill (unit-tested there against a
-      // fake client, since IN_TEST keeps this path out of the suite).
-      const { backfillBaseWindows } = await import('./baseWindowBackfill');
-      const { filled } = await backfillBaseWindows(client);
-      if (filled > 0) {
-        console.log(`[DB] Filled a base context window for ${filled} previously-unknown sessions`);
+    if (!IN_TEST) {
+      // First LEARN base windows already present in the archive (a served window
+      // seen below the 1M ceiling self-confirms), so the pricing dialog and the
+      // session backfill below pick up every model we already have evidence for
+      // — not just the maintainer-probed seed. Models only ever served at 1M
+      // stay unconfirmed (a probe is the only way to learn their base).
+      const learned = await enrichWindowsFromHistory(client);
+      if (learned > 0) {
+        console.log(`[DB] Learned/updated ${learned} model base window(s) from history`);
+      }
+
+      if (hasAnyConfirmedWindow()) {
+        // Branching lives in lib/baseWindowBackfill (unit-tested there against a
+        // fake client, since IN_TEST keeps this path out of the suite).
+        const { backfillBaseWindows } = await import('./baseWindowBackfill');
+        const { filled } = await backfillBaseWindows(client);
+        if (filled > 0) {
+          console.log(`[DB] Filled a base context window for ${filled} previously-unknown sessions`);
+        }
       }
     }
   } catch (err) {

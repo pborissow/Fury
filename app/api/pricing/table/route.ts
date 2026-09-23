@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { getPricingTable, hasPricingOverrides, PRICING_AS_OF } from '@/lib/pricing';
-import { loadPricingOverrides } from '@/lib/pricingPoller';
+import { getPricingTable, hasPricingOverrides } from '@/lib/pricing';
+import { loadPricingOverrides, pricingAsOfDay } from '@/lib/pricingPoller';
 import { baseWindowFor } from '@/lib/modelWindows';
 
 export const runtime = 'nodejs';
@@ -31,7 +31,7 @@ export async function GET() {
     const models = getPricingTable().map(m => ({ ...m, baseWindow: baseWindowFor(m.id) }));
 
     return NextResponse.json({
-      asOf: PRICING_AS_OF,
+      asOf: await pricingAsOfDay(),
       hasOverrides: hasPricingOverrides(),
       models,
     });

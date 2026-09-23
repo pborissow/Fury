@@ -86,6 +86,8 @@ export default function ChatTab({
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [isLoadingMoreHistory, setIsLoadingMoreHistory] = useState(false);
   const historyLengthRef = useRef(0);
+  /** Server-issued cursor for the last history entry we hold (see fetchHistory). */
+  const historyCursorRef = useRef<string | null>(null);
   const [liveSessionIds, setLiveSessionIds] = useState<Set<string>>(new Set());
   // Per-session epoch-ms of the last turn completion. Anchors the prompt-cache
   // freshness leaf in the sidebar — stamped when a viewed session stops
@@ -707,18 +709,35 @@ export default function ChatTab({
   // 25, ask the API for at least as many entries as we already display.
   const fetchHistory = async (opts?: { append?: boolean }) => {
     const append = opts?.append === true;
-    const offset = append ? historyLengthRef.current : 0;
+
+    // Append pages by CURSOR, never by offset. The list mutates under us while
+    // scrolling (a new session is prepended on submit, an archive removes one),
+    // and a positional offset silently skips or repeats entries across that
+    // seam. The cursor names the last entry we hold, so the server resumes
+    // exactly after it regardless of what moved.
+    if (append && !historyCursorRef.current) return;
+
+    // A refresh re-requests everything currently on screen so a deep scroll
+    // position survives it. The server applies no upper bound, so this can't
+    // come back short and truncate the list.
     const limit = append
       ? HISTORY_PAGE_SIZE
       : Math.max(HISTORY_PAGE_SIZE, historyLengthRef.current);
+    const qs = append
+      ? `limit=${limit}&cursor=${encodeURIComponent(historyCursorRef.current!)}`
+      : `limit=${limit}`;
+
     if (append) setIsLoadingMoreHistory(true); else setIsLoadingHistory(true);
     try {
-      const res = await fetch(`/api/history?limit=${limit}&offset=${offset}`);
+      const res = await fetch(`/api/history?${qs}`);
       if (res.ok) {
         const data = await res.json();
         const incoming: HistoryEntry[] = data.entries || [];
         if (append) {
           setHistory(prev => {
+            // Dedup is a belt-and-braces guard only; the cursor should already
+            // guarantee no overlap. It must NOT drive the next cursor, which
+            // comes from the server's own last-returned entry.
             const seen = new Set(prev.map(e => e.sessionId).filter(Boolean) as string[]);
             const merged = [...prev];
             for (const e of incoming) {
@@ -732,6 +751,10 @@ export default function ChatTab({
           setHistory(incoming);
           historyLengthRef.current = incoming.length;
         }
+        // Track the server's cursor for the last entry it returned. On a
+        // refresh this re-anchors to the end of the refreshed window.
+        if (data.nextCursor) historyCursorRef.current = data.nextCursor;
+        else if (!append) historyCursorRef.current = null;
         setHistoryHasMore(!!data.hasMore);
       }
     } catch (error) {

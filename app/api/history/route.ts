@@ -14,14 +14,34 @@ interface HistoryEntry {
   pastedContents?: Record<string, unknown>;
 }
 
+/** Sort order for the session list, and the order cursor paging walks:
+ *  most recent first, ties broken by stable id so the sequence is total. */
+function byRecencyThenId(
+  a: { timestamp: number; cursorId?: string },
+  b: { timestamp: number; cursorId?: string },
+): number {
+  if (b.timestamp !== a.timestamp) return b.timestamp - a.timestamp;
+  const ai = String(a.cursorId ?? '');
+  const bi = String(b.cursorId ?? '');
+  return ai < bi ? -1 : ai > bi ? 1 : 0;
+}
+
 export async function GET(req: NextRequest) {
   try {
     const historyPath = join(homedir(), '.claude', 'history.jsonl');
     const url = new URL(req.url);
     const limitParam = Number.parseInt(url.searchParams.get('limit') || '', 10);
     const offsetParam = Number.parseInt(url.searchParams.get('offset') || '', 10);
-    const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 200) : 25;
+    // No upper clamp: the full list is materialized below regardless of `limit`,
+    // so capping it only truncates the caller's view. A refresh that re-requests
+    // everything already on screen must never come back short — that silently
+    // drops sessions the user has scrolled to.
+    const limit = Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 25;
     const offset = Number.isFinite(offsetParam) && offsetParam > 0 ? offsetParam : 0;
+    // Opaque cursor: "<timestamp>:<cursorId>". Preferred over `offset` for
+    // paging deeper, because offsets shift when a session is prepended or
+    // removed mid-scroll and silently skip entries across the seam.
+    const cursor = url.searchParams.get('cursor');
 
     try {
       const content = await readFile(historyPath, 'utf-8');
@@ -64,14 +84,22 @@ export async function GET(req: NextRequest) {
         }
       }
 
-      // Sort by timestamp (most recent first), drop sessions with no meaningful messages
+      // Sort by timestamp (most recent first), drop sessions with no meaningful messages.
+      //
+      // `cursorId` is the stable per-session key (sessionId, or a synthetic one
+      // for the rare history line without a session). It breaks timestamp ties
+      // deterministically so that paging by cursor can't straddle a tie and
+      // repeat or skip an entry. Plain < / > is used rather than localeCompare
+      // so the sort order and the cursor comparison below agree exactly —
+      // locale collation and code-unit order disagree on some inputs.
       let allEntriesFlat = Array.from(sessionBestEntry.entries())
         .filter(([, entry]) => !isSkippableDisplay(entry.display))
         .map(([key, entry]) => ({
           ...entry,
           messageCount: sessionMessageCount.get(key) || 0,
+          cursorId: key,
         }))
-        .sort((a, b) => b.timestamp - a.timestamp);
+        .sort(byRecencyThenId);
 
       // Merge archived sessions from SQLite (surfaces sessions that survived
       // in the DB after Claude deleted the JSONL + history entries)
@@ -121,13 +149,14 @@ export async function GET(req: NextRequest) {
             timestamp: archived.updated_at,
             project: archived.project,
             sessionId: archived.session_id,
+            cursorId: archived.session_id,
             messageCount: archived.message_count,
             ...(archived.metadata ? { metadata: archived.metadata } : {}),
           } as any);
         }
 
-        // Re-sort after merging
-        allEntriesFlat.sort((a, b) => b.timestamp - a.timestamp);
+        // Re-sort after merging (same comparator — cursor paging depends on it)
+        allEntriesFlat.sort(byRecencyThenId);
       } catch (archiveErr) {
         // Deliberately fails OPEN: on a DB error we serve the unfiltered
         // history.jsonl list rather than blanking the sidebar. The cost is that
@@ -139,10 +168,31 @@ export async function GET(req: NextRequest) {
       }
 
       const total = allEntriesFlat.length;
-      const entries = allEntriesFlat.slice(offset, offset + limit);
-      const hasMore = offset + entries.length < total;
 
-      return new Response(JSON.stringify({ entries, hasMore, total }), {
+      // Resolve the start of the page. A cursor names the LAST entry the client
+      // already has; we resume at the first entry that sorts strictly after it.
+      // Because that is a value comparison rather than a positional offset, it
+      // stays correct when entries are prepended (a new session), removed (an
+      // archive), or when the cursor's own entry no longer exists.
+      let start = offset;
+      if (cursor) {
+        const sep = cursor.indexOf(':');
+        const cTs = Number(cursor.slice(0, sep));
+        const cId = cursor.slice(sep + 1);
+        if (sep > 0 && Number.isFinite(cTs)) {
+          const idx = allEntriesFlat.findIndex(
+            e => e.timestamp < cTs || (e.timestamp === cTs && String(e.cursorId) > cId),
+          );
+          start = idx < 0 ? total : idx;
+        }
+      }
+
+      const entries = allEntriesFlat.slice(start, start + limit);
+      const last = entries[entries.length - 1];
+      const nextCursor = last ? `${last.timestamp}:${last.cursorId}` : null;
+      const hasMore = start + entries.length < total;
+
+      return new Response(JSON.stringify({ entries, hasMore, total, nextCursor }), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });

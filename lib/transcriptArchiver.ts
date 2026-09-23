@@ -37,6 +37,12 @@ export interface SessionMetadata {
  * never contend. The tail is swallowed so one failure can't reject the next op.
  */
 const metaChains = new Map<string, Promise<unknown>>();
+
+/** Retention probe for GET /api/diagnostics/memory. Read-only. A non-trivial
+ *  standing value here means archive operations are queueing behind the lock. */
+export function archiverLockStats(): { metaChains: number } {
+  return { metaChains: metaChains.size };
+}
 function withSessionMetaLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
   const prev = metaChains.get(sessionId) ?? Promise.resolve();
   const run = prev.then(fn, fn); // run regardless of the previous op's outcome

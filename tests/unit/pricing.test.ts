@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { cacheRewriteCost, costForUsage, latestRate, modelTierRank, rateFor } from '../../lib/pricing';
+import { cacheRewriteCost, costForUsage, latestRate, modelTierRank, normalizeModelId, rateFor } from '../../lib/pricing';
 
 describe('modelTierRank — picker ordering', () => {
   it('orders the catalog most-capable-first: fable, opus, sonnet, haiku', () => {
@@ -47,6 +47,36 @@ describe('cacheRewriteCost — the model-switch quote', () => {
     expect(cacheRewriteCost('us.anthropic.claude-sonnet-4-6', 400_000)).toBeNull();
     expect(cacheRewriteCost('claude-opus-4-8', 0)).toBeNull();
     expect(cacheRewriteCost(null, 400_000)).toBeNull();
+  });
+});
+
+describe('current-gen models are priced (no more "—" in the Stats table)', () => {
+  // Sessions on claude-opus-5 / claude-fable-5-1 showed blank cost because the
+  // models were absent from PRICING. They're now present with page-verified rates.
+  it('prices Opus 5 at the standard $5/$25, 0.1x cache read', () => {
+    expect(latestRate('claude-opus-5')).toMatchObject({
+      input: 5, output: 25, cacheWrite5m: 6.25, cacheWrite1h: 10, cacheRead: 0.5,
+    });
+    expect(costForUsage('claude-opus-5', {
+      input: 100, output: 100, cacheWrite5m: 0, cacheWrite1h: 0, cacheRead: 0,
+    }).priced).toBe(true);
+  });
+
+  it('prices Fable 5.1 with the NON-standard 0.025x cache read ($0.25, not $1.00)', () => {
+    expect(latestRate('claude-fable-5-1')).toMatchObject({
+      input: 10, output: 50, cacheWrite5m: 12.5, cacheWrite1h: 20, cacheRead: 0.25,
+    });
+  });
+
+  it('prices Opus 5.5 with the NON-standard 0.05x cache read ($0.20, not $0.40)', () => {
+    expect(latestRate('claude-opus-5-5')).toMatchObject({
+      input: 4, output: 20, cacheWrite5m: 5, cacheWrite1h: 8, cacheRead: 0.2,
+    });
+  });
+
+  it('normalizes dated snapshots of the new models onto their PRICING key', () => {
+    expect(normalizeModelId('claude-opus-5-20251201')).toBe('claude-opus-5');
+    expect(latestRate('claude-fable-5-1-20260115')).toMatchObject({ input: 10, output: 50 });
   });
 });
 

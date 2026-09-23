@@ -119,3 +119,35 @@ describe('deriveObservedWindows (MIN base + confirmed gate)', () => {
   });
 });
 
+describe('enrichWindowsFromHistory (additive boot backfill)', () => {
+  const fakeDb = (rows: any[]) => ({ execute: async () => ({ rows }) }) as any;
+
+  it('adds a confirmed sub-ceiling base for a model missing from the store', async () => {
+    const n = await mw.enrichWindowsFromHistory(fakeDb([
+      { model: 'claude-opus-9-1', base: 200_000, ceiling: 1_000_000, max_prompt: 500_000 },
+    ]));
+    expect(n).toBeGreaterThanOrEqual(1);
+    const e = mw.windowFor('claude-opus-9-1')!;
+    expect(e.base).toBe(200_000);
+    expect(e.ceiling).toBe(1_000_000);         // larger served window reflected
+    expect(mw.hasConfirmedBase(e)).toBe(true);
+  });
+
+  it('skips models only ever served at the 1M ceiling (unconfirmed)', async () => {
+    await mw.enrichWindowsFromHistory(fakeDb([
+      { model: 'claude-opus-9-2', base: 1_000_000, ceiling: 1_000_000, max_prompt: 999_999 },
+    ]));
+    expect(mw.windowFor('claude-opus-9-2')).toBeNull();
+  });
+
+  it('never overwrites an authoritative probe seed', async () => {
+    await mw.recordServedWindow('claude-opus-9-3', 1_000_000, 'probe'); // probe says base = 1M
+    await mw.enrichWindowsFromHistory(fakeDb([
+      { model: 'claude-opus-9-3', base: 200_000, ceiling: 1_000_000, max_prompt: 500_000 },
+    ]));
+    const e = mw.windowFor('claude-opus-9-3')!;
+    expect(e.base).toBe(1_000_000); // probe base stands, not lowered to the observed 200k
+    expect(e.source).toBe('probe');
+  });
+});
+

@@ -18,7 +18,8 @@
 
 import { NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
-import { costForUsage, normalizeModelId, PRICING_AS_OF } from '@/lib/pricing';
+import { costForUsage, normalizeModelId } from '@/lib/pricing';
+import { pricingAsOfDay } from '@/lib/pricingPoller';
 
 const DEFAULT_TZ = 'America/New_York';
 
@@ -232,7 +233,7 @@ export async function GET(req: Request) {
 
     return NextResponse.json({
       timezone: tz,
-      pricingAsOf: PRICING_AS_OF,
+      pricingAsOf: await pricingAsOfDay(),
       generatedAt: Date.now(),
       today: localDay(Date.now()),
       models,

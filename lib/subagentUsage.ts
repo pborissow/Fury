@@ -44,6 +44,15 @@ export function subagentsDirFor(sessionId: string, project: string): string {
 const fileCache = new Map<string, { mtimeMs: number; size: number; events: UsageEvent[] }>();
 const FILE_CACHE_MAX = 10_000;
 
+/** Retention probe for GET /api/diagnostics/memory. Read-only. Counts the
+ *  cached PAYLOAD (usage events), not just keys — the cap is on key count, so
+ *  bytes can grow well past what `entries` alone suggests. */
+export function subagentUsageCacheStats(): { entries: number; events: number } {
+  let events = 0;
+  for (const v of fileCache.values()) events += v.events.length;
+  return { entries: fileCache.size, events };
+}
+
 /**
  * Parse a session's subagent sidecars into usage events billed to the PARENT
  * session. Each subagent file is parsed with the SAME usage logic as the main

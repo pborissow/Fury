@@ -57,20 +57,28 @@ export interface RatePeriod extends ModelRates {
 
 const round = (n: number) => Math.round(n * 1000) / 1000;
 
-/** Build a full rate set from base input/output, deriving cache rates. */
-function rates(input: number, output: number): ModelRates {
+/**
+ * Build a full rate set from base input/output, deriving cache rates from the
+ * standard multipliers (5m 1.25x, 1h 2x, read 0.1x of input).
+ *
+ * `cacheReadMult` overrides ONLY the cache-read multiplier for models that
+ * depart from the 0.1x default — Anthropic prices cache hits at 0.025x on Fable
+ * 5.1 / Mythos 5.1 and 0.05x on Opus 5.5 (per the pricing page). The two cache-
+ * WRITE multipliers (1.25x / 2x) are unchanged across every current model.
+ */
+function rates(input: number, output: number, cacheReadMult = 0.1): ModelRates {
   return {
     input,
     output,
     cacheWrite5m: round(input * 1.25),
     cacheWrite1h: round(input * 2),
-    cacheRead: round(input * 0.1),
+    cacheRead: round(input * cacheReadMult),
   };
 }
 
-/** One dated pricing period. */
-function period(effectiveFrom: string, input: number, output: number): RatePeriod {
-  return { effectiveFrom, ...rates(input, output) };
+/** One dated pricing period. `cacheReadMult` defaults to the standard 0.1x. */
+function period(effectiveFrom: string, input: number, output: number, cacheReadMult = 0.1): RatePeriod {
+  return { effectiveFrom, ...rates(input, output, cacheReadMult) };
 }
 
 /**
@@ -82,9 +90,16 @@ function period(effectiveFrom: string, input: number, output: number): RatePerio
  * and events before 2026-07-20 stay at $5/$25 forever.
  */
 export const PRICING: Record<string, RatePeriod[]> = {
-  // Fable / Mythos tier
+  // Fable / Mythos tier. Fable 5.1 / Mythos 5.1 price cache reads at 0.025x
+  // (not 0.1x) — $0.25/MTok — so they pass an explicit cache-read multiplier.
+  'claude-fable-5-1': [period('', 10, 50, 0.025)],
+  'claude-mythos-5-1': [period('', 10, 50, 0.025)],
   'claude-fable-5': [period('', 10, 50)],
   'claude-mythos-5': [period('', 10, 50)],
+  // Opus 5.x tier. Opus 5.5 = $4/$20 with cache reads at 0.05x ($0.20/MTok);
+  // Opus 5 = $5/$25 at the standard 0.1x, same sticker as the 4.x Opus line.
+  'claude-opus-5-5': [period('', 4, 20, 0.05)],
+  'claude-opus-5': [period('', 5, 25)],
   // Opus 4.x tier — $5 / $25
   'claude-opus-4-8': [period('', 5, 25)],
   'claude-opus-4-7': [period('', 5, 25)],
@@ -128,8 +143,12 @@ export const PRICING: Record<string, RatePeriod[]> = {
  * no warning at all.
  */
 export const CONTEXT_WINDOWS: Record<string, number> = {
+  'claude-fable-5-1': 1_000_000,
+  'claude-mythos-5-1': 1_000_000,
   'claude-fable-5': 1_000_000,
   'claude-mythos-5': 1_000_000,
+  'claude-opus-5-5': 1_000_000,
+  'claude-opus-5': 1_000_000,
   'claude-opus-4-8': 1_000_000,
   'claude-opus-4-7': 1_000_000,
   'claude-opus-4-6': 1_000_000,

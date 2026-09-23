@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useLayoutEffect, useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { AlertTriangle, ShieldAlert, Pencil, Archive } from 'lucide-react';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import HistoryTimestamp from '@/components/HistoryTimestamp';
@@ -53,31 +53,35 @@ export default function SessionSidebar({
   onContextMenu,
 }: SessionSidebarProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const sentinelRef = useRef<HTMLDivElement>(null);
 
-  // Auto-fetch the next page while the list doesn't fill the viewport.
-  // Runs after layout so we can measure scrollHeight vs clientHeight.
-  useLayoutEffect(() => {
-    if (!historyHasMore || isLoadingHistory || isLoadingMoreHistory) return;
-    const el = scrollRef.current;
-    if (!el) return;
-    if (el.scrollHeight <= el.clientHeight + 16) {
-      onLoadMoreHistory();
-    }
-  }, [history.length, historyHasMore, isLoadingHistory, isLoadingMoreHistory, onLoadMoreHistory]);
-
-  // Infinite scroll: load more when user scrolls near the bottom.
+  // Infinite scroll, via a sentinel below the last row.
+  //
+  // This replaces a scroll-event handler that measured scrollTop against
+  // scrollHeight. That approach stalled: it bailed while a page was in flight,
+  // and nothing re-evaluated once the page landed — so scrolling to the bottom
+  // during a load left the list stuck until the user scrolled AGAIN. An
+  // IntersectionObserver is level-triggered rather than edge-triggered: if the
+  // sentinel is still visible after new rows render, it fires again on its own,
+  // which also covers the short-list case (content doesn't fill the viewport)
+  // without a separate layout measurement.
   useEffect(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    const onScroll = () => {
-      if (!historyHasMore || isLoadingMoreHistory) return;
-      if (el.scrollHeight - el.scrollTop - el.clientHeight < 200) {
-        onLoadMoreHistory();
-      }
-    };
-    el.addEventListener('scroll', onScroll);
-    return () => el.removeEventListener('scroll', onScroll);
-  }, [historyHasMore, isLoadingMoreHistory, onLoadMoreHistory]);
+    const el = sentinelRef.current;
+    const root = scrollRef.current;
+    if (!el || !root) return;
+    if (!historyHasMore || isLoadingHistory || isLoadingMoreHistory) return;
+
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) onLoadMoreHistory();
+      },
+      // Start fetching before the sentinel is actually on screen so the next
+      // page is usually already there by the time the user reaches it.
+      { root, rootMargin: '400px 0px' },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [history.length, historyHasMore, isLoadingHistory, isLoadingMoreHistory, onLoadMoreHistory]);
 
   return (
     <div ref={scrollRef} className="flex-1 overflow-y-auto p-2">
@@ -288,15 +292,13 @@ export default function SessionSidebar({
         </div>
       )}
 
+      {/* Infinite-scroll sentinel. Rendered (not conditional on a loading flag)
+          so the observer above has a stable target to watch; it self-triggers
+          whenever it scrolls into range. */}
       {historyHasMore && history.length > 0 && (
-        <button
-          type="button"
-          onClick={onLoadMoreHistory}
-          disabled={isLoadingMoreHistory}
-          className="w-full mt-2 py-2 text-xs text-muted-foreground hover:text-foreground border border-border rounded hover:border-ring transition-colors disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
-        >
-          {isLoadingMoreHistory ? 'Loading…' : 'Load more'}
-        </button>
+        <div ref={sentinelRef} className="w-full py-3 text-center text-xs text-muted-foreground">
+          {isLoadingMoreHistory ? 'Loading…' : ''}
+        </div>
       )}
       </TooltipProvider>
     </div>

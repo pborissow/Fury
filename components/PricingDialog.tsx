@@ -48,6 +48,8 @@ export default function PricingDialog({
   const [data, setData] = useState<PricingTable | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [checkNote, setCheckNote] = useState<string | null>(null);
 
   // Fetch each time it opens — pricing rarely changes, but a poller override
   // could land between opens, and the payload is tiny.
@@ -56,6 +58,7 @@ export default function PricingDialog({
     let cancelled = false;
     setLoading(true);
     setError(false);
+    setCheckNote(null);
     fetch('/api/pricing/table')
       .then(res => { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
       .then(json => { if (!cancelled) setData(json); })
@@ -63,6 +66,36 @@ export default function PricingDialog({
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [open]);
+
+  // Run the pricing poller now (POST /api/pricing), then re-fetch the rate card
+  // so any discovered change and the refreshed "as of" date show immediately.
+  // This is the pricing-specific refresh — distinct from the model-catalog
+  // "Refresh model list", which only re-fetches GET /v1/models and never
+  // touches pricing.
+  async function checkNow() {
+    setChecking(true);
+    setCheckNote(null);
+    try {
+      const res = await fetch('/api/pricing', { method: 'POST' });
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(result?.error || `HTTP ${res.status}`);
+      setCheckNote(
+        result.status === 'ok'
+          ? result.changes > 0
+            ? `Updated ${result.changes} rate${result.changes === 1 ? '' : 's'} from Anthropic's pricing page.`
+            : 'Checked — rates are already up to date.'
+          : `Check failed: ${result.note || 'could not read the pricing page'}`,
+      );
+      await fetch('/api/pricing/table')
+        .then(r => (r.ok ? r.json() : Promise.reject(r.status)))
+        .then(json => setData(json))
+        .catch(() => { /* keep showing the prior table */ });
+    } catch (e) {
+      setCheckNote(`Check failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setChecking(false);
+    }
+  }
 
   const cols = ['Model', 'Base context', 'Input', 'Output', 'Cache write 5m', 'Cache write 1h', 'Cache read'];
 
@@ -79,11 +112,23 @@ export default function PricingDialog({
       buttons={[{ label: 'Close', onClick: () => onOpenChange(false), variant: 'ghost' }]}
     >
       <div className="text-sm">
-        <p className="text-xs text-muted-foreground mb-3">
-          Rates in USD per million tokens{data ? <> · as of {data.asOf}</> : null}.
-          These are the rates the Stats tab prices with.
-          {data?.hasOverrides ? ' Includes live-updated rates from the pricing poller.' : ''}
-        </p>
+        <div className="flex items-start justify-between gap-3 mb-3">
+          <p className="text-xs text-muted-foreground">
+            Rates in USD per million tokens{data ? <> · as of {data.asOf}</> : null}.
+            These are the rates the Stats tab prices with.
+            {data?.hasOverrides ? ' Includes live-updated rates from the pricing poller.' : ''}
+            {checkNote ? <span className="block mt-1 text-foreground">{checkNote}</span> : null}
+          </p>
+          <button
+            type="button"
+            onClick={checkNow}
+            disabled={checking}
+            title="Fetch Anthropic's current pricing now (updates the Stats tab's rates and 'as of' date)"
+            className="shrink-0 rounded-md border border-border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-50"
+          >
+            {checking ? 'Checking…' : 'Check for updates'}
+          </button>
+        </div>
 
         {loading && !data ? (
           <div className="py-10 text-center text-muted-foreground">Loading…</div>

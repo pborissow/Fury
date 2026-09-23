@@ -24,7 +24,7 @@
 import type { Client } from '@libsql/client';
 import { getDb } from './db';
 import { settingsPersistence } from './settingsPersistence';
-import { PRICING, setPricingOverrides, latestRate, type ModelRates, type RatePeriod } from './pricing';
+import { PRICING, PRICING_AS_OF, setPricingOverrides, latestRate, type ModelRates, type RatePeriod } from './pricing';
 
 const PRICING_URL = 'https://platform.claude.com/docs/en/about-claude/pricing.md';
 const TZ = 'America/New_York';
@@ -80,7 +80,13 @@ export function parsePricingMarkdown(md: string): { rates: Map<string, ModelRate
   const collected = new Map<string, ModelRates[]>();
   let inTable = false;
   for (const line of md.split('\n')) {
-    if (line.includes('Base Input Tokens') && line.includes('Output Tokens')) { inTable = true; continue; }
+    // Header detection is case-insensitive: the pricing page shifted from
+    // title case ("Base Input Tokens") to sentence case ("Base input tokens")
+    // in 2026-09, which silently broke the poller (parsed 0 models) until this
+    // was relaxed. Match on lowercase so a future capitalization tweak can't
+    // regress it again.
+    const lower = line.toLowerCase();
+    if (lower.includes('base input tokens') && lower.includes('output tokens')) { inTable = true; continue; }
     if (!inTable) continue;
     const trimmed = line.trim();
     if (!trimmed.startsWith('|')) break; // table ended
@@ -124,6 +130,32 @@ export async function loadPricingOverrides(dbArg?: Client): Promise<void> {
   setPricingOverrides(map);
 }
 
+/**
+ * The date to display as "pricing as of" — the most recent confirmation that
+ * the shown rates are current. That's the LATER of:
+ *   (a) PRICING_AS_OF — when a human last reviewed the git constant, and
+ *   (b) the last SUCCESSFUL poll against Anthropic's pricing page.
+ * A successful poll reconfirms the rates even when it finds no change, so it
+ * advances the date; a failed poll (or never having polled) falls back to the
+ * constant. Formatted as an ET day to match PRICING_AS_OF and the Stats tab's
+ * "New York time" framing. Never throws — a DB hiccup yields the constant.
+ */
+export async function pricingAsOfDay(dbArg?: Client): Promise<string> {
+  try {
+    const db = dbArg ?? await getDb();
+    const row = await db.execute(
+      `SELECT MAX(checked_at) AS m FROM pricing_checks WHERE status = 'ok'`,
+    );
+    const lastOkAt = Number(row.rows[0]?.m) || 0;
+    if (!lastOkAt) return PRICING_AS_OF;
+    const day = etDay(lastOkAt);
+    // ISO "YYYY-MM-DD" strings compare lexicographically = chronologically.
+    return day > PRICING_AS_OF ? day : PRICING_AS_OF;
+  } catch {
+    return PRICING_AS_OF;
+  }
+}
+
 // ---- the check ----
 
 export interface CheckResult { status: 'ok' | 'failed'; models: number; changes: number; note: string }
@@ -152,6 +184,13 @@ export async function runPricingCheck(trigger: string): Promise<CheckResult> {
     const { rates, ambiguous } = parsePricingMarkdown(md);
     models = rates.size;
     if (models === 0) throw new Error('parsed 0 known models (page format may have changed)');
+
+    // Compare the page against the rates we ACTUALLY charge (constant + already-
+    // persisted overrides), so re-load overrides into memory first. Without this,
+    // a check that runs before rehydrate — or after a dev HMR reset the in-memory
+    // override map — would compare against the bare constant and re-apply an
+    // override that already exists, inserting a redundant dated row.
+    await loadPricingOverrides(db).catch(() => { /* fall back to whatever's loaded */ });
 
     const today = etDay(Date.now());
     const applied: string[] = [];

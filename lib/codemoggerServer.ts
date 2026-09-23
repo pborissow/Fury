@@ -83,6 +83,16 @@ const usage = new Map<string, Usage>();
 // Without it, a DELETE/disable landing mid-reindex would keep indexing into the
 // now-disabled project, and could re-open a CodeIndex against its orphaned DB.
 const generations = new Map<string, number>();
+
+/** Retention probe for GET /api/diagnostics/memory. Read-only. */
+export function codemoggerStats(): Record<string, number> {
+  return {
+    registry: registry.size,
+    locks: locks.size,
+    usage: usage.size,
+    generations: generations.size,
+  };
+}
 const norm = (p: string) => p.replace(/\\/g, '/');
 
 /** Serialize an op behind the project's current op (search never overlaps reindex). */

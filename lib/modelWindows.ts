@@ -201,6 +201,33 @@ export interface ObservedWindow {
  * the probe's target selection — only uses it to skip models already known, so
  * an echoed confirmation is exactly the right behaviour.
  */
+/**
+ * One-time boot enrichment: seed the JSON from windows ALREADY observed in the
+ * archive, so the pricing dialog and the session backfill cover every model we
+ * have evidence for — not just the maintainer-probed seed. A model served below
+ * the 1M ceiling self-confirms (it can't be the backfill's guess), so record its
+ * base now instead of waiting to observe it served small again.
+ *
+ * ADDITIVE ONLY: it fills models that have no confirmed base yet and never
+ * rewrites an authoritative probe seed — a bulk retroactive pass shouldn't
+ * silently flip a probed default. (The runtime write-back in sdkSessionManager
+ * still refines seeds incrementally per recordServedWindow's documented merge.)
+ * Models only ever seen at the ceiling are left blank — a probe is the only way
+ * to confirm their base. Best-effort; returns how many entries changed.
+ */
+export async function enrichWindowsFromHistory(db: Client): Promise<number> {
+  const observed = await deriveObservedWindows(db);
+  let changed = 0;
+  for (const [id, w] of observed) {
+    if (!w.confirmed) continue;                    // only sub-ceiling captures are trustworthy bases
+    if (hasConfirmedBase(windowFor(id))) continue; // don't overwrite the probe seed
+    if (await recordServedWindow(id, w.base, 'observed') !== 'unchanged') changed++;
+    // Reflect a larger served window (the variant ceiling) if history shows one.
+    if (w.ceiling > w.base) await recordServedWindow(id, w.ceiling, 'observed');
+  }
+  return changed;
+}
+
 export async function deriveObservedWindows(db: Client): Promise<Map<string, ObservedWindow>> {
   const r = await db.execute(`
     SELECT model,

@@ -60,6 +60,11 @@ export function readCwdFromJsonl(jsonlPath: string): string | null {
 // single existsSync on hit, so a moved/deleted file falls back to a fresh lookup.
 const dirCache = new Map<string, string>();
 
+/** Retention probe for GET /api/diagnostics/memory. Read-only. */
+export function sessionPathsCacheStats(): { entries: number } {
+  return { entries: dirCache.size };
+}
+
 export function findSessionJsonlDir(sessionId: string, projectPath: string): JsonlLocation | null {
   const base = join(homedir(), '.claude', 'projects');
   const slug = projectPathToSlug(projectPath);

@@ -145,6 +145,17 @@ app.prepare().then(() => {
   server.listen(port, hostname, async () => {
     console.log(`> Ready on http://localhost:${port} (${dev ? 'development' : 'production'})`);
 
+    // Start memory telemetry from process start, not from the first time
+    // someone opens /api/diagnostics/memory — a lazily-started sampler leaves a
+    // coverage hole across exactly the unattended hours a slow leak needs to be
+    // measured over. Cheap: one small sample per minute, unref'd timer.
+    try {
+      const { startMemorySampling } = await import('./lib/startMemorySampler');
+      startMemorySampling();
+    } catch (err) {
+      console.error('[server] Failed to start memory sampler:', err);
+    }
+
     // Rehydrate any pending Anthropic switch-back from the durable
     // fallback log. This recovers the auto-failover scheduler across
     // server restarts, deploys, and crashes — without it, a process
