@@ -22,6 +22,7 @@ import { isCodeSearchEnabled, codeSearchDbPath, stripStdioCodemogger } from './c
 import { log } from './logger';
 import { detectUsageLimit } from './providerSwitch';
 import { findSessionJsonlDir } from './sessionPaths';
+import { restoreJsonlFromArchive } from './transcriptArchiver';
 import { scrubSessionFile } from './imageScrubber';
 import { settingsPersistence } from './settingsPersistence';
 import { recordServedWindow } from './modelWindows';
@@ -586,6 +587,12 @@ class SdkSessionManager {
       if (opts?.confirmTakeover) {
         await this.takeoverExternalOwner(s);
       }
+
+      // MUST precede startQuery: it picks `resume` vs `sessionId` from whether
+      // the JSONL exists, so a transcript deleted by the CLI's 30-day cleanup
+      // has to be restored from the archive first — else the send silently
+      // opens a FRESH session under the old id and the history vanishes.
+      if (!s.q) await this.restoreMissingJsonl(s);
     } catch (err) {
       s.isProcessing = false; // release the guard — the turn never opened
       throw err;
@@ -718,7 +725,10 @@ class SdkSessionManager {
     if (projectPath) s.projectPath = projectPath;
     // If the query was fully torn down (e.g. server restart), resume it so the
     // persisted checkpoints are reachable; the interrupt() path keeps it live.
-    if (!s.q) this.startQuery(s);
+    if (!s.q) {
+      await this.restoreMissingJsonl(s);
+      this.startQuery(s);
+    }
     return s.q!.rewindFiles(messageUuid);
   }
 
@@ -2280,6 +2290,35 @@ class SdkSessionManager {
   getPendingAsk(sessionId: string): { toolUseID: string; questions: unknown[] } | null {
     const p = this.sessions.get(sessionId)?.pendingAsk;
     return p ? { toolUseID: p.toolUseID, questions: p.questions } : null;
+  }
+
+  /**
+   * Before opening a query: if this session's JSONL is gone (Claude CLI's
+   * `cleanupPeriodDays` deletes transcripts after 30 days by default) but the
+   * SQLite archive has it, write it back so startQuery resumes the real
+   * conversation. Parity with sessionManager.executeClaudeCommand's preamble.
+   * Best-effort: never throws. A session with nothing archived (brand new)
+   * falls through to startQuery's fresh-session path unchanged.
+   */
+  private async restoreMissingJsonl(s: SdkSession): Promise<void> {
+    const cwd = s.projectPath || process.cwd();
+    if (findSessionJsonlDir(s.sessionId, cwd) !== null) return;
+    try {
+      const restoredPath = await restoreJsonlFromArchive(s.sessionId, cwd);
+      if (restoredPath) {
+        log.info('sdk.turn', 'restored jsonl from archive', {
+          sessionId: s.sessionId,
+          corrId: s.sessionId,
+          data: { path: restoredPath },
+        });
+      }
+    } catch (err) {
+      log.warn('sdk.turn', 'jsonl archive restore failed', {
+        sessionId: s.sessionId,
+        corrId: s.sessionId,
+        data: { error: String(err) },
+      });
+    }
   }
 
   private startQuery(s: SdkSession): void {
