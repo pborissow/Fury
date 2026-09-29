@@ -35,6 +35,12 @@ export interface TranscriptMessage {
   /** Image parts attached to this message (user pastes). Present only when the
    *  turn carried images (inline, scrubbed-persisted ref, or bare placeholder). */
   images?: TranscriptImagePart[];
+  /** True for a user's AskUserQuestion answer recovered from the tool_result, so
+   *  the renderer surfaces it as an in-turn intermediary rather than a new turn. */
+  askAnswer?: boolean;
+  /** True for the question half of an AskUserQuestion exchange (role assistant).
+   *  Always an intermediary — never promoted to the turn's visible Claude bubble. */
+  askQuestion?: boolean;
 }
 
 /**
@@ -120,6 +126,102 @@ export interface UsageEvent {
 }
 
 const WRITE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+/** One asked-and-answered AskUserQuestion item, as display markdown. */
+export interface AskExchange {
+  /** Claude's question (plus the offered option labels) — rendered as Claude. */
+  question: string;
+  /** The user's answer (plus any free-text notes) — rendered as You. */
+  answer: string;
+}
+
+// Markdown collapses single newlines; force hard breaks so multi-line text (the
+// "Other" textarea allows it) keeps its shape.
+const hardBreaks = (s: string) => s.replace(/\r?\n/g, '  \n');
+
+/**
+ * Split an answered AskUserQuestion into per-question exchanges, so the question
+ * can render as Claude's message and the answer as the user's — instead of the
+ * one-line `"Q1"="A1", "Q2"="A2"` string, which reads as if the user wrote the
+ * question and is ambiguous when questions contain quotes.
+ *
+ * Source is the structured `toolUseResult` the CLI saves on the tool_result
+ * entry: `{ questions: [...], answers: { [questionText]: answer } }` (multi-select
+ * labels arrive comma-joined; optional `annotations[q].notes` carries free text
+ * given alongside a selection). `fallbackQuestions` — the tool_use's own input —
+ * supplies the question order and options when `toolUseResult.questions` is
+ * missing. Returns null without structured answers, so the caller falls back to
+ * the flattened string (extractAskAnswer).
+ */
+export function buildAskExchanges(toolUseResult: unknown, fallbackQuestions?: unknown): AskExchange[] | null {
+  type Q = { question?: unknown; options?: { label?: unknown }[] };
+  const r = toolUseResult as {
+    questions?: Q[];
+    answers?: Record<string, unknown>;
+    annotations?: Record<string, { notes?: unknown } | undefined>;
+  } | null;
+  if (!r || typeof r !== 'object' || !r.answers || typeof r.answers !== 'object') return null;
+
+  // Question order (and options) from `questions`; `answers` is keyed by
+  // question text. Append any answered keys not covered so none are lost.
+  const questionList: Q[] = Array.isArray(r.questions) ? r.questions
+    : Array.isArray(fallbackQuestions) ? (fallbackQuestions as Q[]) : [];
+  const order: { text: string; q?: Q }[] = [];
+  for (const q of questionList) {
+    if (typeof q?.question === 'string' && q.question in r.answers) order.push({ text: q.question, q });
+  }
+  for (const k of Object.keys(r.answers)) {
+    if (!order.some(o => o.text === k)) order.push({ text: k });
+  }
+
+  const out: AskExchange[] = [];
+  for (const { text, q } of order) {
+    const answer = r.answers[text];
+    if (typeof answer !== 'string' || !answer.trim()) continue;
+
+    let question = hardBreaks(text.trim());
+    const labels = (Array.isArray(q?.options) ? q.options : [])
+      .map(o => o?.label)
+      .filter((l): l is string => typeof l === 'string' && l.trim() !== '');
+    if (labels.length) question += '\n\n' + labels.map(l => `- ${l}`).join('\n');
+
+    let body = hardBreaks(answer.trim());
+    const notes = r.annotations?.[text]?.notes;
+    if (typeof notes === 'string' && notes.trim()) body += `\n\n${hardBreaks(notes.trim())}`;
+
+    out.push({ question, answer: body });
+  }
+  return out.length ? out : null;
+}
+
+/**
+ * Fallback: pull the human-readable answer out of an AskUserQuestion tool_result
+ * string, for entries without structured `toolUseResult` data. The CLI wraps the
+ * payload in boilerplate — either `Your questions have been answered:
+ * "Q"="A"[, ...]. You can now continue with these answers in mind.` or
+ * `The user answered: "Q"="A"[, ...]`. We strip the wrapper down to the `"Q"="A"`
+ * pairs (which carry any long free-text "Other" answer verbatim). If the wrapper
+ * ever changes we fall back to the raw string rather than dropping the answer.
+ * `content` is a tool_result block's content: a string, or an array of text
+ * blocks (Anthropic's two content shapes).
+ */
+export function extractAskAnswer(content: unknown): string | null {
+  const raw = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content
+          .map((b: any) => (typeof b === 'string' ? b : b?.type === 'text' ? (b.text ?? '') : ''))
+          .join('')
+      : '';
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const stripped = trimmed
+    .replace(/^Your questions have been answered:\s*/i, '')
+    .replace(/^The user answered:\s*/i, '')
+    .replace(/\.?\s*You can now continue with these answers in mind\.?\s*$/i, '')
+    .trim();
+  return stripped || trimmed;
+}
 
 export function isInternalContent(content: string): boolean {
   const trimmed = content.trim();
@@ -254,6 +356,13 @@ export function parseTranscriptJsonl(content: string): {
   // Track the latest AskUserQuestion input seen; cleared whenever a real
   // user-turn message comes after it (which means the user already answered).
   let pendingAskUserQuestion: any | null = null;
+  // AskUserQuestion calls by tool_use id, so the matching tool_result (the
+  // user's answer) can be recovered. On the SDK path the answer resolves the
+  // tool in place and is otherwise dropped, so this is the only record of what
+  // the user actually chose (incl. long free-text "Other" answers). Keeps the
+  // asked questions (fallback order/options) and when they were asked (the
+  // timestamp for the rendered question messages).
+  const askQuestionToolUses = new Map<string, { questions: unknown; timestamp: string }>();
 
   for (const line of rawLines) {
     try {
@@ -343,6 +452,58 @@ export function parseTranscriptJsonl(content: string): {
           // the previous turn.
           resetTurnTools();
         } else if (Array.isArray(msg.content)) {
+          // Recover the user's AskUserQuestion answer from its tool_result. The
+          // pending assistant (the question preamble) has already been flushed
+          // above, so pushing here keeps chronological order. Marked askAnswer so
+          // the renderer groups it as an in-turn intermediary, not a new turn.
+          for (const block of msg.content) {
+            if (block?.type === 'tool_result' &&
+                typeof block.tool_use_id === 'string' &&
+                askQuestionToolUses.has(block.tool_use_id)) {
+              const asked = askQuestionToolUses.get(block.tool_use_id);
+              askQuestionToolUses.delete(block.tool_use_id);
+              // The CLI (--print) auto-ERRORS AskUserQuestion and the real answer
+              // arrives later as a fresh user turn (a normal "You" bubble). Only a
+              // non-error result carries an actual in-place SDK answer to recover.
+              if (block.is_error === true) continue;
+              pendingAskUserQuestion = null; // answered — drop the replayable dialog
+              // Prefer the structured per-question data: each question renders as
+              // Claude's (askQuestion, stamped when it was asked) and each answer
+              // as the user's (askAnswer). Both are in-turn intermediaries.
+              const exchanges = buildAskExchanges(entry.toolUseResult, asked?.questions);
+              if (exchanges) {
+                for (const ex of exchanges) {
+                  messages.push({
+                    role: 'assistant',
+                    content: ex.question,
+                    timestamp: asked?.timestamp ?? entry.timestamp,
+                    askQuestion: true,
+                  });
+                  messages.push({
+                    role: 'user',
+                    content: ex.answer,
+                    timestamp: entry.timestamp,
+                    uuid: entry.uuid,
+                    askAnswer: true,
+                  });
+                }
+              } else {
+                // No structured data: the flattened string already names each
+                // question alongside its answer, so it stands alone.
+                const answer = extractAskAnswer(block.content);
+                if (answer) {
+                  messages.push({
+                    role: 'user',
+                    content: answer,
+                    timestamp: entry.timestamp,
+                    uuid: entry.uuid,
+                    askAnswer: true,
+                  });
+                }
+              }
+            }
+          }
+
           // Array-form user turn. Historically this fell through and rendered as
           // NOTHING (constraint 6) — a text+image paste dropped even the typed
           // text. isRealUserTurnEntry excludes pure tool_result deliveries AND
@@ -449,6 +610,9 @@ export function parseTranscriptJsonl(content: string): {
           if (block.type === 'tool_use' && block.name === 'AskUserQuestion' &&
               block.input?.questions?.length) {
             pendingAskUserQuestion = block.input;
+            if (typeof block.id === 'string') {
+              askQuestionToolUses.set(block.id, { questions: block.input.questions, timestamp: entry.timestamp });
+            }
           }
           // Accumulate tool composition for the current turn. Snapshotted
           // onto the next pendingAssistant push as TurnMeta.
@@ -498,10 +662,17 @@ export function parseTranscriptJsonl(content: string): {
 
   // Find the message index after which the plan should be inserted.
   // This is the last assistant message at or before the plan Write timestamp.
+  // AskUserQuestion exchanges need care: a question row sits where its answer
+  // arrived but is stamped with the (earlier) time it was asked, so it must be
+  // skipped or the plan lands between question and answer. An answer row is a
+  // valid anchor, though — it's in-turn, and a plan written after the user
+  // answered belongs after that answer, not back before the question.
   let planInsertAfter: number | null = null;
   if (planSlug && planWriteTimestamp) {
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'assistant' && messages[i].timestamp <= planWriteTimestamp) {
+      const m = messages[i];
+      const anchor = (m.role === 'assistant' && !m.askQuestion) || m.askAnswer;
+      if (anchor && m.timestamp <= planWriteTimestamp) {
         planInsertAfter = i;
         break;
       }

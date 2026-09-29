@@ -10,7 +10,7 @@
 import { describe, it, expect } from 'vitest';
 import { stripInFlightPartials } from '../../lib/transcriptStrip';
 
-type Msg = { role: 'user' | 'assistant'; content: string; timestamp?: string };
+type Msg = { role: 'user' | 'assistant'; content: string; timestamp?: string; askAnswer?: boolean; askQuestion?: boolean };
 const ts = (ms: number) => new Date(ms).toISOString();
 
 // A mid-turn prompt ("please continue") gets folded by the CLI into the next
@@ -61,5 +61,16 @@ describe('stripInFlightPartials', () => {
       { role: 'assistant', content: 'partial', timestamp: ts(4000) },
     ];
     expect(stripInFlightPartials(messages, 0).map((m) => m.content)).toEqual(['q1', 'a1', 'q2']);
+  });
+  it('the fallback walks back through an in-turn AskUserQuestion answer (not a prompt)', () => {
+    const messages: Msg[] = [
+      { role: 'user', content: 'do X' },
+      { role: 'assistant', content: 'preamble' },
+      { role: 'assistant', content: 'Q?', askQuestion: true },
+      { role: 'user', content: 'A', askAnswer: true },
+      { role: 'assistant', content: 'partial' },
+    ];
+    // The whole in-flight run after the real prompt goes, answer included.
+    expect(stripInFlightPartials(messages, 0).map((m) => m.content)).toEqual(['do X']);
   });
 });

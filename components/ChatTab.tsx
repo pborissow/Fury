@@ -25,6 +25,7 @@ import { DirectoryPicker } from '@/components/DirectoryPicker';
 import { getRecentDirectories } from '@/lib/recent-directories';
 import { uiLog } from '@/lib/clientTelemetry';
 import { stripInFlightPartials, envelopeHiddenMessages } from '@/lib/transcriptStrip';
+import { findRewindCutIndex, groupTurns } from '@/lib/transcriptTurns';
 import type { Message, TranscriptMsg, HistoryEntry, PendingSession, AskUserQuestionState, TranscriptImagePart } from '@/lib/types';
 import { normalizeImage, type AttachedImage } from '@/lib/clientImage';
 import type { TurnMeta } from '@/lib/transcriptParser';
@@ -38,6 +39,22 @@ const generateUUID = () => {
     return v.toString(16);
   });
 };
+
+type SpeakableMsg = TranscriptMsg & { turnMeta?: TurnMeta };
+
+/**
+ * The Claude bubble TTS should read: the visible bubble of the last turn that has
+ * one. Uses the same grouping TranscriptRenderer renders, so AskUserQuestion
+ * answers don't count as new turns and question messages are never read aloud
+ * as the reply (the hand-rolled loops this replaced got both wrong).
+ */
+function lastClaudeBubble<M extends SpeakableMsg>(msgs: M[]): M | null {
+  const turns = groupTurns(msgs);
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i].assistant) return turns[i].assistant;
+  }
+  return null;
+}
 
 interface ChatTabProps {
   chatHorizontalLayout: number[];
@@ -117,7 +134,7 @@ export default function ChatTab({
 
 
   // History transcript viewer state (renders in center panel)
-  const [historyTranscript, setHistoryTranscript] = useState<{ role: 'user' | 'assistant'; content: string; timestamp: string; turnMeta?: TurnMeta; uuid?: string; images?: TranscriptImagePart[] }[]>([]);
+  const [historyTranscript, setHistoryTranscript] = useState<{ role: 'user' | 'assistant'; content: string; timestamp: string; turnMeta?: TurnMeta; uuid?: string; images?: TranscriptImagePart[]; askAnswer?: boolean; askQuestion?: boolean }[]>([]);
   const [viewingTranscriptId, setViewingTranscriptId] = useState<string | null>(null);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [historyTranscriptLoading, setHistoryTranscriptLoading] = useState(false);
@@ -626,6 +643,11 @@ export default function ChatTab({
     envelopeOpen && !overlayHasContent
       ? historyTranscript.filter((m) => {
           if (m.role !== 'user' || !m.timestamp) return false;
+          // An AskUserQuestion answer is a user message, but it belongs INSIDE
+          // the turn as an intermediary (see the parser's askAnswer flag), not as
+          // a live "You" send. Echoing it here made it flash as a spurious second
+          // top-level bubble until the turn settled and re-grouped it.
+          if (m.askAnswer) return false;
           const t = Date.parse(m.timestamp);
           return Number.isFinite(t) && t >= (live!.envelopeStartedAt as number);
         })
@@ -1454,20 +1476,7 @@ export default function ChatTab({
               // logic as TranscriptRenderer — within the last turn, the final
               // assistant message is the rendered bubble; earlier ones are intermediaries.
               if (ttsEnabledRef.current) {
-                const msgs = refreshData.messages as { role: string; content: string; turnMeta?: TurnMeta }[];
-                let turnBubble: { content: string; turnMeta?: TurnMeta } | null = null;
-                let lastTurnBubble: { content: string; turnMeta?: TurnMeta } | null = null;
-                for (const msg of msgs) {
-                  if (msg.role === 'user') {
-                    // New turn — commit previous turn's bubble
-                    if (turnBubble) lastTurnBubble = turnBubble;
-                    turnBubble = null;
-                  } else if (msg.role === 'assistant') {
-                    turnBubble = msg;
-                  }
-                }
-                // The last turn's bubble is either the open turn or the last committed one
-                const bubble = turnBubble || lastTurnBubble;
+                const bubble = lastClaudeBubble(refreshData.messages as SpeakableMsg[]);
                 if (bubble?.content) {
                   ttsCleanup();
                   const abort = new AbortController();
@@ -2155,10 +2164,14 @@ export default function ChatTab({
       );
       if (!res.ok) return;
       const data = await res.json();
-      const msgs: { role: string; content: string }[] = data.messages || [];
+      const msgs: { role: string; content: string; askAnswer?: boolean }[] = data.messages || [];
       const last = msgs[msgs.length - 1];
       if (!last || last.role !== 'user' || last.content !== prompt) return;
-      const userTurns = msgs.filter(m => m.role === 'user').length;
+      // Count TURNS, not raw user messages: an AskUserQuestion answer is user-role
+      // but doesn't start a turn. Including it over-counts, so turnIndex points
+      // past the last real turn and the server can't find it (the drop no-ops,
+      // leaving the limited prompt in place — the model may then see it twice).
+      const userTurns = msgs.filter(m => m.role === 'user' && !m.askAnswer).length;
       await fetch('/api/session', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -2240,15 +2253,11 @@ export default function ChatTab({
     const rewindInfo = { ...rewindConfirm };
     const { turnIndex, fullMessage } = rewindInfo;
 
-    // Immediately truncate the UI: remove all messages from the rewind point onward
-    let userCount = 0;
-    const cutIdx = historyTranscript.findIndex(msg => {
-      if (msg.role === 'user') {
-        if (userCount === turnIndex) return true;
-        userCount++;
-      }
-      return false;
-    });
+    // Immediately truncate the UI: remove all messages from the rewind point
+    // onward. turnIndex counts TURNS (what the rewind button + server use), and
+    // an AskUserQuestion answer is a user-role message that does NOT start a
+    // turn — so it must be skipped, else an earlier turn is cut off too.
+    const cutIdx = findRewindCutIndex(historyTranscript, turnIndex);
     if (cutIdx >= 0) {
       setHistoryTranscript(prev => prev.slice(0, cutIdx));
     }
@@ -2696,17 +2705,7 @@ export default function ChatTab({
                                 }
                               } else {
                                 // Replay: re-generate from last bubble (same turn logic as TranscriptRenderer)
-                                let turnBubble: { content: string; turnMeta?: TurnMeta } | null = null;
-                                let lastTurnBubble: { content: string; turnMeta?: TurnMeta } | null = null;
-                                for (const msg of historyTranscript) {
-                                  if (msg.role === 'user') {
-                                    if (turnBubble) lastTurnBubble = turnBubble;
-                                    turnBubble = null;
-                                  } else if (msg.role === 'assistant') {
-                                    turnBubble = msg;
-                                  }
-                                }
-                                const bubble = turnBubble || lastTurnBubble;
+                                const bubble = lastClaudeBubble(historyTranscript);
                                 if (!bubble?.content) return;
                                 ttsCleanup();
                                 const abort = new AbortController();
@@ -3050,7 +3049,8 @@ export default function ChatTab({
           // (the CLI is killed when the tool fires) it's the last assistant
           // bubble in the refreshed transcript.
           transcriptStreaming.trim() ||
-          [...historyTranscript].reverse().find(m => m.role === 'assistant')?.content ||
+          // (skipping an earlier exchange's question messages, which aren't prose)
+          [...historyTranscript].reverse().find(m => m.role === 'assistant' && !m.askQuestion)?.content ||
           ''
         }
         onSubmit={handleAskUserQuestionResponse}

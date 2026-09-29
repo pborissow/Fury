@@ -9,6 +9,7 @@ import ChatBubble from '@/components/ChatBubble';
 import CopyableCodeBlock from '@/components/CopyableCodeBlock';
 import ImageViewerDialog from '@/components/ImageViewerDialog';
 import type { TranscriptMsg, TranscriptImagePart } from '@/lib/types';
+import { groupTurns } from '@/lib/transcriptTurns';
 
 const ExternalLink = ({ node: _node, ...props }: any) => (
   <a {...props} target="_blank" rel="noopener noreferrer" />
@@ -161,37 +162,28 @@ export default function TranscriptRenderer({
     allMessages = [...historyTranscript, ...overlayAsTranscript];
   }
 
-  // userIndex/assistantIndex: the message's FLAT index in allMessages — the
-  // same indexing the transcript archive stores as `turn_index`, which is what
-  // a Search-result deep link carries. Emitted as data-msg-index on the bubble
-  // wrappers so ChatTab can scroll a hit's bubble into view.
-  const turns: { user: TranscriptMsg | null; assistant: TranscriptMsg | null; intermediaries: TranscriptMsg[]; userIndex: number | null; assistantIndex: number | null }[] = [];
-  let currentTurn: typeof turns[0] = { user: null, assistant: null, intermediaries: [], userIndex: null, assistantIndex: null };
-
-  for (let msgIndex = 0; msgIndex < allMessages.length; msgIndex++) {
-    const msg = allMessages[msgIndex];
-    if (msg.role === 'user') {
-      if (currentTurn.user || currentTurn.assistant) {
-        turns.push(currentTurn);
-      }
-      currentTurn = { user: msg, assistant: null, intermediaries: [], userIndex: msgIndex, assistantIndex: null };
-    } else {
-      if (currentTurn.assistant) {
-        currentTurn.intermediaries.push(currentTurn.assistant);
-      }
-      currentTurn.assistant = msg;
-      currentTurn.assistantIndex = msgIndex;
-    }
-  }
-  if (currentTurn.user || currentTurn.assistant) {
-    turns.push(currentTurn);
-  }
+  // Group the flat list into turns (user prompt + final assistant reply +
+  // intermediaries). See lib/transcriptTurns for the askAnswer + assistant-null
+  // handling; kept pure there so it's unit-testable.
+  const turns = groupTurns(allMessages);
 
   // Find the last turn that has an assistant response (for TTS button placement)
   let lastAssistantTurnIndex = -1;
   for (let i = turns.length - 1; i >= 0; i--) {
     if (turns[i].assistant) { lastAssistantTurnIndex = i; break; }
   }
+
+  // The "+N intermediary" chip. Normally lives on the Claude bubble, but a
+  // text-less question turn has no Claude bubble — there we anchor it to the You
+  // bubble so the user's answer stays reachable instead of vanishing.
+  const intermediaryChip = (intermediaries: TranscriptMsg[]) => (
+    <span
+      className="text-[10px] text-muted-foreground bg-background border border-border rounded px-1.5 py-0.5 cursor-pointer hover:border-ring hover:text-foreground transition-colors"
+      onClick={() => onIntermediaryView(intermediaries)}
+    >
+      +{intermediaries.length} intermediary
+    </span>
+  );
 
   return (
     <>
@@ -217,7 +209,15 @@ export default function TranscriptRenderer({
                   <RotateCcw className="h-3.5 w-3.5 text-muted-foreground" />
                 </button>
               )}
-              <ChatBubble label="You" className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-blue-900 text-white border-blue-700" rawContent={turn.user.content} isMarkdown>
+              <ChatBubble
+                label="You"
+                className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-blue-900 text-white border-blue-700"
+                rawContent={turn.user.content}
+                isMarkdown
+                // A text-less question turn has no Claude bubble to carry the chip;
+                // surface it here so the answer is still reachable.
+                headerExtra={!turn.assistant && turn.intermediaries.length > 0 ? intermediaryChip(turn.intermediaries) : undefined}
+              >
                 {turn.user.content && (
                   <div className="prose-chat prose-invert max-w-none">
                     <ReactMarkdown
@@ -263,14 +263,7 @@ export default function TranscriptRenderer({
                       </button>
                     )
                   )}
-                  {turn.intermediaries.length > 0 && (
-                    <span
-                      className="text-[10px] text-muted-foreground bg-background border border-border rounded px-1.5 py-0.5 cursor-pointer hover:border-ring hover:text-foreground transition-colors"
-                      onClick={() => onIntermediaryView(turn.intermediaries)}
-                    >
-                      +{turn.intermediaries.length} intermediary
-                    </span>
-                  )}
+                  {turn.intermediaries.length > 0 && intermediaryChip(turn.intermediaries)}
                 </>}
               >
                 <div className="prose-chat max-w-none">

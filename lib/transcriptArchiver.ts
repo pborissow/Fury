@@ -602,16 +602,28 @@ export async function loadTranscript(
   // join enriches every row it CAN match and ignores the rest. Duplicate keys
   // are consumed in order (queue) so twin-timestamped messages stay aligned.
   // (Post-archive purge means the bytes 404 → placeholder chip; intended.)
+  //
+  // The table has no columns for the AskUserQuestion flags either (askQuestion /
+  // askAnswer). Without them a question row reads as Claude's final reply and
+  // the answer as a new user prompt — splitting the turn and shifting rewind
+  // numbering for every later turn. Restored from the same reparse; see
+  // restoreAskFlags for why that join is keyed on content, not timestamp.
   if (rawLines.length > 0) {
     const joined = rawLines.join('\n');
-    // Cheap gate: skip the full reparse for image-less sessions.
+    // Cheap gates: skip the full reparse when neither enrichment can apply.
     const mayHaveImages = joined.includes('fury-img://')
       || joined.includes('"type":"image"') || joined.includes('"type": "image"');
-    if (mayHaveImages) {
+    const mayHaveAsk = joined.includes('AskUserQuestion');
+    if (mayHaveImages || mayHaveAsk) {
+      let reparsed: TranscriptMessage[] | null = null;
       try {
-        const reparsed = parseTranscriptJsonl(joined);
+        reparsed = parseTranscriptJsonl(joined).messages;
+      } catch {
+        // Best-effort enrichment — fall back to the plain rows.
+      }
+      if (reparsed && mayHaveImages) {
         const byKey = new Map<string, TranscriptMessage[]>();
-        for (const m of reparsed.messages) {
+        for (const m of reparsed) {
           if (!m.images?.length) continue;
           const key = `${m.role}|${m.timestamp}`;
           const q = byKey.get(key);
@@ -622,13 +634,49 @@ export async function loadTranscript(
           const match = q?.shift();
           if (match?.images) msg.images = match.images;
         }
-      } catch {
-        // Best-effort enrichment — fall back to image-less messages.
       }
+      if (reparsed && mayHaveAsk) restoreAskFlags(messages, reparsed);
     }
   }
 
   return { messages, rawLines };
+}
+
+/**
+ * Copy the AskUserQuestion flags (askQuestion / askAnswer) from a fresh reparse
+ * of raw_jsonl onto the archived rows, which can't store them.
+ *
+ * The archived rows stay the source of truth rather than being replaced by the
+ * reparse: they include the plan-mode bubble /api/transcript splices in from the
+ * plan file, which raw_jsonl can't reproduce (and the file may be gone too).
+ *
+ * Joined on role + timestamp + content, consuming duplicates in order. Both
+ * halves of the key matter:
+ *  - timestamp: rows archived before question/answer rows existed LACK the
+ *    exchange a fresh reparse now produces. With content alone, that unarchived
+ *    answer (say "Yes") matched the next stored row with the same text — a real
+ *    later prompt — flagging it, absorbing it into the previous turn and shifting
+ *    rewind numbering. An answer carries its own entry's timestamp, which a later
+ *    prompt can't share.
+ *  - content: a question row carries the time it was ASKED, which can equal the
+ *    preamble's timestamp (same assistant entry); content keeps them apart.
+ * Every reparsed message is queued, flagged or not, so an ordinary message never
+ * steals a flag from a duplicate-keyed neighbour. Rows with no reparse
+ * counterpart (the plan bubble, rows from an older parser) are left as-is.
+ */
+export function restoreAskFlags(stored: TranscriptMessage[], reparsed: TranscriptMessage[]): void {
+  const keyOf = (m: TranscriptMessage) => `${m.role}\u0000${m.timestamp}\u0000${m.content}`;
+  const byKey = new Map<string, TranscriptMessage[]>();
+  for (const m of reparsed) {
+    const key = keyOf(m);
+    const q = byKey.get(key);
+    if (q) q.push(m); else byKey.set(key, [m]);
+  }
+  for (const msg of stored) {
+    const match = byKey.get(keyOf(msg))?.shift();
+    if (match?.askQuestion) msg.askQuestion = true;
+    if (match?.askAnswer) msg.askAnswer = true;
+  }
 }
 
 /**

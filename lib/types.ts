@@ -26,6 +26,15 @@ export interface TranscriptMsg {
   uuid?: string;
   /** Image parts attached to this message (pastes / Read-tool images). */
   images?: TranscriptImagePart[];
+  /** True for a user's AskUserQuestion answer recovered from the tool_result.
+   *  On the SDK path the answer resolves the tool in place and never becomes a
+   *  normal user turn, so it's surfaced as an in-turn intermediary rather than a
+   *  top-level "You" bubble — the renderer groups it into `intermediaries`. */
+  askAnswer?: boolean;
+  /** True for the question half of an AskUserQuestion exchange: Claude's question
+   *  (role 'assistant'), emitted right before its askAnswer. Always an in-turn
+   *  intermediary — it is never promoted to the turn's visible Claude bubble. */
+  askQuestion?: boolean;
 }
 
 /** An image attachment on an outgoing chat turn (client → /api/claude → SDK). */

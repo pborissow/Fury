@@ -80,4 +80,15 @@ describe('envelopeHiddenMessages', () => {
     expect(shown.filter((m) => hidden.includes(m))).toEqual([]);
     expect(shown.length + hidden.length).toBe(history.length - 2);
   });
+  it('leaves out AskUserQuestion question messages (their answers are not shown live)', () => {
+    const history = [
+      msg('user', 0, 'plan the rewrite'),
+      msg('assistant', 10, 'I need one decision first'),
+      { ...msg('assistant', 11, 'Which scope?'), askQuestion: true },
+      { ...msg('user', 30, 'Durable'), askAnswer: true },
+      msg('assistant', 40, 'scouts dispatched'),
+    ];
+    const hidden = envelopeHiddenMessages(history, T0, null);
+    expect(hidden.map((m) => m.content)).toEqual(['I need one decision first', 'scouts dispatched']);
+  });
 });

@@ -22,7 +22,7 @@
  * Pure and generic so it can be unit-tested directly and shared by ChatTab's
  * initial-restore and latch-break paths.
  */
-export function stripInFlightPartials<T extends { role: string; timestamp?: string }>(
+export function stripInFlightPartials<T extends { role: string; timestamp?: string; askAnswer?: boolean }>(
   messages: T[],
   startedAt: number,
 ): T[] {
@@ -35,8 +35,10 @@ export function stripInFlightPartials<T extends { role: string; timestamp?: stri
     return cutIdx >= 0 ? messages.slice(0, cutIdx) : messages;
   }
   // No anchor — drop the trailing assistant run after the last real user prompt.
+  // An AskUserQuestion answer is user-role but NOT a prompt (it's in-turn), so
+  // the run continues through it rather than stopping there.
   let end = messages.length;
-  while (end > 0 && messages[end - 1].role === 'assistant') end--;
+  while (end > 0 && (messages[end - 1].role === 'assistant' || messages[end - 1].askAnswer)) end--;
   return messages.slice(0, end);
 }
 
@@ -52,7 +54,10 @@ export function stripInFlightPartials<T extends { role: string; timestamp?: stri
  *
  *  - assistant messages only (the envelope's opening user send is represented
  *    by the overlay bubble; internal <task-notification> user strings never
- *    leave the parser);
+ *    leave the parser), excluding AskUserQuestion question messages — their
+ *    answers are user-role and so aren't shown here, and a question without
+ *    its answer is confusing. The whole exchange appears once the turn settles;
+
  *  - committed at/after the envelope's opening turn start;
  *  - EXCLUDING the currently-streaming turn's own in-flight partials
  *    (timestamp ≥ `turnStartedAt`, when a main turn is active) — those are
@@ -64,13 +69,13 @@ export function stripInFlightPartials<T extends { role: string; timestamp?: stri
  * Pure so it can be unit-tested and shared (same contract style as
  * stripInFlightPartials above).
  */
-export function envelopeHiddenMessages<T extends { role: string; timestamp?: string }>(
+export function envelopeHiddenMessages<T extends { role: string; timestamp?: string; askQuestion?: boolean }>(
   messages: T[],
   envelopeStartedAt: number,
   turnStartedAt: number | null,
 ): T[] {
   return messages.filter((m) => {
-    if (m.role !== 'assistant' || !m.timestamp) return false;
+    if (m.role !== 'assistant' || m.askQuestion || !m.timestamp) return false;
     const t = Date.parse(m.timestamp);
     if (!Number.isFinite(t) || t < envelopeStartedAt) return false;
     if (typeof turnStartedAt === 'number' && t >= turnStartedAt) return false;
