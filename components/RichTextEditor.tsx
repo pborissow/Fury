@@ -57,6 +57,10 @@ interface RichTextEditorProps {
   /** When true, allow submitting with an empty editor (there are image
    *  attachments staged in the parent). Also enables the send button. */
   hasAttachments?: boolean;
+  /** When false, plain Enter inserts a new line (TipTap's default) instead of
+   *  submitting — for touch keyboards, where the Send button submits.
+   *  Shift+Enter is unaffected. Default true. Only applies with the button bar. */
+  submitOnEnter?: boolean;
 }
 
 export interface RichTextEditorHandle {
@@ -82,11 +86,15 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
   autoFocus = false,
   onImagesAdded,
   hasAttachments = false,
+  submitOnEnter = true,
 }, ref) {
   // Keep the latest callback in a ref so the editorProps closures (created once)
   // always see the current handler without re-initializing the editor.
   const onImagesAddedRef = useRef(onImagesAdded);
   onImagesAddedRef.current = onImagesAdded;
+  // Synced in an effect (not during render); only read on keydown, post-commit.
+  const submitOnEnterRef = useRef(submitOnEnter);
+  useEffect(() => { submitOnEnterRef.current = submitOnEnter; }, [submitOnEnter]);
   const [isRecording, setIsRecording] = useState(false);
   const [isSupported, setIsSupported] = useState(true);
   const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -217,7 +225,9 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
             return true;
           }
 
-          // Enter = submit (always)
+          // Enter = submit — unless disabled (touch), where it falls through
+          // to TipTap's default new-paragraph / split-list-item handling.
+          if (!submitOnEnterRef.current) return false;
           event.preventDefault();
           handleSubmit();
           return true;

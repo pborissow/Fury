@@ -55,6 +55,12 @@
       "ceiling": 1000000,
       "source": "probe",
       "at": "2026-08-07"
+    },
+    "haiku": {
+      "base": 200000,
+      "ceiling": 200000,
+      "source": "observed",
+      "at": "2026-09-29"
     }
   }
 }

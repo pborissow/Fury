@@ -2,7 +2,10 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
-import ChatTab from '@/components/ChatTab';
+import ChatTab, { type MobileChatStatus } from '@/components/ChatTab';
+import MobileHeader from '@/components/chat/MobileHeader';
+import type { MobilePane } from '@/components/chat/MobileChatLayout';
+import { useIsMobileSsr } from '@/lib/useIsMobile';
 import CanvasTab from '@/components/CanvasTab';
 import StatsTab, { type StatsPrefs } from '@/components/StatsTab';
 import SearchTab, { type SearchPrefs } from '@/components/SearchTab';
@@ -153,6 +156,38 @@ export default function Home() {
 
   // Tab control state
   const [activeTab, setActiveTab] = useState<'chat' | 'canvas' | 'stats' | 'search'>('chat');
+
+  // Phone layout (docs/ticket-mobile-pwa.md). The server renders desktop; a
+  // phone switches right after hydration.
+  const isMobile = useIsMobileSsr();
+  // The Chat carousel's pane. Lifted here because the header (indicator) and
+  // ChatTab (carousel) both need it. In memory only — never /api/ui-state,
+  // which is server-wide and shared with desktop. Sessions on every load.
+  const [mobilePane, setMobilePane] = useState<MobilePane>('sessions');
+  const [mobileChatStatus, setMobileChatStatus] = useState<MobileChatStatus>({ title: 'Sessions', conversationBadge: false });
+
+  // Size the phone shell to the VISIBLE viewport. iOS Safari ignores
+  // interactive-widget=resizes-content, so without this the on-screen keyboard
+  // covers the composer; iOS also pans the page when an input focuses, so the
+  // shell follows the visual viewport's offset (see .mobile-shell).
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!isMobile || !vv) return;
+    const root = document.documentElement;
+    const update = () => {
+      root.style.setProperty('--vvh', `${vv.height}px`);
+      root.style.setProperty('--vvt', `${vv.offsetTop}px`);
+    };
+    update();
+    vv.addEventListener('resize', update);
+    vv.addEventListener('scroll', update);
+    return () => {
+      vv.removeEventListener('resize', update);
+      vv.removeEventListener('scroll', update);
+      root.style.removeProperty('--vvh');
+      root.style.removeProperty('--vvt');
+    };
+  }, [isMobile]);
 
   // Track which tabs have been mounted at least once (lazy mount + CSS hide)
   const [mountedTabs, setMountedTabs] = useState<Set<string>>(new Set(['chat']));
@@ -336,7 +371,39 @@ export default function Home() {
   }, [theme]);
 
   return (
-    <div className="h-screen w-screen bg-background flex flex-col">
+    <div className={isMobile ? 'mobile-shell w-full bg-background flex flex-col' : 'h-dvh w-screen bg-background flex flex-col'}>
+      {/* Settings: a portal, so it lives outside either header. */}
+      <Dialog open={settingsOpen} onOpenChange={setSettingsOpen} title="Settings" noPadding>
+        <SettingsPanel
+          ttsEnabled={ttsEnabled}
+          onTtsChange={setTtsEnabled}
+          imagePersist={imagePersist}
+          onImagePersistChange={setImagePersist}
+          localhostOnly={localhostOnly}
+          onLocalhostOnlyChange={setLocalhostOnly}
+          hasCredentials={hasCredentials}
+          authUsername={authUsername}
+          onCredentialsSaved={(name) => { setHasCredentials(true); setAuthUsername(name); }}
+          services={services}
+          onServicesChanged={(updates) => setServices(prev => ({ ...prev, ...updates }))}
+        />
+      </Dialog>
+      {isMobile ? (
+        <MobileHeader
+          activeTab={activeTab}
+          onTabChange={setActiveTab}
+          title={activeTab === 'chat' ? mobileChatStatus.title : activeTab[0].toUpperCase() + activeTab.slice(1)}
+          pane={mobilePane}
+          onPaneChange={setMobilePane}
+          conversationBadge={mobileChatStatus.conversationBadge}
+          theme={theme}
+          onToggleTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+          onOpenSettings={() => setSettingsOpen(true)}
+          user={loggedInUser}
+          onSignOut={handleLogout}
+        />
+      ) : (
+      <>
       {/* Toolbar */}
       <div className="bg-card border-b border-border px-4 py-2 flex items-center justify-end gap-3">
         {loggedInUser && (
@@ -378,26 +445,15 @@ export default function Home() {
         <Button variant="ghost" size="sm" title="Settings" className="h-8 w-8 p-0" onClick={() => setSettingsOpen(true)}>
           <EllipsisVertical className="h-4 w-4" />
         </Button>
-        <Dialog open={settingsOpen} onOpenChange={setSettingsOpen} title="Settings" noPadding>
-          <SettingsPanel
-            ttsEnabled={ttsEnabled}
-            onTtsChange={setTtsEnabled}
-            imagePersist={imagePersist}
-            onImagePersistChange={setImagePersist}
-            localhostOnly={localhostOnly}
-            onLocalhostOnlyChange={setLocalhostOnly}
-            hasCredentials={hasCredentials}
-            authUsername={authUsername}
-            onCredentialsSaved={(name) => { setHasCredentials(true); setAuthUsername(name); }}
-            services={services}
-            onServicesChanged={(updates) => setServices(prev => ({ ...prev, ...updates }))}
-          />
-        </Dialog>
       </div>
+
+      </>
+      )}
 
       {/* Main Content with Tabs */}
       <div className="flex-1 overflow-hidden flex flex-col">
-        {/* Primary Tabs */}
+        {/* Primary Tabs (desktop; the phone header's drawer replaces them) */}
+        {!isMobile && (
         <div className="border-b border-border px-4 flex items-center gap-6">
           <button
             onClick={() => setActiveTab('chat')}
@@ -444,6 +500,7 @@ export default function Home() {
             )}
           </button>
         </div>
+        )}
 
         {/* Tab Content — lazy mount, then CSS hide to preserve state */}
         <div className="flex-1 overflow-hidden relative">
@@ -467,6 +524,9 @@ export default function Home() {
                 ttsEnabled={ttsEnabled}
                 sdkSessionsEnabled={sdkSessionsEnabled}
                 openSessionRequest={sessionToOpen}
+                mobilePane={mobilePane}
+                onMobilePaneChange={setMobilePane}
+                onMobileStatus={setMobileChatStatus}
               />
             </div>
           )}

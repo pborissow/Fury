@@ -445,3 +445,84 @@
     animation-delay: -0.16s;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Mobile shell (docs/ticket-mobile-pwa.md). Everything here is either scoped to
+   mobile-only classes or wrapped in the MOBILE_QUERY media query
+   (lib/useIsMobile.ts) — keep the two in sync. Desktop is unaffected.
+   --------------------------------------------------------------------------- */
+
+/* Chat tab carousel: full-width pages, native swipe + snap. */
+.mobile-carousel {
+  display: flex;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+.mobile-carousel::-webkit-scrollbar {
+  display: none;
+}
+.mobile-carousel > section {
+  flex: 0 0 100%;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+}
+
+/* The app shell: fill the VISIBLE viewport. --vvh is set from visualViewport
+   (iOS Safari ignores interactive-widget=resizes-content, so the keyboard
+   would otherwise cover the composer); falls back to the dynamic viewport. */
+.mobile-shell {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: var(--vvt, 0px);
+  height: var(--vvh, 100dvh);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+
+/* Header clears the notch / status bar (viewport-fit=cover, standalone). */
+.mobile-header {
+  padding-top: env(safe-area-inset-top);
+}
+
+@media (max-width: 767px), (pointer: coarse) and (max-height: 500px) {
+  /* No pull-to-refresh reloading the app mid-stream. */
+  html, body {
+    overscroll-behavior-y: none;
+  }
+
+  /* Horizontal scrollers inside the transcript don't flick the carousel when
+     they hit their edge. */
+  .prose-chat pre,
+  .prose-chat table,
+  .prose-chat .overflow-x-auto {
+    overscroll-behavior-x: contain;
+  }
+
+  /* iOS zooms into inputs with a font-size under 16px. */
+  input, textarea, select, [contenteditable="true"] {
+    font-size: 16px;
+  }
+
+  /* Composer sits above the home indicator. */
+  .mobile-composer {
+    padding-bottom: calc(1rem + env(safe-area-inset-bottom));
+  }
+}
+
+/* Stacked composer (ConversationPane splitComposer={false}): content-sized, up
+   to 40% of the visible viewport, then the editor scrolls inside. The editor's
+   root is `h-full`, which resolves to auto here; min-height:0 lets it shrink. */
+.composer-stack {
+  display: flex;
+  flex-direction: column;
+  min-height: min(7rem, calc(var(--vvh, 100dvh) * 0.4));
+  max-height: calc(var(--vvh, 100dvh) * 0.4);
+}
+.composer-stack > * {
+  flex: 1 1 auto;
+  min-height: 0;
+}

@@ -111,3 +111,17 @@ export function findRewindCutIndex(messages: Pick<TranscriptMsg, 'role' | 'askAn
   }
   return -1;
 }
+
+/**
+ * The Claude bubble a finished turn is announced by (TTS): the visible bubble of
+ * the last turn that has one. Uses groupTurns — the same grouping the transcript
+ * renders — so AskUserQuestion answers don't count as new turns and question
+ * messages are never read aloud as the reply.
+ */
+export function lastClaudeBubble<M extends TranscriptMsg>(msgs: M[]): M | null {
+  const turns = groupTurns(msgs);
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i].assistant) return turns[i].assistant;
+  }
+  return null;
+}

@@ -1,6 +1,7 @@
 'use client';
 
 import { useRef, useEffect, useState } from 'react';
+import { scrollIntoViewY } from '@/lib/scrollIntoViewY';
 
 export type StreamEvent =
   | { type: 'tool_start'; name: string; ts: number }
@@ -55,7 +56,7 @@ export default function StreamEventsPanel({
   }, [submitStartTime, submitEndTime]);
 
   useEffect(() => {
-    streamEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    scrollIntoViewY(streamEndRef.current, { behavior: 'smooth' });
   }, [streamEvents]);
 
   return (

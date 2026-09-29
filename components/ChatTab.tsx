@@ -1,60 +1,29 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
-import { Plus, AlertTriangle, FolderTree, FileText, Activity, Plug } from 'lucide-react';
-import Dialog, { ConfirmDialog, AlertDialog } from '@/components/Dialog';
-import { Button } from '@/components/ui/button';
-import RichTextEditor, { type RichTextEditorHandle } from '@/components/RichTextEditor';
-import FileTree from '@/components/FileTree';
-import CodeViewerDialog, { isCodeFile } from '@/components/CodeViewerDialog';
-import SourceControlDialog from '@/components/SourceControlDialog';
-import AskUserQuestionDialog from '@/components/AskUserQuestionDialog';
-import StreamEventsPanel, { type StreamEvent } from '@/components/StreamEventsPanel';
-import McpPanel from '@/components/McpPanel';
-import SessionSidebar from '@/components/SessionSidebar';
-import TranscriptRenderer from '@/components/TranscriptRenderer';
-import IntermediaryMessagesDialog from '@/components/IntermediaryMessagesDialog';
-import SessionContextMenu from '@/components/SessionContextMenu';
-import LabelEditDialog from '@/components/LabelEditDialog';
-import ModelPickerDialog from '@/components/ModelPickerDialog';
-import LimitReachedDialog, { type LimitReachedInfo } from '@/components/LimitReachedDialog';
-import { setSessionModel } from '@/lib/setSessionModel';
-import NewSessionModelStep from '@/components/NewSessionModelStep';
-import { DirectoryPicker } from '@/components/DirectoryPicker';
-import { getRecentDirectories } from '@/lib/recent-directories';
-import { uiLog } from '@/lib/clientTelemetry';
-import { stripInFlightPartials, envelopeHiddenMessages } from '@/lib/transcriptStrip';
-import { findRewindCutIndex, groupTurns } from '@/lib/transcriptTurns';
-import type { Message, TranscriptMsg, HistoryEntry, PendingSession, AskUserQuestionState, TranscriptImagePart } from '@/lib/types';
-import { normalizeImage, type AttachedImage } from '@/lib/clientImage';
-import type { TurnMeta } from '@/lib/transcriptParser';
-import type { Liveness } from '@/lib/eventBus';
-
-// Generate a UUID v4
-const generateUUID = () => {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-    const r = Math.random() * 16 | 0;
-    const v = c === 'x' ? r : (r & 0x3 | 0x8);
-    return v.toString(16);
-  });
-};
-
-type SpeakableMsg = TranscriptMsg & { turnMeta?: TurnMeta };
-
-/**
- * The Claude bubble TTS should read: the visible bubble of the last turn that has
- * one. Uses the same grouping TranscriptRenderer renders, so AskUserQuestion
- * answers don't count as new turns and question messages are never read aloud
- * as the reply (the hand-rolled loops this replaced got both wrong).
- */
-function lastClaudeBubble<M extends SpeakableMsg>(msgs: M[]): M | null {
-  const turns = groupTurns(msgs);
-  for (let i = turns.length - 1; i >= 0; i--) {
-    if (turns[i].assistant) return turns[i].assistant;
-  }
-  return null;
-}
+import { useState, useRef, useEffect } from 'react';
+import type { RichTextEditorHandle } from '@/components/RichTextEditor';
+import Composer from '@/components/composer/Composer';
+import { useComposerAttachments } from '@/components/composer/useComposerAttachments';
+import { useNotes } from '@/components/notes/useNotes';
+import { useViewedSession } from '@/components/chat/hooks/useViewedSession';
+import { useTts } from '@/components/chat/hooks/useTts';
+import { useProviderStatus } from '@/components/chat/hooks/useProviderStatus';
+import { useSessionHistory } from '@/components/chat/hooks/useSessionHistory';
+import { useSessionDrafts } from '@/components/chat/hooks/useSessionDrafts';
+import { useAskUserQuestion } from '@/components/chat/hooks/useAskUserQuestion';
+import { useLimitHandling } from '@/components/chat/hooks/useLimitHandling';
+import { useSessionStream } from '@/components/chat/hooks/useSessionStream';
+import { useNewSessionWizard } from '@/components/chat/hooks/useNewSessionWizard';
+import { useOpenSessionRequest, type OpenSessionRequest } from '@/components/chat/hooks/useOpenSessionRequest';
+import DesktopChatLayout from '@/components/chat/DesktopChatLayout';
+import MobileChatLayout, { type MobilePane } from '@/components/chat/MobileChatLayout';
+import { useIsMobile, useIsCoarsePointer } from '@/lib/useIsMobile';
+import SessionsPane from '@/components/chat/SessionsPane';
+import ConversationPane from '@/components/chat/ConversationPane';
+import ChatSidePane, { type ChatSideView } from '@/components/chat/ChatSidePane';
+import ChatDialogs, { type ContextMenuState, type RewindRequest, type SessionRef } from '@/components/chat/ChatDialogs';
+import { lastClaudeBubble } from '@/lib/transcriptTurns';
+import type { TranscriptMsg } from '@/lib/types';
 
 interface ChatTabProps {
   chatHorizontalLayout: number[];
@@ -69,12 +38,20 @@ interface ChatTabProps {
   /** A request from another tab (Stats) to open a transcript here. `nonce`
    *  changes on every request so re-opening the same session re-fires; null
    *  when nothing is pending. */
-  openSessionRequest?: { sessionId: string; project: string; display: string; nonce: number; turnIndex?: number } | null;
+  openSessionRequest?: OpenSessionRequest | null;
+  /** Phone layout (docs/ticket-mobile-pwa.md): the carousel pane on screen.
+   *  Controlled by page.tsx, whose header holds the pane indicator. */
+  mobilePane?: MobilePane;
+  onMobilePaneChange?: (pane: MobilePane) => void;
+  /** What the phone header shows for the Chat tab: the viewed session's title,
+   *  and whether Conversation has news (a turn finished while off screen). */
+  onMobileStatus?: (status: MobileChatStatus) => void;
 }
 
-// stripInFlightPartials moved to lib/transcriptStrip.ts (imported above) so its
-// anchor-vs-fallback behavior can be unit-tested without pulling in this client
-// component. See that file for the rationale on why the startedAt anchor matters.
+export interface MobileChatStatus {
+  title: string;
+  conversationBadge: boolean;
+}
 
 export default function ChatTab({
   chatHorizontalLayout,
@@ -85,96 +62,124 @@ export default function ChatTab({
   ttsEnabled,
   sdkSessionsEnabled,
   openSessionRequest,
+  mobilePane = 'sessions',
+  onMobilePaneChange,
+  onMobileStatus,
 }: ChatTabProps) {
-  // --- State moved from page.tsx ---
+  // Which session is on screen (+ its project), and a ref for async guards.
+  const viewed = useViewedSession();
+  const viewingTranscriptId = viewed.id;
+  const historyTranscriptProject = viewed.project;
 
-  const [showDirectoryPicker, setShowDirectoryPicker] = useState(false);
-  // New-session wizard step (b): model selection. `wizardPath` holds the
-  // directory chosen in step (a) until the user commits or backs out.
-  const [showModelStep, setShowModelStep] = useState(false);
-  const [wizardPath, setWizardPath] = useState<string | null>(null);
-
-  // Health check state
-  const [isStuck, setIsStuck] = useState(false);
-  const [stuckReason, setStuckReason] = useState<string | undefined>();
-
-  const [history, setHistory] = useState<HistoryEntry[]>([]);
-  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
-  const [historyHasMore, setHistoryHasMore] = useState(false);
-  const [isLoadingMoreHistory, setIsLoadingMoreHistory] = useState(false);
-  const historyLengthRef = useRef(0);
-  /** Server-issued cursor for the last history entry we hold (see fetchHistory). */
-  const historyCursorRef = useRef<string | null>(null);
-  const [liveSessionIds, setLiveSessionIds] = useState<Set<string>>(new Set());
-  // Per-session epoch-ms of the last turn completion. Anchors the prompt-cache
-  // freshness leaf in the sidebar — stamped when a viewed session stops
-  // processing. Sessions without an entry fall back to their history timestamp.
-  const [sessionActivity, setSessionActivity] = useState<Record<string, number>>({});
-  // Per-session live context occupancy + window, driven by session:usage SSE.
-  // Overlays archived metadata so the sidebar tracks context as Claude streams.
-  //
-  // Unlike the cumulative token count this replaced, context is an ABSOLUTE
-  // level, not an increment — the server reports the latest call's prompt size
-  // outright. So there's no baseline to freeze, no addition, and no risk of
-  // double-counting the archive's mid-turn growth: last value wins.
-  const [liveContext, setLiveContext] = useState<
-    Record<string, { tokens: number; window: number }>
-  >({});
-
-  // New sessions that haven't been submitted yet — persisted in the sidebar so
-  // the user can switch away and come back without losing them.
-  const [pendingNewSessions, setPendingNewSessions] = useState<
-    { sessionId: string; project: string; title: string; createdAt: number }[]
-  >([]);
-
-  // Stream events for the right-panel Stream tab
-  const [streamEvents, setStreamEvents] = useState<StreamEvent[]>([]);
-
-  // Smart prompt suggestion for incomplete responses
-
-
-  // History transcript viewer state (renders in center panel)
-  const [historyTranscript, setHistoryTranscript] = useState<{ role: 'user' | 'assistant'; content: string; timestamp: string; turnMeta?: TurnMeta; uuid?: string; images?: TranscriptImagePart[]; askAnswer?: boolean; askQuestion?: boolean }[]>([]);
-  const [viewingTranscriptId, setViewingTranscriptId] = useState<string | null>(null);
-  const [modelPickerOpen, setModelPickerOpen] = useState(false);
-  const [historyTranscriptLoading, setHistoryTranscriptLoading] = useState(false);
-  const [historyTranscriptProject, setHistoryTranscriptProject] = useState<string | null>(null);
-  const [transcriptOverlayMessages, setTranscriptOverlayMessages] = useState<(Message & { images?: TranscriptImagePart[] })[]>([]);
   // Image attachments staged for the next send (paste/drop → normalize → chip).
-  // Lives here (not in the editor) so it survives editor clears.
-  const [attachedImages, setAttachedImages] = useState<AttachedImage[]>([]);
-  /** Why the last paste/drop was (partially) rejected — shown beside the chips. */
-  const [attachError, setAttachError] = useState<string | null>(null);
-  const [transcriptStreaming, setTranscriptStreaming] = useState('');
-  const [transcriptLoading, setTranscriptLoading] = useState(false);
-  // Independent of transcriptLoading (which is tied to an in-flight MAIN turn and
-  // its strip/refetch machinery): true while the session is driving a BACKGROUND
-  // subagent between its own turns. Drives ONLY the bouncing dots — deliberately
-  // orthogonal so background liveness never touches the fragile in-flight-partials
-  // logic. See docs/ticket-live-badge-dark-during-background-subagent.md.
-  const [backgroundWorking, setBackgroundWorking] = useState(false);
-  // SSOT liveness projection (docs/design-liveness-single-source-of-truth.md, step 2b).
-  // The single authoritative "is Claude working?" level, held verbatim from the server
-  // (session:health PUSH, seq-gated; /api/health PULL, unconditional). When the flag is
-  // on, the dots render off `live.phase` instead of the legacy `transcriptLoading ||
-  // backgroundWorking` OR-of-proxies; the legacy machinery stays intact as the fallback
-  // (and reseeds the dots when `live` is null / flag off). Reset to null on session switch.
-  const [live, setLive] = useState<Liveness | null>(null);
-  const liveRef = useRef<Liveness | null>(null);
-  // Apply an incoming liveness LEVEL. An SSE beat (PUSH) advances state only when
-  // its seq is NEWER — a late/duplicate beat can't move the level backward. A PULL
-  // (/api/health, /api/stream-buffer, reconnect/poll) is an authoritative snapshot
-  // applied UNCONDITIONALLY: state can move without a push (a wedge self-heal), so
-  // a fresh pull may legitimately carry the SAME seq as the last push (design §3
-  // seq contract). Component-scoped (not effect-local) so the fetchTranscript
-  // restore path can seed `live` — incl. the envelope anchor — on first paint.
-  const applyLiveness = useCallback((next: Liveness | undefined | null, fromPull: boolean) => {
-    if (!next || typeof next.seq !== 'number') return;
-    const cur = liveRef.current;
-    if (!fromPull && cur && next.seq <= cur.seq) return;
-    liveRef.current = next;
-    setLive(next);
-  }, []);
+  // Lives here (not in the editor) so it survives editor clears and travels
+  // with per-session drafts and the limit auto-resend.
+  const attachments = useComposerAttachments();
+
+  // Voice summary + turn-complete chime (see useTts for the ownership rule).
+  const tts = useTts(ttsEnabled);
+
+  // Provider (Anthropic / Bedrock) + the viewed session's model — status label,
+  // limit dialog's Bedrock button.
+  const {
+    label: providerLabel, currentModel, setCurrentModel, failoverConfigured,
+    refresh: refreshProviderStatus, load: loadProviderStatus,
+  } = useProviderStatus();
+
+  // Session list (cursor-paged) + live-session ids, kept current by the global
+  // /api/events stream while the tab is active.
+  const sessionHistory = useSessionHistory(isActive, {
+    // A turn finished somewhere: chime — EXCEPT for the session in view with
+    // voice summary on, where TTS is the notification (its failure paths chime
+    // instead). One chime per event, even if several sessions finished at once.
+    onTurnsFinished: (ids) => {
+      if (ids.some(id => !(id === viewed.idRef.current && tts.enabledRef.current))) tts.playChime();
+    },
+    // Source (Anthropic/Bedrock) and the configured model are tracked separately
+    // so the per-session model can override the model portion once known.
+    onProviderStale: (reason) => (reason === 'activate' ? loadProviderStatus() : refreshProviderStatus()),
+  });
+  const { history, setHistory, isLoadingHistory, historyHasMore, isLoadingMoreHistory, fetchHistory, loadMoreHistory, liveSessionIds } = sessionHistory;
+
+  const chatEditorRef = useRef<RichTextEditorHandle>(null);
+  // Per-session unsent composer (text + attachments); stash/restore as a pair
+  // on every navigation.
+  const drafts = useSessionDrafts(chatEditorRef, attachments);
+
+  // Phone vs desktop layout. Crossing the breakpoint (resizing a desktop window —
+  // rotation never switches, see MOBILE_QUERY) remounts the panes, and the
+  // unsent composer text lives in the editor: stash it while the outgoing
+  // layout is still mounted, restore it once the new one is.
+  const isMobile = useIsMobile(() => drafts.stash(viewed.idRef.current));
+  const layoutSwitched = useRef(false);
+  useEffect(() => {
+    if (!layoutSwitched.current) { layoutSwitched.current = true; return; }
+    if (viewed.idRef.current) drafts.restore(viewed.idRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on a switch
+  }, [isMobile]);
+  // Touch keyboards: Enter is a new line, the Send button sends.
+  const isCoarsePointer = useIsCoarsePointer();
+  /** Phone: bring a pane on screen (no-op on desktop, where all are visible). */
+  const showPane = (pane: MobilePane) => {
+    if (isMobile) onMobilePaneChange?.(pane);
+  };
+
+  // AskUserQuestion dialog (SDK: parked tool call; CLI: answered as a new turn).
+  // `stream` is declared below; these callbacks only run on user action.
+  const ask = useAskUserQuestion({
+    sdkSessionsEnabled,
+    sessionId: viewingTranscriptId,
+    activeSessionRef: viewed.activeSessionRef,
+    onProseAnswer: (answer) => stream.sendProseAnswer(answer),
+  });
+
+  // Terminal usage/rate limit (server `session:limit`): the recovery dialog —
+  // switch model or fail over to Bedrock, then auto-resend the limited prompt.
+  const limits = useLimitHandling({
+    activeSessionRef: viewed.activeSessionRef,
+    projectPath: historyTranscriptProject,
+    send: (prompt, images) => stream.send(prompt, images),
+    onError: (message) => stream.showError(message),
+    refreshProvider: refreshProviderStatus,
+    setCurrentModel,
+    bedrockConfigured: failoverConfigured,
+  });
+
+  // The viewed session's conversation, in-flight turn, and session SSE.
+  const stream = useSessionStream({
+    viewed, isActive, sdkSessionsEnabled, chatEditorRef, attachments, drafts, tts, setCurrentModel,
+    history: sessionHistory, ask, limits,
+  });
+  const {
+    historyTranscript, historyTranscriptLoading, transcriptOverlayMessages, overlayInsertPoint, transcriptPartial,
+    displayedTranscript, envelopeOpen, envelopeHidden, envelopeUserEcho,
+    transcriptStreaming, transcriptLoading, backgroundWorking, live, livenessDotsEnabled, streamEvents,
+    submitStartTime, submitEndTime, isStuck, stuckReason, sessionError, mcpFailedServers, takeoverConfirm,
+    sessionActivity, liveContext, pendingNewSessions, transcriptEndRef, lastAssistantRef,
+  } = stream;
+
+  // New Session wizard: directory → model → create.
+  const wizard = useNewSessionWizard({
+    history, sdkSessionsEnabled,
+    onCreate: (...args: Parameters<typeof stream.startNewSession>) => {
+      showPane('conversation');
+      return stream.startNewSession(...args);
+    },
+  });
+
+  // Notes for the viewed session's project. Held here (always mounted), not in
+  // NotesView (mounted only while selected) — see useNotes.
+  const notes = useNotes(historyTranscriptProject);
+
+  // The conversation column the AskUserQuestion modal anchors to, so the
+  // question dialog appears within it rather than over the whole app. Held in
+  // state via a callback ref (not read from a ref during render), so the dialog
+  // re-renders with the element once it's attached.
+  const [conversationEl, setConversationEl] = useState<HTMLDivElement | null>(null);
+
+  // --- UI state (panels, dialogs) ---
+  const [rightPanelView, setRightPanelView] = useState<ChatSideView>('stream');
+  const [modelPickerOpen, setModelPickerOpen] = useState(false);
   // Whether the dots-bubble's intermediary-messages modal is open (the agreed
   // product direction in docs/ticket-subagent-notification-turns-intermediate-
   // bubbles.md: intermediate turn output is hidden from the main flow while the
@@ -182,2343 +187,68 @@ export default function ChatTab({
   // The modal's CONTENT is derived at render time from (historyTranscript, live),
   // so it live-updates while open and empties (closing itself) when the envelope
   // closes and the main flow reveals the committed history.
-  const [envelopeModalOpen, setEnvelopeModalOpen] = useState(false);
-  // Opt-in for the projection-driven dots (localStorage `fury.livenessDots`). Off by
-  // default so the legacy path is untouched until this is proven in the app; flip it in
-  // the browser console to verify. Step 3 makes it the default and deletes the legacy path.
-  const [livenessDotsEnabled, setLivenessDotsEnabled] = useState(false);
-  const livenessDotsEnabledRef = useRef(false);
-  const [providerSource, setProviderSource] = useState<'Anthropic' | 'Bedrock' | null>(null);
-  const [providerConfiguredModel, setProviderConfiguredModel] = useState<string | null>(null);
-  const [currentModel, setCurrentModel] = useState<string | null>(null);
-  // The most recent prompt+attachments sent, per session — so a terminal usage
-  // limit can auto-resend it verbatim on the newly chosen model without the user
-  // retyping. Keyed by sessionId; cleared implicitly by being overwritten.
-  const lastSendRef = useRef<{ sessionId: string; prompt: string; images: AttachedImage[] } | null>(null);
-  const transcriptLoadingRef = useRef(false);
-  const backgroundWorkingRef = useRef(false);
-  const transcriptStreamingRef = useRef('');
-  // Consecutive `/api/health` isProcessing:false readings from the 15s fallback
-  // poll. The SDK singleton swap on Next.js HMR can make a not-yet-recompiled
-  // /api/health route momentarily report a live session as idle (documented in
-  // lib/sdkSessionManager.ts). A lone transient false must NOT tear down the
-  // in-flight view — require two in a row before trusting "the turn ended", and
-  // let the authoritative session-health SSE handle real completions instantly.
-  const healthFalseStreakRef = useRef(0);
-  const ttsEnabledRef = useRef(ttsEnabled);
-  const ttsAudioRef = useRef<HTMLAudioElement | null>(null);
-  const ttsBlobUrlRef = useRef<string | null>(null);
-  const ttsAbortRef = useRef<AbortController | null>(null);
-  const [ttsPlaying, setTtsPlaying] = useState<'loading' | 'playing' | 'paused' | 'idle'>('idle');
-
-  // --- Turn-complete chime ---
-  // A short notification sound whenever Claude finishes a turn in ANY session
-  // (unlike TTS, which only ever speaks the session in view). Ownership rule:
-  // when the finished session IS the one in view and voice summary is on, the
-  // chime defers to TTS — speech is the notification — but every TTS failure
-  // path chimes instead, so a completed turn is never silent by accident.
-  const chimeAudioRef = useRef<HTMLAudioElement | null>(null);
-  const lastChimeAtRef = useRef(0);
-  /** Minimum gap between chimes. Several sessions finishing within a couple of
-   *  seconds (distinct SSE events, so the per-event dedupe can't see them)
-   *  should ring ONCE, not machine-gun the bell. */
-  const CHIME_COOLDOWN_MS = 2000;
-  const playChime = useCallback(() => {
-    try {
-      // Never ring over active voice playback: speech IS the notification
-      // (original spec). The <audio> element is the source of truth — no state
-      // to fall out of sync — and the TTS failure-path chimes still pass, since
-      // a playback that failed or ended isn't playing. A single shared chime
-      // element (below) means chimes can't stack over EACH OTHER either.
-      const tts = ttsAudioRef.current;
-      if (tts && !tts.paused && !tts.ended) return;
-      const now = Date.now();
-      if (now - lastChimeAtRef.current < CHIME_COOLDOWN_MS) return;
-      lastChimeAtRef.current = now;
-      if (!chimeAudioRef.current) {
-        chimeAudioRef.current = new Audio('/sounds/bike-bell.mp3');
-        chimeAudioRef.current.volume = 0.5;
-      }
-      chimeAudioRef.current.currentTime = 0;
-      // Rejection = browser autoplay policy (no user gesture yet) — expected
-      // on a fresh tab; nothing to do about it.
-      chimeAudioRef.current.play().catch(() => {});
-    } catch {
-      // No audio support — a chime is never worth an error.
-    }
-  }, []);
-  /** Live-session ids as of the LAST global SSE event / baseline fetch. The
-   *  chime triggers on ids leaving this set (turn finished), so baseline
-   *  fetches (mount, SSE reconnect catch-up) must update it WITHOUT chiming —
-   *  sessions that finished while the tab was hidden are old news. */
-  const prevLiveIdsRef = useRef<Set<string>>(new Set());
-  /** Mirror of viewingTranscriptId for the global SSE closure (bound once per
-   *  tab activation). */
-  const viewingIdRef = useRef<string | null>(null);
-  const activeSessionRef = useRef<string | null>(null);
-  const transcriptEndRef = useRef<HTMLDivElement>(null);
-  const lastAssistantRef = useRef<HTMLDivElement>(null);
-  const prevAssistantCountRef = useRef(0);
-  const skipNextAssistantScrollRef = useRef(true);
-
-  // Tracks the latest prompt-submission timing for the stream panel's
-  // "Elapsed Time" indicator. submitEndTime stays null until the response
-  // (or error) completes; once set, the timer freezes at the final value.
-  const [submitStartTime, setSubmitStartTime] = useState<number | null>(null);
-  const [submitEndTime, setSubmitEndTime] = useState<number | null>(null);
-  const chatEditorRef = useRef<RichTextEditorHandle>(null);
-  /** Unsent composer state per session: editor HTML + staged image
-   *  attachments. Attachments MUST travel with the text — stashing only the
-   *  HTML left `attachedImages` behind on switch, so a pasted image followed
-   *  the user into the next session (and got sent with, or cleared by, that
-   *  session's next turn). Same family of bug as the AskUserQuestion draft
-   *  store in AskUserQuestionDialog.tsx. */
-  const sessionDraftsRef = useRef<Map<string, { html: string; images: AttachedImage[] }>>(new Map());
-
-  /** Stash the CURRENT session's composer (editor + attachment chips) before
-   *  switching away. Every navigation path must call this — and its
-   *  counterpart restoreDraft — as a pair. */
-  const stashDraft = () => {
-    if (!viewingTranscriptId || !chatEditorRef.current) return;
-    const html = chatEditorRef.current.getContent();
-    const hasText = !!(chatEditorRef.current.getPlainText?.()?.trim?.() || html.replace(/<[^>]*>/g, '').trim());
-    if (hasText || attachedImages.length > 0) {
-      sessionDraftsRef.current.set(viewingTranscriptId, { html: hasText ? html : '', images: attachedImages });
-    } else {
-      sessionDraftsRef.current.delete(viewingTranscriptId);
-    }
-  };
-
-  /** Restore (or clear) the composer for the session being switched TO. A
-   *  session with no stashed draft gets an empty editor and NO chips — a new
-   *  or clean session must never inherit another session's attachments. */
-  const restoreDraft = (sessionId: string) => {
-    const draft = sessionDraftsRef.current.get(sessionId);
-    setAttachedImages(draft?.images || []);
-    setAttachError(null);
-    setTimeout(() => chatEditorRef.current?.setContent(draft?.html || ''), 50);
-  };
-
-  // When overlay messages are restored from a previous session, they belong at a
-  // specific position in the transcript (not at the end). null = append at end (live sends).
-  const [overlayInsertPoint, setOverlayInsertPoint] = useState<number | null>(null);
-
-  // True when the transcript was reconstructed from history.jsonl (user prompts only, no responses)
-  const [transcriptPartial, setTranscriptPartial] = useState(false);
-
-  // AskUserQuestion dialog state
-  const [askUserQuestion, setAskUserQuestion] = useState<AskUserQuestionState | null>(null);
-  // The middle-panel container the AskUserQuestion modal anchors to, so the
-  // question dialog appears within the Chat panel rather than over the whole app.
-  const middlePanelRef = useRef<HTMLDivElement>(null);
-
-  /** When a question last PARKED, via SSE. Guards the stale-close race below. */
-  const lastAskEventAtRef = useRef(0);
-  /** The last question the user ANSWERED and when. Guards the stale-RE-OPEN race
-   *  (P18): a reconnect/visibility buffer fetch issued before the answer landed can
-   *  still return the question as pending and flash the just-answered dialog back on. */
-  const answeredAskRef = useRef<{ toolUseID: string; at: number } | null>(null);
-
-  /**
-   * Re-open (or close) the dialog from a /api/stream-buffer response.
-   *
-   * On the SDK path the server holds the pending question and Claude is parked
-   * on it indefinitely, so this is what makes a browser refresh, a switch-back,
-   * or a backgrounded tab survivable: without it the turn is stranded — the
-   * process waits forever on a dialog that no longer exists on screen. Called
-   * from every buffer restore site, since each is a moment the dialog could have
-   * been lost.
-   *
-   * A null pendingAsk closes a stale SDK dialog (the question was answered
-   * elsewhere — another tab, an abort). Guarded on toolUseID so it never closes
-   * a CLI-sourced dialog, which the server has no record of.
-   *
-   * `issuedAt` is when the fetch was SENT, and the null branch needs it: the
-   * response is a snapshot of the past with no ordering guarantee against SSE.
-   * If a question parks after we asked but before the answer lands, that stale
-   * null would close a dialog that had only just opened — and Claude would park
-   * forever with nothing on screen to answer it. Narrow (fetches return in ms,
-   * parks happen seconds in) but it's the failure this whole design exists to
-   * prevent, so: never let a snapshot older than the last park close anything.
-   */
-  const applyPendingAskFromBuffer = (
-    bufData: { pendingAsk?: { toolUseID?: string; questions?: unknown } | null },
-    issuedAt: number,
-  ) => {
-    if (!sdkSessionsEnabled) return;
-    const pending = bufData?.pendingAsk;
-    if (pending?.toolUseID && Array.isArray(pending.questions)) {
-      // P18: don't re-open a dialog the user already answered. In the small window
-      // before the server resolves the answer, a stale buffer snapshot (issued
-      // BEFORE the answer) can still carry this toolUseID as pending. If we answered
-      // it at/after the snapshot was issued, that snapshot predates the answer —
-      // ignore it. A fetch issued AFTER the answer that STILL shows pending is
-      // genuinely unresolved (e.g. the answer POST failed), so let it re-open.
-      const answered = answeredAskRef.current;
-      if (answered && answered.toolUseID === pending.toolUseID && answered.at >= issuedAt) return;
-      lastAskEventAtRef.current = Date.now();
-      setAskUserQuestion({
-        toolUseID: pending.toolUseID,
-        input: { questions: pending.questions as AskUserQuestionState['input']['questions'] },
-      });
-    } else if (pending === null) {
-      // >= not >: a park stamped in the same millisecond the fetch was issued is
-      // unordered with respect to it, so treat it as newer. Ties fail toward
-      // KEEPING the dialog — the safe direction, since the cost of a wrong close
-      // is a turn parked forever with nothing on screen, and the cost of a wrong
-      // keep is a stale dialog whose answer gets a harmless 409.
-      if (lastAskEventAtRef.current >= issuedAt) return; // snapshot predates the park
-      setAskUserQuestion(prev => (prev?.toolUseID ? null : prev));
-    }
-  };
-
-  // Provider status → status-bar + Bedrock-button state. One definition, reused by
-  // the SSE effect and the limit dialog (which used to do a partial refetch that
-  // left providerSource/configuredModel stale).
-  const applyProviderStatus = useCallback(
-    (data: { current?: string; bedrockEnv?: Record<string, string>; failoverConfigured?: boolean }) => {
-      setProviderSource(data.current === 'bedrock' ? 'Bedrock' : 'Anthropic');
-      setProviderConfiguredModel(data.bedrockEnv?.ANTHROPIC_MODEL || null);
-      setFailoverConfigured(!!data.failoverConfigured);
-    },
-    [],
-  );
-  const refreshProviderStatus = useCallback(() => {
-    fetch('/api/provider').then(res => res.json()).then(applyProviderStatus).catch(() => {});
-  }, [applyProviderStatus]);
-
-  // Sessions whose limit dialog the user dismissed with "Not now" — so a stream-
-  // buffer restore (on open / SSE reconnect) doesn't keep re-popping a limit they
-  // chose to leave. Re-armed when a FRESH limit fires for the session.
-  const limitDismissedRef = useRef<Set<string>>(new Set());
-
-  // Raise the recovery dialog for a terminal usage limit. `force` (a fresh SSE
-  // event) re-arms a previously dismissed session; a buffer restore does not.
-  // Never overrides a dialog already open for the same session. Refreshes whether
-  // Bedrock is configured so the fallback button is correct right now.
-  const raiseLimit = useCallback(
-    (sid: string, limitedModel: string | null, message: string, force: boolean) => {
-      if (!message) return;
-      if (force) limitDismissedRef.current.delete(sid);
-      else if (limitDismissedRef.current.has(sid)) return;
-      setLimitError(null);
-      setLimitInfo(prev => (prev?.sessionId === sid ? prev : { sessionId: sid, limitedModel, message }));
-      // Refresh full provider status so the Bedrock button (and status bar) are
-      // correct right now.
-      refreshProviderStatus();
-    },
-    [refreshProviderStatus],
-  );
-
-  // Session-scoped SSE ref
-  const sessionEsRef = useRef<EventSource | null>(null);
-
-  // Recent directories (computed from history)
-  const [recentDirectories, setRecentDirectories] = useState<string[]>([]);
-
-  // Right panel view state
-  type RightPanelView = 'files' | 'notes' | 'stream' | 'mcp';
-  const [rightPanelView, setRightPanelView] = useState<RightPanelView>('stream');
-
-  // Notes state
-  const [notes, setNotes] = useState<string>('');
-  const [isLoadingNotes, setIsLoadingNotes] = useState(false);
-
+  //
+  // Held as the anchor of the envelope it was opened for, not a boolean: it's
+  // open only while THAT envelope is, so the next task's first update can't
+  // silently re-open a dialog nobody asked for (derived — no reset effect).
+  const [envelopeModalFor, setEnvelopeModalFor] = useState<number | null>(null);
+  const envelopeModalOpen =
+    envelopeOpen && envelopeModalFor !== null && envelopeModalFor === live?.envelopeStartedAt;
   // Dialog/confirmation states (all local to ChatTab)
-  const [contextMenu, setContextMenu] = useState<{
-    x: number; y: number; sessionId: string; project: string; display: string; isLive: boolean;
-  } | null>(null);
-  const [archiveConfirm, setArchiveConfirm] = useState<{
-    sessionId: string; project: string; display: string; isLive: boolean;
-  } | null>(null);
-  const [labelEdit, setLabelEdit] = useState<{
-    sessionId: string; currentLabel: string;
-  } | null>(null);
-  const [rewindConfirm, setRewindConfirm] = useState<{
-    turnIndex: number; userMessage: string; fullMessage: string; timestamp: string; uuid?: string;
-  } | null>(null);
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const [archiveConfirm, setArchiveConfirm] = useState<SessionRef | null>(null);
+  const [labelEdit, setLabelEdit] = useState<{ sessionId: string; currentLabel: string } | null>(null);
+  const [rewindConfirm, setRewindConfirm] = useState<RewindRequest | null>(null);
   const [intermediaryMessages, setIntermediaryMessages] = useState<TranscriptMsg[]>([]);
   const [showKillConfirm, setShowKillConfirm] = useState(false);
-  // Parked when a send hits a session that's live in an external terminal. The
-  // backend answers with a 409 {needsTakeoverConfirm}; this holds the owner info
-  // plus the confirm/cancel continuations so the user decides whether to take it
-  // over (which ends the terminal) or back out. See handleTranscriptSend.
-  const [takeoverConfirm, setTakeoverConfirm] = useState<{
-    owner: { pid?: number; name?: string; cwd?: string };
-    onConfirm: () => void;
-    onCancel: () => void;
-  } | null>(null);
-  const [codeViewerPath, setCodeViewerPath] = useState<string | null>(null);
-  const [sourceControlOpen, setSourceControlOpen] = useState(false);
   const [errorDialog, setErrorDialog] = useState<{ title: string; message?: string } | null>(null);
-  // A turn-ending error surfaced by the backend (session:stream {error}) — e.g.
-  // "Failed to authenticate: OAuth session expired...". Held as a persistent
-  // center-panel notice, NOT just a stream event: the transcript parser drops
-  // the SDK's synthetic error message (transcriptParser.ts, `model==='<synthetic>'`),
-  // so a refetch would erase it and the chat would go silent (the 87487df4 bug).
-  // Cleared on the next send and on session switch.
-  const [sessionError, setSessionError] = useState<string | null>(null);
-  // Terminal usage/rate limit on the turn's model (server `session:limit`). Opens
-  // the LimitReachedDialog — a recovery flow: pick another model and auto-resend
-  // the prompt that failed, or fail over to Bedrock when it's configured.
-  const [limitInfo, setLimitInfo] = useState<LimitReachedInfo | null>(null);
-  // Inline recovery error shown in the LimitReachedDialog (e.g. a rejected model
-  // switch) — keeps the dialog open for another choice instead of a silent retry.
-  const [limitError, setLimitError] = useState<string | null>(null);
-  // True when an automatic Bedrock failover is enabled AND configured — gates the
-  // dialog's "Use Bedrock fallback" button. From /api/provider (failoverConfigured).
-  const [failoverConfigured, setFailoverConfigured] = useState(false);
-
-  // Durable per-session set of MCP servers that FAILED to connect at init (B4).
-  // Server-authoritative: set from the session-stream signal, restored from
-  // /api/stream-buffer on open, and cleared when the server reports recovery (an
-  // empty set) or on session switch. NOT stored in streamEvents, so it survives
-  // turn resets instead of vanishing with the live stream.
-  const [mcpFailedServers, setMcpFailedServers] = useState<{ name: string; status: string }[]>([]);
-
-  // --- Scroll helper ---
-  const scrollTranscriptToBottom = () => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
-
-  // Pretty-print a Claude model id ("claude-opus-4-7" → "Claude Opus 4.7").
-  // Returns null if the id doesn't match the expected shape so the caller
-  // can fall back to a coarser label.
-  //
-  // Handles both version shapes the catalog actually ships: two-segment
-  // ("claude-opus-4-8" → "Opus 4.8") and one-segment ("claude-sonnet-5" →
-  // "Sonnet 5"). The minor segment MUST stay optional — Sonnet 5 and Fable 5
-  // have none, and requiring it silently degraded them to a bare "Claude".
-  // Context-window variants carry a bracket suffix ("claude-opus-4-8[1m]")
-  // that isn't part of the name, so strip it before matching.
-  const formatModelName = (raw: string | null): string | null => {
-    if (!raw) return null;
-    const match = raw.replace(/\[[^\]]*\]/g, '').match(/claude-([a-z]+)-(\d+)(?:-(\d+))?/i);
-    if (!match) return null;
-    const name = `${match[1][0].toUpperCase()}${match[1].slice(1)}`;
-    const version = match[3] ? `${match[2]}.${match[3]}` : match[2];
-    return `Claude ${name} ${version}`;
-  };
-
-  // Compose the status-bar label. Prefer the per-session model (from the
-  // CLI init event or the most recent assistant turn); fall back to the
-  // ANTHROPIC_MODEL env var (set in Bedrock mode); finally fall back to
-  // a generic "Claude".
-  const modelLabel = formatModelName(currentModel) || formatModelName(providerConfiguredModel) || 'Claude';
-  const providerLabel = providerSource ? `${modelLabel} (${providerSource})` : '';
-
   // The model picker is an SDK-backend-only affordance — see the status bar.
   const modelPickerAvailable = !!viewingTranscriptId && sdkSessionsEnabled;
 
-  // --- Ref sync effects ---
+  // Open a session requested by another tab (Stats, Search).
+  useOpenSessionRequest(openSessionRequest, (sessionId, project) => {
+    showPane('conversation');
+    return stream.openSession(sessionId, project);
+  });
 
-  // Track whether this tab is visible so SSE handlers can skip work when hidden.
-  const isActiveRef = useRef(isActive);
+  // --- Phone: automatic navigation + header status ---
+
+  // A question arriving while Conversation is off screen would be invisible —
+  // its dialog is portaled into the conversation column. Go there.
+  const hasQuestion = !!ask.question;
   useEffect(() => {
-    isActiveRef.current = isActive;
-  }, [isActive]);
+    if (hasQuestion) showPane('conversation');
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- on arrival only
+  }, [hasQuestion]);
 
-  /** Stop any in-flight TTS fetch and playing audio, revoke blob URL. */
-  const ttsCleanup = useCallback(() => {
-    ttsAbortRef.current?.abort();
-    ttsAbortRef.current = null;
-    if (ttsAudioRef.current) {
-      ttsAudioRef.current.pause();
-      ttsAudioRef.current = null;
+  // Badge the Conversation segment when the viewed session's turn finishes
+  // while another pane is showing; cleared on arrival.
+  const [conversationBadge, setConversationBadge] = useState(false);
+  const wasLoading = useRef(transcriptLoading);
+  useEffect(() => {
+    if (wasLoading.current && !transcriptLoading && isMobile && mobilePane !== 'conversation') {
+      setConversationBadge(true);
     }
-    if (ttsBlobUrlRef.current) {
-      URL.revokeObjectURL(ttsBlobUrlRef.current);
-      ttsBlobUrlRef.current = null;
-    }
-    setTtsPlaying('idle');
-  }, []);
-
-  // Track the currently-viewed session so in-flight SSE handlers can detect
-  // when the user has switched away and skip state updates accordingly.
+    wasLoading.current = transcriptLoading;
+  }, [transcriptLoading, isMobile, mobilePane]);
   useEffect(() => {
-    activeSessionRef.current = viewingTranscriptId;
-    // Stop TTS and dictation when switching sessions
-    ttsCleanup();
-    chatEditorRef.current?.stopRecording();
-  }, [viewingTranscriptId, ttsCleanup]);
+    if (mobilePane === 'conversation') setConversationBadge(false);
+  }, [mobilePane]);
 
-  // Keep refs in sync so SSE event handlers always see the current value
+  const viewedEntry = viewingTranscriptId
+    ? history.find(h => h.sessionId === viewingTranscriptId)
+      ?? pendingNewSessions.find(p => p.sessionId === viewingTranscriptId)
+    : undefined;
+  const mobileTitle = !viewedEntry
+    ? 'Sessions'
+    : 'display' in viewedEntry
+      ? (viewedEntry.metadata?.label || viewedEntry.display)
+      : viewedEntry.title;
   useEffect(() => {
-    transcriptLoadingRef.current = transcriptLoading;
-  }, [transcriptLoading]);
-
-  useEffect(() => {
-    backgroundWorkingRef.current = backgroundWorking;
-  }, [backgroundWorking]);
-
-  useEffect(() => {
-    liveRef.current = live;
-  }, [live]);
-
-  // Read the projection-dots setting once (client-only; localStorage is undefined in
-  // SSR). DEFAULT-ON as of step 3 (scenario 1+2 closed and verified live); set
-  // `fury.livenessDots='0'` to fall back to the legacy path. The legacy compensators
-  // remain in the tree as that fallback until a soak proves the projection, then step-3
-  // cleanup deletes them.
-  useEffect(() => {
-    let on = true;
-    try { on = localStorage.getItem('fury.livenessDots') !== '0'; }
-    catch { on = true; /* no localStorage (private mode) — default to the projection */ }
-    livenessDotsEnabledRef.current = on;
-    setLivenessDotsEnabled(on);
-  }, []);
-
-  useEffect(() => {
-    transcriptStreamingRef.current = transcriptStreaming;
-  }, [transcriptStreaming]);
-
-  useEffect(() => {
-    ttsEnabledRef.current = ttsEnabled;
-  }, [ttsEnabled]);
-
-  useEffect(() => {
-    viewingIdRef.current = viewingTranscriptId;
-  }, [viewingTranscriptId]);
-
-  // --- Logical-task ENVELOPE projection ---
-  // (docs/ticket-subagent-notification-turns-intermediate-bubbles.md.) Since
-  // Claude Code 2.1.26x one user send spans MANY result-terminated turns (each
-  // background-task <task-notification> drives its own turn), so a completed
-  // intermediate turn's assistant message is a REAL committed message — the
-  // in-flight-partials strip must not (and does not) remove it. Per the agreed
-  // product direction, while the envelope is open those messages are hidden from
-  // the main flow (nothing may render above the bouncing dots) and surfaced via
-  // a modal opened by clicking the dots bubble. Everything here is a pure
-  // function of (historyTranscript, live), same as the SSOT strip.
-  //
-  // Declared ABOVE the scroll effects on purpose: the DISPLAYED transcript is
-  // what user-visible reactions (auto-scroll) must key on — the raw
-  // historyTranscript now legitimately grows mid-envelope (the transcript-
-  // updated refetch that feeds the modal), and reacting to the raw growth is
-  // what scrolled the panel to the previous turn instead of the dots
-  // (the 2026-09-14 macOS report — see the assistant-scroll effect below).
-  const envelopeOpen =
-    livenessDotsEnabled &&
-    !!live &&
-    live.phase !== 'idle' &&
-    typeof live.envelopeStartedAt === 'number';
-  // The main-flow cut: the envelope anchor when open (hides ALL of the task's
-  // turns, current and completed); otherwise the current turn's startedAt (the
-  // pre-envelope behavior — in-flight partials only). The envelope anchor is ≤
-  // startedAt by construction, so it subsumes the partials strip.
-  const displayCutAt = envelopeOpen
-    ? (live!.envelopeStartedAt as number)
-    : (livenessDotsEnabled && live && typeof live.startedAt === 'number' ? live.startedAt : null);
-  const displayedTranscript =
-    displayCutAt != null ? stripInFlightPartials(historyTranscript, displayCutAt) : historyTranscript;
-  // What the dots-bubble modal shows: the envelope's COMMITTED intermediate
-  // assistant messages (current turn's in-flight partials excluded — same policy
-  // as the main flow has always had for them). Derived at render so the open
-  // modal live-updates as notification turns complete.
-  const envelopeHidden: TranscriptMsg[] = envelopeOpen
-    ? envelopeHiddenMessages(
-        historyTranscript,
-        live!.envelopeStartedAt as number,
-        typeof live!.startedAt === 'number' ? live!.startedAt : null,
-      )
-    : [];
-  // The envelope slice removes the task's committed USER send(s) too (they sit
-  // inside the envelope, and on the send path the optimistic overlay covers the
-  // prompt — rendering both would duplicate it). On a switch/restore mid-task
-  // there IS no overlay, so resurface the committed user sends through the same
-  // overlay slot: the main flow keeps reading "your prompt + dots" instead of
-  // the prompt vanishing until the reveal. (Task-notification user strings never
-  // leave the parser, so only real prompts can appear here.)
-  //
-  // The echo defers only to an overlay with ACTUAL content — not to a blank
-  // one. A restore that overlaid a notification-turn buffer's empty userPrompt
-  // used to both paint a blank "You" bubble and (via a bare length check here)
-  // suppress the echo, leaving the task's real prompt invisible (2026-09-19
-  // report). The restore no longer sets that overlay, and this guard keeps any
-  // other empty-overlay path from re-creating the hole.
-  const overlayHasContent = transcriptOverlayMessages.some(
-    (m) => (m.content && m.content.trim() !== '') || (m.images?.length ?? 0) > 0,
-  );
-  const envelopeUserEcho =
-    envelopeOpen && !overlayHasContent
-      ? historyTranscript.filter((m) => {
-          if (m.role !== 'user' || !m.timestamp) return false;
-          // An AskUserQuestion answer is a user message, but it belongs INSIDE
-          // the turn as an intermediary (see the parser's askAnswer flag), not as
-          // a live "You" send. Echoing it here made it flash as a spurious second
-          // top-level bubble until the turn settled and re-grouped it.
-          if (m.askAnswer) return false;
-          const t = Date.parse(m.timestamp);
-          return Number.isFinite(t) && t >= (live!.envelopeStartedAt as number);
-        })
-      : null;
-  // When the envelope closes (task done, session switch, interrupt) the main
-  // flow reveals the committed history — drop the modal-open flag so the NEXT
-  // task's first update can't silently re-open a dialog nobody asked for.
-  useEffect(() => {
-    if (!envelopeOpen) setEnvelopeModalOpen(false);
-  }, [envelopeOpen]);
-
-  // Auto-scroll transcript viewer during streaming
-  useEffect(() => {
-    if (transcriptStreaming) {
-      scrollTranscriptToBottom();
-    }
-  }, [transcriptStreaming]);
-
-  // Freeze the elapsed-time counter when the first stream chunk arrives —
-  // this is the "time to first chunk" measurement. Fall back to freezing
-  // on completion in case the response ends without producing any chunks
-  // (e.g. an error before streaming starts).
-  useEffect(() => {
-    if (submitStartTime == null || submitEndTime != null) return;
-    if (streamEvents.length > 0 || !transcriptLoading) {
-      setSubmitEndTime(Date.now());
-    }
-  }, [streamEvents.length, transcriptLoading, submitStartTime, submitEndTime]);
-
-  // Open the prompt-cache freshness window when the response starts streaming.
-  // submitEndTime freezes at the first chunk (and is restored from the stream
-  // buffer on navigation), which is the point the turn's prompt has been
-  // processed and cached — so that's when the 5-min TTL countdown should begin.
-  // Turn completion and stop re-anchor it later (see session-health handler and
-  // handleTranscriptStop).
-  useEffect(() => {
-    if (submitEndTime != null && viewingTranscriptId) {
-      setSessionActivity(prev => ({ ...prev, [viewingTranscriptId]: submitEndTime }));
-    }
-  }, [submitEndTime, viewingTranscriptId]);
-
-  // When a new assistant response lands (post-streaming), scroll so that the
-  // start of the response is at the top of the panel — letting the user see
-  // as much of the response as possible. Skip on initial transcript loads.
-  //
-  // Counts the DISPLAYED transcript, NOT the raw historyTranscript. The raw
-  // array now grows mid-task (the transcript-updated handler refetches inside
-  // an open envelope to feed the dots-bubble modal), but every one of those
-  // messages is sliced out of display — so a raw-count trigger fired
-  // scrollIntoView on `lastAssistantRef`, which points at the last VISIBLE
-  // bubble: Claude's PREVIOUS answer, not the bouncing dots (reported on macOS
-  // 2026-09-14; masked elsewhere by the streaming bottom-scroll racing it).
-  // Keyed on the projection, the count is static while the envelope is open
-  // (dots keep the viewport via the streaming/bottom scrolls) and jumps ONCE at
-  // the reveal — landing exactly one scroll at the start of the final answer.
-  useEffect(() => {
-    if (historyTranscriptLoading) {
-      skipNextAssistantScrollRef.current = true;
-      prevAssistantCountRef.current = 0;
-      return;
-    }
-    const assistantCount = displayedTranscript.reduce(
-      (n, m) => (m.role === 'assistant' ? n + 1 : n),
-      0,
-    );
-    if (assistantCount > prevAssistantCountRef.current && !skipNextAssistantScrollRef.current) {
-      requestAnimationFrame(() => {
-        lastAssistantRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      });
-    }
-    prevAssistantCountRef.current = assistantCount;
-    skipNextAssistantScrollRef.current = false;
-  }, [displayedTranscript, historyTranscriptLoading]);
-
-  const HISTORY_PAGE_SIZE = 25;
-
-  // --- fetchHistory ---
-  // A non-append refresh (the default) is fired on `history-updated` SSE,
-  // SSE reconnect, mount, and after deletes — events that arrive often while
-  // chatting. To avoid collapsing previously-loaded pages back to the first
-  // 25, ask the API for at least as many entries as we already display.
-  const fetchHistory = async (opts?: { append?: boolean }) => {
-    const append = opts?.append === true;
-
-    // Append pages by CURSOR, never by offset. The list mutates under us while
-    // scrolling (a new session is prepended on submit, an archive removes one),
-    // and a positional offset silently skips or repeats entries across that
-    // seam. The cursor names the last entry we hold, so the server resumes
-    // exactly after it regardless of what moved.
-    if (append && !historyCursorRef.current) return;
-
-    // A refresh re-requests everything currently on screen so a deep scroll
-    // position survives it. The server applies no upper bound, so this can't
-    // come back short and truncate the list.
-    const limit = append
-      ? HISTORY_PAGE_SIZE
-      : Math.max(HISTORY_PAGE_SIZE, historyLengthRef.current);
-    const qs = append
-      ? `limit=${limit}&cursor=${encodeURIComponent(historyCursorRef.current!)}`
-      : `limit=${limit}`;
-
-    if (append) setIsLoadingMoreHistory(true); else setIsLoadingHistory(true);
-    try {
-      const res = await fetch(`/api/history?${qs}`);
-      if (res.ok) {
-        const data = await res.json();
-        const incoming: HistoryEntry[] = data.entries || [];
-        if (append) {
-          setHistory(prev => {
-            // Dedup is a belt-and-braces guard only; the cursor should already
-            // guarantee no overlap. It must NOT drive the next cursor, which
-            // comes from the server's own last-returned entry.
-            const seen = new Set(prev.map(e => e.sessionId).filter(Boolean) as string[]);
-            const merged = [...prev];
-            for (const e of incoming) {
-              if (e.sessionId && seen.has(e.sessionId)) continue;
-              merged.push(e);
-            }
-            historyLengthRef.current = merged.length;
-            return merged;
-          });
-        } else {
-          setHistory(incoming);
-          historyLengthRef.current = incoming.length;
-        }
-        // Track the server's cursor for the last entry it returned. On a
-        // refresh this re-anchors to the end of the refreshed window.
-        if (data.nextCursor) historyCursorRef.current = data.nextCursor;
-        else if (!append) historyCursorRef.current = null;
-        setHistoryHasMore(!!data.hasMore);
-      }
-    } catch (error) {
-      console.error('Failed to fetch history:', error);
-    } finally {
-      if (append) setIsLoadingMoreHistory(false); else setIsLoadingHistory(false);
-    }
-  };
-
-  const loadMoreHistory = useCallback(() => {
-    fetchHistory({ append: true });
-  }, []);
-
-  // Fetch history on mount
-  useEffect(() => {
-    fetchHistory();
-  }, []);
-
-  // Keep ref in sync with history length so loadMore uses an accurate offset
-  // even when entries are added/removed outside of fetchHistory (e.g. prepend
-  // on submit, delete-session).
-  useEffect(() => {
-    historyLengthRef.current = history.length;
-  }, [history.length]);
-
-  // Mirror history into a ref so the per-session SSE handler can read the
-  // current archived baseline without re-subscribing on every history change.
-  const historyRef = useRef<HistoryEntry[]>([]);
-  useEffect(() => {
-    historyRef.current = history;
-  }, [history]);
-
-  // NOTE: the live-token overlay used to need a reconciliation effect here to
-  // drop it once the archived baseline caught up. The context overlay needs no
-  // such thing — it's an absolute level that the archive converges to on its
-  // own, so a stale overlay can only ever be superseded, never double-counted.
-
-  // --- fetchTranscript ---
-  const fetchTranscript = async (sessionId: string, project: string, displayTitle: string) => {
-    // Save current composer draft (text + attachments) before switching
-    stashDraft();
-
-    // Update the active session ref synchronously so SSE handlers for the
-    // previous session's isStillActive() return false immediately.
-    activeSessionRef.current = sessionId;
-
-    setHistoryTranscriptLoading(true);
-    setHistoryTranscript([]);
-
-    setHistoryTranscriptProject(project);
-    setViewingTranscriptId(sessionId);
-    setTranscriptOverlayMessages([]);
-    setOverlayInsertPoint(null);
-    setTranscriptStreaming('');
-    setStreamEvents([]);
-    setSessionError(null);
-    // Clear on switch; the target session's restore re-sets it from
-    // /api/stream-buffer (mcpFailed) below. NOT cleared on send — a still-failed
-    // server's banner must persist across turns.
-    setMcpFailedServers([]);
-    setTranscriptLoading(false);
-    // Clear background-work dots on switch; the target session's restore re-sets
-    // it from /api/stream-buffer + /api/health below.
-    setBackgroundWorking(false);
-    setTranscriptPartial(false);
-    // Clear any parked question on switch, UNCONDITIONALLY (P17). The SDK path
-    // self-heals (its restore returns pendingAsk:null), but the CLI path never
-    // clears a stale dialog — so answering a question carried over from session A
-    // while viewing B would post the answer as a new turn against B (wrong session).
-    // The target session's own restore below re-sets it from /api/stream-buffer.
-    setAskUserQuestion(null);
-    setIsStuck(false);
-    setStuckReason(undefined);
-    setCurrentModel(null);
-    setSubmitStartTime(null);
-    setSubmitEndTime(null);
-
-    // Restore composer draft (text + attachments) for the target session (or clear)
-    restoreDraft(sessionId);
-    try {
-      const res = await fetch(`/api/transcript?sessionId=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(project)}`);
-      let transcriptMessages: { role: 'user' | 'assistant'; content: string; timestamp: string; images?: TranscriptImagePart[] }[] = [];
-      if (res.ok) {
-        const data = await res.json();
-        transcriptMessages = data.messages || [];
-        setTranscriptPartial(!!data.partial);
-
-        // If the API found a prompt that was sent but never processed
-        // (e.g. Claude was interrupted), pre-fill the editor so the user
-        // can review and re-send it.
-        if (data.unprocessedPrompt) {
-          setTimeout(() => chatEditorRef.current?.setContent(data.unprocessedPrompt), 100);
-        }
-
-        // Replay any AskUserQuestion the CLI auto-errored in --print mode
-        // that hasn't been answered by a subsequent user prompt. Without
-        // this, navigating away from a session while AskUserQuestion was
-        // in flight loses the dialog forever.
-        //
-        // CLI PATH ONLY — deliberately ignored when SDK sessions are on.
-        // transcriptParser derives this from the JSONL, and its state machine is
-        // permanently stuck-on for us: it SETS pendingAskUserQuestion for any
-        // AskUserQuestion tool_use, and its only clear lives behind
-        // `typeof msg.content === 'string'`. On the SDK path the answer arrives
-        // as a tool_result — a user entry whose content is an ARRAY — so the
-        // clear never runs and the flag survives for the life of the session.
-        // Honoring it here would re-open the dialog on EVERY navigation to a
-        // session that ever asked anything, for a question already answered, and
-        // the JSONL has no toolUseID so that dialog could never resolve anything.
-        // A pending SDK question comes from server-held state instead (the
-        // stream-buffer's pendingAsk, below) — see docs/ask-user-question-sdk.md
-        // TRAP #4. The CLI path keeps the heuristic untouched: we stop LISTENING
-        // to it rather than teach the parser about tool_results.
-        if (!sdkSessionsEnabled && data.pendingAskUserQuestion) {
-          setAskUserQuestion({
-            // null, not an id: the CLI path cannot answer a tool call — the
-            // answer is re-sent as a fresh prose turn — so there is nothing to
-            // correlate with. The type says so out loud.
-            toolUseID: null,
-            input: data.pendingAskUserQuestion,
-          });
-        }
-
-        if (data.currentModel) {
-          setCurrentModel(data.currentModel);
-        }
-      }
-      setHistoryTranscript(transcriptMessages);
-
-      // Check if this session is actively processing. Restore stream state
-      // from the buffer if available, and check health as a fallback.
-      let detectedProcessing = false;
-      try {
-        const bufIssuedAt = Date.now();
-        const bufRes = await fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(sessionId)}`);
-        if (bufRes.ok) {
-          const bufData = await bufRes.json();
-          // Before the isActive branch: a parked question must re-open whether
-          // or not the buffer is still active.
-          applyPendingAskFromBuffer(bufData, bufIssuedAt);
-          // Restore the durable failed-MCP banner for this session (B4).
-          setMcpFailedServers(Array.isArray(bufData.mcpFailed) ? bufData.mcpFailed : []);
-          // Re-raise a terminal usage limit whose SSE event fired while this tab
-          // wasn't watching (unless the user already dismissed it).
-          if (bufData.pendingLimit?.message) {
-            raiseLimit(sessionId, bufData.pendingLimit.limitedModel ?? null, bufData.pendingLimit.message, false);
-          }
-          // Show the background-work dots immediately when opening a session whose
-          // main turn is idle but which is still driving a background subagent.
-          setBackgroundWorking(!!bufData.backgroundActive);
-          // Seed the SSOT projection from the restore snapshot (a PULL — applied
-          // unconditionally). Load-bearing for the envelope: opening a session
-          // mid-logical-task must hide its intermediate turn output on the FIRST
-          // paint via liveness.envelopeStartedAt, not after the next SSE beat.
-          applyLiveness(bufData.liveness, true);
-          if (bufData.hasBuffer && bufData.isActive) {
-            // The JSONL contains partial assistant messages for the in-flight
-            // turn that the stream buffer is handling. Strip everything this
-            // turn has written so the chat shows bouncing dots instead of
-            // intermediary assistant bubbles.
-            //
-            // Anchor on the buffer's startedAt, NOT on matching userPrompt. A
-            // message sent mid-turn ("please continue") is folded by the CLI
-            // into the next tool_result — array content, which the parser never
-            // emits as a user message — so the string match silently found
-            // nothing (verified live: findLastIndex -> -1) and fell through to a
-            // heuristic that walked back over EVERY trailing assistant, cutting
-            // earlier completed turns too. It also broke on a repeated prompt.
-            // startedAt vs each message's timestamp identifies this turn's
-            // output exactly, whatever the prompt was.
-            setHistoryTranscript(prev =>
-              stripInFlightPartials(prev, typeof bufData.startedAt === 'number' ? bufData.startedAt : 0),
-            );
-
-            // Only overlay a REAL prompt. A notification/auto turn's buffer
-            // carries userPrompt '' (reassertProcessing — no user-typed prompt),
-            // and overlaying that painted a blank "You" bubble AND suppressed
-            // envelopeUserEcho (which defers to any overlay), leaving the
-            // task's real opening prompt invisible when a session is opened
-            // mid-notification-turn (screenshot report, 2026-09-19). With no
-            // overlay, the echo resurfaces the committed prompt instead.
-            if (bufData.userPrompt) {
-              setTranscriptOverlayMessages([{ role: 'user' as const, content: bufData.userPrompt }]);
-            }
-            setTranscriptStreaming(bufData.accumulatedText || '');
-            setStreamEvents(bufData.events || []);
-            setTranscriptLoading(true);
-            // Restore the elapsed-time counter from the buffer so it survives
-            // navigating away and back. submitEndTime mirrors the live freeze
-            // semantics ("time to first chunk"): frozen at the first buffered
-            // event if one exists, still ticking (null) otherwise.
-            setSubmitStartTime(bufData.startedAt ?? null);
-            setSubmitEndTime(bufData.events?.[0]?.ts ?? null);
-            detectedProcessing = true;
-          } else if (bufData.isProcessing) {
-            // Session is processing but buffer is inactive or missing. Still strip
-            // this turn's partials — otherwise they render as intermediary bubbles
-            // above the dots (buffer inactive doesn't mean the JSONL is clean).
-            setHistoryTranscript(prev =>
-              stripInFlightPartials(prev, typeof bufData.startedAt === 'number' ? bufData.startedAt : 0),
-            );
-            setTranscriptLoading(true);
-            if (bufData.startedAt) setSubmitStartTime(bufData.startedAt);
-            detectedProcessing = true;
-          }
-        }
-      } catch {
-        // Buffer fetch is best-effort; transcript is already loaded
-      }
-
-      // Fallback: if buffer didn't indicate processing, check health directly.
-      // This covers external CLI sessions not managed by Fury's sessionManager.
-      if (!detectedProcessing) {
-        try {
-          const healthRes = await fetch(`/api/health?sessionId=${encodeURIComponent(sessionId)}`);
-          if (healthRes.ok) {
-            const healthData = await healthRes.json();
-            if (healthData.isProcessing) {
-              setTranscriptLoading(true);
-            }
-            setBackgroundWorking(!!healthData.backgroundActive);
-            applyLiveness(healthData.liveness, true);
-          }
-        } catch {
-          // Health check is best-effort
-        }
-      }
-    } catch (error) {
-      console.error('Failed to fetch transcript:', error);
-      setHistoryTranscript([]);
-    } finally {
-      setHistoryTranscriptLoading(false);
-      // Scroll to bottom after transcript renders
-      setTimeout(() => scrollTranscriptToBottom(), 100);
-    }
-  };
-
-  // Open a transcript requested by another tab (Stats → "open this session").
-  //
-  // Keyed on the request's nonce alone, NOT on fetchTranscript: that's a plain
-  // arrow re-created every render, so depending on it would re-open the session
-  // on every state change. The ref keeps the effect pinned to the nonce while
-  // still calling the current closure.
-  const fetchTranscriptRef = useRef(fetchTranscript);
-  fetchTranscriptRef.current = fetchTranscript;
-  useEffect(() => {
-    if (!openSessionRequest) return;
-    const { sessionId, project, display, turnIndex } = openSessionRequest;
-    if (!sessionId || !project) return;
-    const opened = fetchTranscriptRef.current(sessionId, project, display);
-    if (turnIndex == null) return;
-    // Search-result anchor: once the transcript is in, scroll the hit's bubble
-    // into view and flash it. The bubbles render a beat after the fetch
-    // resolves (state → React commit), so poll briefly. Exact data-msg-index
-    // first; else the nearest EARLIER bubble (intermediary assistant messages
-    // collapse into their turn and lose their own index).
-    Promise.resolve(opened).then(() => {
-      let tries = 0;
-      const tryScroll = () => {
-        let el = document.querySelector(`[data-msg-index="${turnIndex}"]`);
-        if (!el) {
-          let best = -1;
-          for (const cand of document.querySelectorAll('[data-msg-index]')) {
-            const idx = Number(cand.getAttribute('data-msg-index'));
-            if (idx <= turnIndex && idx > best) { best = idx; el = cand; }
-          }
-          // Bubbles exist but none at/below the target yet → still rendering.
-          if (el && tries < 5) el = null;
-        }
-        if (el) {
-          el.scrollIntoView({ block: 'center' });
-          (el as HTMLElement).animate(
-            [
-              { boxShadow: '0 0 0 3px var(--primary, #3b82f6)', offset: 0 },
-              { boxShadow: '0 0 0 3px var(--primary, #3b82f6)', offset: 0.6 },
-              { boxShadow: '0 0 0 3px transparent', offset: 1 },
-            ],
-            { duration: 1800 },
-          );
-        } else if (++tries < 20) {
-          setTimeout(tryScroll, 100);
-        }
-      };
-      setTimeout(tryScroll, 100);
-    }).catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [openSessionRequest?.nonce]);
-
-  // --- Global SSE connection for live-sessions and history-updated events ---
-  // Connects when the tab becomes active, disconnects when hidden to save resources.
-  // On reconnect (tab re-shown), re-fetches state to cover the gap.
-  useEffect(() => {
-    if (!isActive) return;
-
-    // Fetch initial / catch-up data
-    fetch('/api/live-sessions').then(res => res.json()).then(data => {
-      const ids = new Set<string>(data.liveSessionIds || []);
-      prevLiveIdsRef.current = ids; // baseline — never chime off a fetch
-      setLiveSessionIds(ids);
-    }).catch(() => {});
-    fetchHistory();
-
-    // Fetch current provider status. Source (Anthropic/Bedrock) and the
-    // configured model (if any) are tracked separately so we can override
-    // the model portion with the per-session value once we know it.
-    fetch('/api/provider').then(res => res.json()).then(applyProviderStatus).catch(() => {
-      setProviderSource(null);
-      setProviderConfiguredModel(null);
-    });
-
-    const es = new EventSource('/api/events');
-
-    es.addEventListener('live-sessions', (e: MessageEvent) => {
-      const data = JSON.parse(e.data);
-      const ids = new Set<string>(data.liveSessionIds || []);
-      // A session leaving the live set = Claude finished a turn (including
-      // background work draining). Chime for it — EXCEPT when it's the session
-      // in view with voice summary on: there TTS is the notification, and its
-      // failure paths chime instead (see playChime).
-      for (const id of prevLiveIdsRef.current) {
-        if (ids.has(id)) continue;
-        if (id === viewingIdRef.current && ttsEnabledRef.current) continue;
-        playChime();
-        break; // one chime per event, even if several sessions finished at once
-      }
-      prevLiveIdsRef.current = ids;
-      setLiveSessionIds(ids);
-    });
-
-    es.addEventListener('history-updated', () => {
-      fetchHistory();
-    });
-
-    es.addEventListener('provider-switched', () => {
-      fetch('/api/provider').then(res => res.json()).then(applyProviderStatus).catch(() => {});
-    });
-
-    es.onerror = () => {
-      if (es.readyState === EventSource.CONNECTING) {
-        // Re-fetch state to cover any events we missed while the SSE
-        // connection was dropped (e.g. provider switch-back fired during
-        // a server restart).
-        fetch('/api/live-sessions').then(res => res.json()).then(data => {
-          const ids = new Set<string>(data.liveSessionIds || []);
-          prevLiveIdsRef.current = ids; // baseline — never chime off a fetch
-          setLiveSessionIds(ids);
-        }).catch(() => {});
-        fetchHistory();
-        fetch('/api/provider').then(res => res.json()).then(applyProviderStatus).catch(() => {});
-      }
-    };
-
-    return () => es.close();
-  }, [isActive]);
-
-  // Free the resend stash (which may hold full-size image payloads) when leaving
-  // the session it belongs to — the limit auto-resend only applies to the session
-  // in view, so there's no reason to retain another session's attachments.
-  useEffect(() => {
-    if (lastSendRef.current && lastSendRef.current.sessionId !== viewingTranscriptId) {
-      lastSendRef.current = null;
-    }
-  }, [viewingTranscriptId]);
-
-  // --- Session-scoped SSE for stream, health, and transcript events ---
-  useEffect(() => {
-    // Close previous session-scoped connection
-    if (sessionEsRef.current) {
-      sessionEsRef.current.close();
-      sessionEsRef.current = null;
-    }
-
-    if (!viewingTranscriptId || !historyTranscriptProject) return;
-
-    const mySessionId = viewingTranscriptId;
-    const myProject = historyTranscriptProject;
-
-    const es = new EventSource(
-      `/api/events?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`
-    );
-    sessionEsRef.current = es;
-
-    const isStillActive = () => activeSessionRef.current === mySessionId;
-    // Skip expensive state updates when the tab is hidden; catch-up happens
-    // when isActive flips back to true (see effect below).
-    const shouldProcess = () => isStillActive() && isActiveRef.current;
-
-    // --- SSOT liveness projection (step 2b) ---
-    // Reset on session switch so a prior session's phase can't leak into this view.
-    // (applyLiveness itself is component-scoped now — see its declaration — so the
-    // fetchTranscript restore can seed `live` from /api/stream-buffer's snapshot.)
-    setLive(null);
-    liveRef.current = null;
-
-    // On SSE connect, re-fetch the stream buffer to close the gap between the
-    // initial restore in fetchTranscript and when the EventSource connected.
-    // Events emitted during that window would otherwise be lost.
-    es.addEventListener('connected', () => {
-      if (!shouldProcess()) return;
-
-      const bufIssuedAt = Date.now();
-      fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(mySessionId)}`)
-        .then(res => res.json())
-        .then(bufData => {
-          if (!shouldProcess()) return;
-
-          // A question could have been asked in the gap between the initial
-          // restore and this connect — that emit would have had no listener.
-          applyPendingAskFromBuffer(bufData, bufIssuedAt);
-          // Re-sync the durable failed-MCP banner on connect (B4).
-          setMcpFailedServers(Array.isArray(bufData.mcpFailed) ? bufData.mcpFailed : []);
-          if (bufData.pendingLimit?.message) {
-            raiseLimit(mySessionId, bufData.pendingLimit.limitedModel ?? null, bufData.pendingLimit.message, false);
-          }
-
-          // Sync background-work dots on connect (SSE may have missed the change).
-          setBackgroundWorking(!!bufData.backgroundActive);
-          // Re-sync the SSOT projection too (a PULL — unconditional). Covers the
-          // initial-restore→SSE-connect gap for the envelope anchor the same way
-          // the buffer re-fetch covers streamed text.
-          applyLiveness(bufData.liveness, true);
-
-          if (bufData.hasBuffer) {
-            // Only update if the buffer has more data than what we currently have
-            const currentLen = transcriptStreamingRef.current?.length || 0;
-            if ((bufData.accumulatedText || '').length > currentLen) {
-              setTranscriptStreaming(bufData.accumulatedText || '');
-              setStreamEvents(bufData.events || []);
-            }
-          }
-
-          // Sync loading state — use isProcessing (session-level) not just
-          // isActive (buffer-level) to avoid false negatives during queue processing.
-          const isProcessing = bufData.isProcessing || (bufData.hasBuffer && bufData.isActive);
-          if (isProcessing && !transcriptLoadingRef.current) {
-            setTranscriptLoading(true);
-          } else if (!isProcessing && transcriptLoadingRef.current) {
-            // Processing completed between initial restore and SSE connect —
-            // refresh the transcript to get the final response and clear overlays.
-            setTranscriptLoading(false);
-            setTranscriptStreaming('');
-            fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
-              .then(res => res.json())
-              .then(refreshData => {
-                // Bail if a new turn began streaming between issuing this
-                // completion refetch and its resolution. Background-task turns
-                // now re-assert processing (docs/ticket-background-task-
-                // notification-turns-render-dark.md), so by the time this async
-                // fetch resolves the health latch-break may have already stripped
-                // the new turn's partials and set loading true. Committing the
-                // JSONL here would re-leak those in-flight partials as bubbles on
-                // top of the stripped view; skip and let the next completion /
-                // transcript-updated refetch commit the clean state once the turn
-                // truly ends. Matches the transcript-updated and reconnect guards.
-                if (refreshData.messages && shouldProcess() && !transcriptLoadingRef.current) {
-                  setHistoryTranscript(refreshData.messages);
-                  setTranscriptOverlayMessages([]);
-                  setOverlayInsertPoint(null);
-                }
-              })
-              .catch(() => {});
-          }
-        })
-        .catch(() => {});
-    });
-
-    // Handle session:stream events — the single path for all stream data.
-    // NOTE: These events only fire for sessions managed by Fury's sessionManager.
-    // External CLI sessions rely on transcript-updated (file watcher) for updates.
-    es.addEventListener('session-stream', (e: MessageEvent) => {
-      if (!shouldProcess()) return;
-
-      const data = JSON.parse(e.data);
-
-      // MCP status signal (B4) — handled BEFORE the loading guard: this is a
-      // one-shot init signal, not turn stream data. The server sends only
-      // genuinely FAILED servers (benign needs-auth/pending are log-only, so this
-      // never fires for an un-authed claude.ai connector), and an EMPTY array is
-      // a recovery/clear. We store it in durable per-session state (not
-      // streamEvents) so the banner survives turn resets and clears on recovery.
-      if (Array.isArray(data.mcpServers)) {
-        setMcpFailedServers(data.mcpServers);
-        if (data.mcpServers.length > 0) {
-          uiLog('warn', 'chat.mcp', 'mcp server(s) failed to connect', {
-            sessionId: mySessionId,
-            data: { servers: data.mcpServers },
-          });
-        }
-        return;
-      }
-
-      // Ignore stream data that arrives after the user has stopped processing.
-      // Without this guard, buffered events could overwrite the cleared state.
-      if (!transcriptLoadingRef.current) return;
-
-      if (data.text) {
-        setTranscriptStreaming(prev => prev + data.text);
-        setStreamEvents(prev => {
-          const last = prev[prev.length - 1];
-          if (last && last.type === 'text') {
-            return [...prev.slice(0, -1), { ...last, content: (last as any).content + data.text }];
-          }
-          return [...prev, { type: 'text' as const, content: data.text, ts: Date.now() }];
-        });
-      } else if (data.toolUse) {
-        const tool = data.toolUse;
-        if (tool.status === 'starting') {
-          setStreamEvents(prev => [...prev, { type: 'tool_start' as const, name: tool.name, ts: Date.now() }]);
-        } else if (tool.status === 'complete') {
-          setStreamEvents(prev => [...prev, { type: 'tool_complete' as const, name: tool.name, input: tool.input, ts: Date.now() }]);
-          // Surface AskUserQuestion immediately. SessionManager fires the
-          // CLI kill on the server side when it parses the same tool_use
-          // block, so we don't need to issue the stop here — that's
-          // necessary so the kill still happens when the user is viewing
-          // a different session at the moment the tool fires.
-          //
-          // CLI PATH ONLY. This event carries no toolUseID (see
-          // SessionStreamEvent.toolUse), so a dialog opened from it could never
-          // resolve the parked tool call. The SDK backend emits its own
-          // `askUserQuestion` event WITH the id — handled below — and this event
-          // fires for SDK sessions too, so without this guard both would race to
-          // open the dialog and the id-less one could win.
-          if (!sdkSessionsEnabled && tool.name === 'AskUserQuestion' && tool.input?.questions) {
-            setAskUserQuestion({ toolUseID: null, input: tool.input });
-          }
-        }
-      } else if (data.askUserQuestion) {
-        // The SDK backend is parked in canUseTool awaiting this answer. Unlike
-        // the toolUse event above, this one carries the toolUseID that
-        // /api/claude-sdk/answer needs to resolve the right tool call.
-        // `cleared` = someone else settled it (abort, another tab, teardown), so
-        // close the dialog rather than leave the user answering a dead question.
-        if (data.askUserQuestion.cleared) {
-          setAskUserQuestion(null);
-        } else if (data.askUserQuestion.questions) {
-          // Stamp the park so an in-flight buffer fetch, issued before this and
-          // answering `pendingAsk: null`, can't close the dialog we just opened.
-          lastAskEventAtRef.current = Date.now();
-          setAskUserQuestion({
-            toolUseID: data.askUserQuestion.toolUseID,
-            input: { questions: data.askUserQuestion.questions },
-          });
-        }
-      } else if (data.toolResult) {
-        setStreamEvents(prev => [...prev, { type: 'tool_result' as const, preview: data.toolResult.preview, ts: Date.now() }]);
-      } else if (data.error) {
-        setStreamEvents(prev => [...prev, { type: 'error' as const, content: data.error, ts: Date.now() }]);
-        // Persist it in the center panel too — the parser drops the SDK's
-        // synthetic error message, so this is the only durable surface.
-        setSessionError(data.error);
-        uiLog('error', 'chat.stream', 'error surfaced', {
-          sessionId: mySessionId,
-          data: { error: String(data.error).slice(0, 300) },
-        });
-      }
-    });
-
-    // The CLI tells us which model it spun up in its `system.init` line —
-    // capture it so the status bar can show the real model name even when
-    // ANTHROPIC_MODEL isn't set (the direct-Anthropic case).
-    es.addEventListener('session-model', (e: MessageEvent) => {
-      if (!shouldProcess()) return;
-      const data = JSON.parse(e.data);
-      if (data.model) setCurrentModel(data.model);
-    });
-
-    // Terminal usage/rate limit on this session's model. Drop the in-flight
-    // spinner (the turn is over, it produced nothing) and raise the recovery
-    // dialog. Refresh provider status so the Bedrock button reflects config.
-    es.addEventListener('session-limit', (e: MessageEvent) => {
-      if (!shouldProcess()) return;
-      const data = JSON.parse(e.data);
-      setTranscriptLoading(false);
-      setSubmitEndTime(Date.now());
-      raiseLimit(mySessionId, data.limitedModel ?? null, String(data.message || ''), true);
-      uiLog('warn', 'chat.limit', 'usage limit dialog raised', {
-        sessionId: mySessionId,
-        data: { limitedModel: data.limitedModel ?? null },
-      });
-    });
-
-    // Live context occupancy for the in-flight turn. An absolute level, so it
-    // replaces rather than accumulates — no baseline, no arithmetic.
-    es.addEventListener('session-usage', (e: MessageEvent) => {
-      if (!shouldProcess()) return;
-      const data = JSON.parse(e.data);
-      if (typeof data.contextTokens !== 'number') return;
-      // Anchor the freshness leaf's countdown on ACTUAL API-call activity, not on
-      // the transcriptLoading-gated turn boundary. Each session-usage event
-      // corresponds to a message_start/assistant — an API call that just reset the
-      // 5-min prompt-cache TTL — so stamping here keeps lastActiveAt current
-      // throughout ANY active turn, including background-task notification turns
-      // whose completion stamp (:921) fires only on the transcriptLoading flip
-      // (docs/ticket-freshness-leaf-false-stale.md). This makes the leaf correct
-      // independent of the isProcessing/live signal: even if `live` briefly gaps
-      // mid-activity, the countdown restarts from a fresh timestamp rather than a
-      // stale turn-boundary one, then freezes at the last call when things go idle.
-      // Known limitation (called out in the ticket, not fixed here): session-usage
-      // only flows for the currently-viewed session, so a session live in the
-      // background still anchors its post-idle countdown on entry.timestamp; its
-      // `live` prop (global live-sessions event) still pins it green while active.
-      setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
-      setLiveContext(prev => {
-        const prior = prev[mySessionId];
-        // The window only arrives once the turn's `result` lands, and later
-        // events in the same turn report 0 until then. Keep the last known
-        // non-zero value so the fill bar doesn't blink out mid-turn.
-        const window = data.contextWindow > 0 ? data.contextWindow : (prior?.window ?? 0);
-        if (prior?.tokens === data.contextTokens && prior?.window === window) return prev;
-        return { ...prev, [mySessionId]: { tokens: data.contextTokens, window } };
-      });
-    });
-
-    // Handle session:health events (replaces health polling)
-    es.addEventListener('session-health', (e: MessageEvent) => {
-      if (!shouldProcess()) return;
-      const data = JSON.parse(e.data);
-      setIsStuck(data.isStuck);
-      setStuckReason(data.stuckReason);
-
-      // SSOT: adopt the pushed liveness level (seq-gated). The heartbeat re-sends this
-      // every few seconds while non-idle, so `live.phase` is self-correcting.
-      applyLiveness(data.liveness, false);
-
-      // Background-work dots: independent of the in-flight-turn machinery below.
-      // A session driving a background subagent between its own turns keeps the
-      // dots on even though its main turn is idle (data.isProcessing false).
-      setBackgroundWorking(!!data.backgroundActive);
-
-      // Authoritative liveness signal — a real reading resets the poll's
-      // transient-false streak either way.
-      healthFalseStreakRef.current = 0;
-
-      // If the session is actively processing, ensure the loading indicator
-      // (bouncing dots) is visible. Break the latch: if a transient false had
-      // already committed this turn's partials to historyTranscript, re-strip
-      // them so we return to dots instead of leaving the bubbles on screen.
-      if (data.isProcessing && !transcriptLoadingRef.current) {
-        uiLog('warn', 'chat.health', 'latch-break re-strip (isProcessing true while not loading)', {
-          sessionId: mySessionId,
-          data: { startedAt: data.startedAt ?? null },
-        });
-        setHistoryTranscript(prev =>
-          stripInFlightPartials(prev, typeof data.startedAt === 'number' ? data.startedAt : 0),
-        );
-        setTranscriptLoading(true);
-      }
-
-      // If processing just ended, refresh transcript from JSONL — BUT NOT while
-      // background work is still in flight (P1). A background task (Monitor / Bash /
-      // subagent) posting a <task-notification> drives a NEW main turn moments after
-      // this idle edge; committing the on-disk partials now, then having the imminent
-      // reassert flip processing back on, paints a raw intermediary assistant bubble
-      // for one frame before the reactive `latch-break re-strip` above removes it —
-      // the visible flash. `backgroundActive` is precisely "a background turn is
-      // imminent", so keep the partials stripped and the dots on until a REAL terminal
-      // idle (background inactive) arrives; the next such idle commits the clean state.
-      if (!data.isProcessing && !data.backgroundActive && transcriptLoadingRef.current) {
-        setTranscriptLoading(false);
-        setTranscriptStreaming('');
-        // Stamp the turn-completion time so the sidebar's freshness leaf
-        // counts the 5-min prompt-cache TTL from now (when the cache was
-        // last refreshed) rather than the turn's start.
-        setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
-        // Drop the live overlay: the turn is done, so the archive (re-read just
-        // below) becomes the source of truth again. SessionSidebar reads
-        // `live?.tokens ?? metadata.contextTokens`, so an entry left here
-        // outranks the archive for the life of the page — it can never be
-        // superseded downward. That strands a stale-high reading after a rewind
-        // (archived contextTokens drops; the overlay wouldn't), which is exactly
-        // the feature this branch exists for.
-        setLiveContext(prev => {
-          if (!(mySessionId in prev)) return prev;
-          const next = { ...prev };
-          delete next[mySessionId];
-          return next;
-        });
-        fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
-          .then(res => res.json())
-          .then(refreshData => {
-            // Bail if a new turn began streaming between this idle refetch being
-            // issued and its resolution — routine now that background-task turns
-            // re-assert processing (docs/ticket-background-task-notification-turns-
-            // render-dark.md). The health latch-break may have already stripped
-            // the new turn's partials and flipped loading back on; committing the
-            // JSONL here would re-leak those partials as intermediary bubbles.
-            // Skip (incl. the TTS below, which would otherwise announce a stale
-            // intermediate turn) — the next completion refetch commits the clean
-            // state once the turn ends. Matches the transcript-updated (:1033) and
-            // reconnect (:1019) guards.
-            if (refreshData.messages && shouldProcess() && !transcriptLoadingRef.current) {
-              setHistoryTranscript(refreshData.messages);
-              setTranscriptOverlayMessages([]);
-              setOverlayInsertPoint(null);
-
-              // TTS: speak the last chat bubble using the same turn-grouping
-              // logic as TranscriptRenderer — within the last turn, the final
-              // assistant message is the rendered bubble; earlier ones are intermediaries.
-              if (ttsEnabledRef.current) {
-                const bubble = lastClaudeBubble(refreshData.messages as SpeakableMsg[]);
-                if (bubble?.content) {
-                  ttsCleanup();
-                  const abort = new AbortController();
-                  ttsAbortRef.current = abort;
-                  setTtsPlaying('loading');
-                  fetch('/api/tts', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ text: bubble.content, turnMeta: bubble.turnMeta }),
-                    signal: abort.signal,
-                  })
-                    .then(res => {
-                      if (ttsAbortRef.current !== abort) return; // superseded
-                      if (!res.ok) throw new Error('TTS failed');
-                      return res.blob();
-                    })
-                    .then(blob => {
-                      if (!blob || ttsAbortRef.current !== abort) return; // superseded
-                      const url = URL.createObjectURL(blob);
-                      ttsBlobUrlRef.current = url;
-                      const audio = new Audio(url);
-                      ttsAudioRef.current = audio;
-                      audio.onended = () => setTtsPlaying('idle');
-                      audio.play().catch(err => {
-                        console.error('[TTS] playback failed:', err);
-                        setTtsPlaying('idle');
-                        // Speech was the turn notification and it never sounded.
-                        playChime();
-                      });
-                      setTtsPlaying('playing');
-                    })
-                    .catch(err => {
-                      if (ttsAbortRef.current !== abort) return; // superseded
-                      if (err.name !== 'AbortError') console.error('[TTS]', err);
-                      setTtsPlaying('idle');
-                      // TTS failed (generation error, server down, bad response)
-                      // — the chime deferred to speech for the viewed session, so
-                      // deliver it here instead. AbortError is a supersede /
-                      // session switch, not a failure: stay silent.
-                      if (err.name !== 'AbortError') playChime();
-                    });
-                } else {
-                  // Turn finished but produced no speakable bubble — the chime
-                  // deferred to TTS for the viewed session, and TTS has nothing
-                  // to say. Chime so the completion still makes a sound.
-                  playChime();
-                }
-              }
-            }
-          })
-          .catch(() => {});
-      }
-    });
-
-    es.onerror = () => {
-      if (es.readyState === EventSource.CONNECTING && shouldProcess()) {
-        uiLog('warn', 'chat.sse', 'reconnecting', {
-          sessionId: mySessionId,
-          data: { loading: transcriptLoadingRef.current },
-        });
-        // SSE reconnecting — check if session completed while disconnected
-        fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`)
-          .then(res => res.json())
-          .then(data => {
-            if (!shouldProcess()) return;
-            if (!data.isProcessing && transcriptLoadingRef.current) {
-              setTranscriptLoading(false);
-              setTranscriptStreaming('');
-            }
-          })
-          .catch(() => {});
-        // Also refresh transcript to pick up any missed messages — but never
-        // while a turn is in flight: the JSONL holds that turn's partial
-        // assistant messages, which would render as intermediary bubbles above
-        // the bouncing dots. Same guard as the transcript-updated handler below.
-        // (Re-checked inside .then(), since loading can flip while in flight.)
-        fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
-          .then(res => res.json())
-          .then(data => {
-            if (!data.messages || !shouldProcess()) return;
-            if (transcriptLoadingRef.current) return;
-            setHistoryTranscript(data.messages);
-            setTranscriptOverlayMessages([]);
-            setOverlayInsertPoint(null);
-          })
-          .catch(() => {});
-      }
-    };
-
-    // Handle transcript:updated events (replaces transcript polling for external live sessions)
-    es.addEventListener('transcript-updated', () => {
-      if (!shouldProcess()) return;
-      // Legacy guard: don't refresh while a turn is in flight — the JSONL contains
-      // partial assistant messages that would render as intermediary bubbles.
-      //
-      // UNDER THE PROJECTION with an open logical-task ENVELOPE, refreshing is
-      // safe AND required: the DISPLAYED transcript is a pure function of
-      // (historyTranscript, live) — everything committed at/after
-      // live.envelopeStartedAt is sliced off at render, so raw mid-task commits
-      // can't paint bubbles above the dots. And those commits are exactly what
-      // feeds the dots-bubble modal's intermediate messages + badge count
-      // (docs/ticket-subagent-notification-turns-intermediate-bubbles.md):
-      // without this, completed notification turns never reach the client until
-      // the task ends and the modal stays empty.
-      if (transcriptLoadingRef.current) {
-        const envelopeProjected =
-          livenessDotsEnabledRef.current &&
-          typeof liveRef.current?.envelopeStartedAt === 'number' &&
-          liveRef.current.phase !== 'idle';
-        if (!envelopeProjected) return;
-      }
-
-      fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
-        .then(res => res.json())
-        .then(data => {
-          if (data.messages && shouldProcess()) {
-            setHistoryTranscript(data.messages);
-          }
-        })
-        .catch(() => {});
-    });
-
-    // Fallback health poll: if SSE drops or a session:health event is lost,
-    // the UI can get stuck showing "processing" forever. Poll every 15s while
-    // transcriptLoading OR background work is showing dots, to catch missed
-    // completion events. Also skips when tab is hidden to avoid unnecessary
-    // network requests.
-    const healthPoll = setInterval(() => {
-      if (!shouldProcess()) return;
-      // Under the projection (flag on) the poll is also the fallback for a dead SSE
-      // while `live.phase` is non-idle; otherwise the legacy gate is unchanged.
-      const projNonIdle = livenessDotsEnabledRef.current && !!liveRef.current && liveRef.current.phase !== 'idle';
-      if (!transcriptLoadingRef.current && !backgroundWorkingRef.current && !projNonIdle) return;
-      fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`)
-        .then(res => res.json())
-        .then(data => {
-          if (!shouldProcess()) return;
-          // SSOT: a PULL is an authoritative snapshot — apply it unconditionally.
-          applyLiveness(data.liveness, true);
-          // Under the projection, the PULL above IS this poll's whole job — it is the
-          // dead-SSE fallback that keeps `live` fresh. The legacy teardown / 2-strike
-          // debounce / raw-commit below is bypassed: the projection + heartbeat own
-          // liveness and the render-strip owns the partials, so inventing "done" from a
-          // bare isProcessing:false here is exactly the drift we're removing (step 3).
-          // The machinery stays intact as the flag-off / CLI-session fallback.
-          if (livenessDotsEnabledRef.current) return;
-          // Keep the independent background-work dots in sync even if the SSE
-          // health event that would clear them was missed (fail toward not-live).
-          setBackgroundWorking(!!data.backgroundActive);
-          // The in-flight-turn teardown below only applies while a MAIN turn is
-          // loading; a background-only poll (loading false) stops here.
-          if (!transcriptLoadingRef.current) return;
-          if (data.isProcessing) {
-            // Live — reset the streak so an earlier isolated false is forgotten.
-            if (healthFalseStreakRef.current > 0) {
-              uiLog('debug', 'chat.healthPoll', 'false streak reset by live reading', {
-                sessionId: mySessionId,
-                data: { priorStreak: healthFalseStreakRef.current },
-              });
-            }
-            healthFalseStreakRef.current = 0;
-            return;
-          }
-          if (!transcriptLoadingRef.current) return;
-          // Never tear down an in-flight MAIN turn while background work is still
-          // live. `backgroundActive` means a background task (subagent / Monitor /
-          // Bash) is running and a task-notification turn may be imminent — the same
-          // guard the SSE idle-commit uses at :1017. Committing the on-disk partials
-          // now would drop the dots mid-turn and paint an intermediary bubble over a
-          // turn that is not actually finished (Defect B / docs/ticket-dots-desync-
-          // subagent-heavy-session.md). Reset the streak so a transient main-turn
-          // idle during background work doesn't accrue toward the 2-strike teardown.
-          if (data.backgroundActive) {
-            healthFalseStreakRef.current = 0;
-            return;
-          }
-          // Debounce: this poll is only a safety net for a dead SSE stream. A
-          // single false is untrustworthy (HMR singleton swap can momentarily
-          // report a live SDK session as idle), so require TWO consecutive false
-          // readings (~30s) before tearing down the in-flight view. Genuine
-          // completions are torn down instantly by the session-health SSE event;
-          // this only fires when that event never arrived.
-          healthFalseStreakRef.current += 1;
-          // This is the inflight-partials trigger. Log EVERY false (the server
-          // log will show whether isProcessing was really false or an HMR blip)
-          // and the teardown separately, so the loop between UI and server is
-          // reconstructable from one file.
-          uiLog('warn', 'chat.healthPoll', 'isProcessing:false while loading', {
-            sessionId: mySessionId,
-            data: { streak: healthFalseStreakRef.current },
-          });
-          if (healthFalseStreakRef.current < 2) return;
-          healthFalseStreakRef.current = 0;
-          uiLog('warn', 'chat.healthPoll', 'teardown after 2 consecutive false', { sessionId: mySessionId });
-          setTranscriptLoading(false);
-          setTranscriptStreaming('');
-          fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
-            .then(res => res.json())
-            .then(refreshData => {
-              // Re-check loading: a real session:health event may have re-lit the
-              // dots via the latch-break (:997) between this teardown and the refetch
-              // resolving. If so the turn is live — let the live path own the
-              // transcript instead of clobbering it here (mirrors the SSE completion
-              // refetch guard at :1050). This IS a genuine improvement over the old
-              // bare-shouldProcess() commit and is kept.
-              if (refreshData.messages && shouldProcess() && !transcriptLoadingRef.current) {
-                // Commit RAW. This poll teardown is the safety net for a GENUINE
-                // completion whose SSE idle event was missed, so the on-disk messages
-                // ARE the final answer — stripping on the turn's startedAt would delete
-                // it, and the transcript-updated restore rides the same (dead) SSE that
-                // forced the poll fallback in the first place (review-dots-desync-fix
-                // Finding 2). The proper fix removes this whole teardown: the client
-                // renders the single liveness projection and strips on
-                // `liveness.startedAt` (null when idle) — see
-                // docs/design-liveness-single-source-of-truth.md, step 2.
-                setHistoryTranscript(refreshData.messages);
-                setTranscriptOverlayMessages([]);
-                setOverlayInsertPoint(null);
-              }
-            })
-            .catch(() => {});
-        })
-        .catch(() => {});
-    }, 15_000);
-
-    return () => {
-      es.close();
-      clearInterval(healthPoll);
-      if (sessionEsRef.current === es) {
-        sessionEsRef.current = null;
-      }
-    };
-    // sdkSessionsEnabled is read inside the handlers here (applyPendingAskFromBuffer,
-    // the AskUserQuestion routing guard); include it (P19) so toggling the setting at
-    // runtime rebinds the handlers instead of leaving them capturing the stale value
-    // until the next session switch. applyLiveness is a stable useCallback — listed
-    // for lint completeness, it never re-triggers this effect.
-  }, [viewingTranscriptId, historyTranscriptProject, sdkSessionsEnabled, applyLiveness]);
-
-  // --- Catch-up when tab becomes visible again ---
-  // SSE events were skipped while hidden; re-fetch stream buffer + transcript
-  // to sync state with what happened while the user was on another tab.
-  useEffect(() => {
-    if (!isActive || !viewingTranscriptId || !historyTranscriptProject) return;
-
-    const mySessionId = viewingTranscriptId;
-    const myProject = historyTranscriptProject;
-
-    const bufIssuedAt = Date.now();
-    fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(mySessionId)}`)
-      .then(res => res.json())
-      .then(bufData => {
-        if (activeSessionRef.current !== mySessionId) return;
-
-        // SSE was ignored while hidden, so a question asked in that window never
-        // reached us — and Claude is still parked on it.
-        applyPendingAskFromBuffer(bufData, bufIssuedAt);
-        // Re-sync the durable failed-MCP banner on visibility catch-up (B4).
-        setMcpFailedServers(Array.isArray(bufData.mcpFailed) ? bufData.mcpFailed : []);
-
-        if (bufData.isProcessing || (bufData.hasBuffer && bufData.isActive)) {
-          // Session is still processing — restore stream state
-          if (bufData.accumulatedText) {
-            setTranscriptStreaming(bufData.accumulatedText);
-          }
-          if (bufData.events) {
-            setStreamEvents(bufData.events);
-          }
-          if (!transcriptLoadingRef.current) {
-            setTranscriptLoading(true);
-          }
-        } else if (transcriptLoadingRef.current) {
-          // Processing completed while we were hidden — refresh transcript
-          setTranscriptLoading(false);
-          setTranscriptStreaming('');
-          fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
-            .then(res => res.json())
-            .then(refreshData => {
-              if (refreshData.messages && activeSessionRef.current === mySessionId) {
-                setHistoryTranscript(refreshData.messages);
-                setTranscriptOverlayMessages([]);
-                setOverlayInsertPoint(null);
-              }
-            })
-            .catch(() => {});
-        }
-      })
-      .catch(() => {});
-  }, [isActive, viewingTranscriptId, historyTranscriptProject]);
-
-  // --- Load workflows + compute recentDirectories ---
-  useEffect(() => {
-    const loadWorkflowsAndDirectories = async () => {
-      try {
-        const res = await fetch('/api/workflows');
-        if (res.ok) {
-          const data = await res.json();
-          const loadedWorkflows = data.workflows || [];
-
-          // Compute recent directories from history and workflows
-          const directories = getRecentDirectories(history, loadedWorkflows);
-          setRecentDirectories(directories);
-        }
-      } catch (error) {
-        console.error('Failed to load workflows:', error);
-      }
-    };
-
-    loadWorkflowsAndDirectories();
-  }, [history]);
-
-  // --- Notes ---
-  useEffect(() => {
-    const loadNotes = async () => {
-      if (!historyTranscriptProject) { setNotes(''); return; }
-      setIsLoadingNotes(true);
-      try {
-        const response = await fetch(`/api/notes?projectPath=${encodeURIComponent(historyTranscriptProject)}`);
-        const data = await response.json();
-        if (response.ok) setNotes(data.notes || '');
-      } catch (error) {
-        console.error('Error loading notes:', error);
-      } finally {
-        setIsLoadingNotes(false);
-      }
-    };
-    loadNotes();
-  }, [historyTranscriptProject]);
-
-  const handleNotesChange = useCallback(async (content: string) => {
-    if (!historyTranscriptProject) return;
-    setNotes(content);
-    try {
-      await fetch('/api/notes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectPath: historyTranscriptProject, notes: content }),
-      });
-    } catch (error) {
-      console.error('Error saving notes:', error);
-    }
-  }, [historyTranscriptProject]);
+    onMobileStatus?.({ title: mobileTitle, conversationBadge });
+  }, [mobileTitle, conversationBadge, onMobileStatus]);
 
   // --- Handlers ---
-
-  const handleCreateSession = () => {
-    setShowDirectoryPicker(true);
-  };
-
-  // Step (a) → (b) of the new-session wizard: stash the chosen directory and
-  // advance to the model step. The session isn't created until the user commits
-  // a model (or backs out), so nothing is minted here.
-  const handleDirectoryNext = (path: string) => {
-    setShowDirectoryPicker(false);
-    // Model selection only means anything on the SDK backend (same gate as the
-    // mid-session picker). With it off, skip step (b) and create straight away
-    // on the default model rather than showing a step that can't take effect.
-    if (!sdkSessionsEnabled) {
-      createNewSession(path, null);
-      return;
-    }
-    setWizardPath(path);
-    setShowModelStep(true);
-  };
-
-  // Step (b) → (a): return to the directory picker, preserving no model choice.
-  const handleModelStepBack = () => {
-    setShowModelStep(false);
-    setShowDirectoryPicker(true);
-  };
-
-  // Step (b) commit: create the session on the chosen directory + model.
-  // `model` is null to follow the provider default (no override); `resolvedModel`
-  // is the picked model's wire id, used to update the status-bar label at once.
-  const handleModelStepCreate = (model: string | null, resolvedModel: string | null) => {
-    setShowModelStep(false);
-    const path = wizardPath;
-    setWizardPath(null);
-    if (path) createNewSession(path, model, resolvedModel);
-  };
-
-  const createNewSession = (path: string, model: string | null, resolvedModel: string | null = null) => {
-    // Save current composer draft (text + attachments) before switching
-    stashDraft();
-
-    const newId = generateUUID();
-    // Update ref synchronously so any in-flight handler's isStillActive() returns false
-    activeSessionRef.current = newId;
-    // Go directly to transcript view for a new empty session
-    setViewingTranscriptId(newId);
-    setHistoryTranscriptProject(path);
-
-    setHistoryTranscript([]);
-    setTranscriptOverlayMessages([]);
-    setOverlayInsertPoint(null);
-    setTranscriptStreaming('');
-    setStreamEvents([]);
-    setTranscriptLoading(false);
-    setBackgroundWorking(false);
-    setTranscriptPartial(false);
-    // Reflect the wizard's model in the status-bar label immediately, instead of
-    // showing the provider default until the first turn's session:model init
-    // event lands. formatModelName strips any [1m] suffix. resolvedModel carries
-    // the CONCRETE wire id of the picked row — including for the default row,
-    // where `model` stays null (no override) but the label still names the real
-    // model. Only null when the catalog failed to load, which keeps the coarse
-    // "Claude" fallback. currentModel wants the WIRE id, not the alias ('haiku'
-    // would format to a bare "Claude").
-    setCurrentModel(resolvedModel);
-    setSubmitStartTime(null);
-    setSubmitEndTime(null);
-
-    // Record the chosen model as a PENDING override before the first send.
-    // sdkSessionManager.setModel persists it and startQuery() replays it into
-    // the query options on the very first turn. Null = follow the default, so
-    // no request is needed. Fire-and-forget: a failure just falls back to the
-    // default, and the mid-session picker remains available to correct it.
-    if (model) {
-      fetch('/api/claude-sdk/model', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: newId, model }),
-      }).catch(() => { /* non-fatal — first turn falls back to the default */ });
-    }
-
-    // Track this as a pending session so it persists in the sidebar
-    setPendingNewSessions(prev => [...prev, { sessionId: newId, project: path, title: 'New Session', createdAt: Date.now() }]);
-
-    // New session starts with an empty composer — restoreDraft on a fresh id
-    // clears the editor AND the attachment chips (which previously leaked in).
-    restoreDraft(newId);
-  };
-
-  const restorePendingSession = (pending: { sessionId: string; project: string; title: string }) => {
-    // Save current composer draft (text + attachments) before switching
-    stashDraft();
-
-    activeSessionRef.current = pending.sessionId;
-    setViewingTranscriptId(pending.sessionId);
-    setHistoryTranscriptProject(pending.project);
-
-    setHistoryTranscript([]);
-    setTranscriptOverlayMessages([]);
-    setOverlayInsertPoint(null);
-    setTranscriptStreaming('');
-    setStreamEvents([]);
-    setTranscriptLoading(false);
-    setBackgroundWorking(false);
-    setTranscriptPartial(false);
-    setIsStuck(false);
-    setStuckReason(undefined);
-    setHistoryTranscriptLoading(false);
-    setCurrentModel(null);
-    setSubmitStartTime(null);
-    setSubmitEndTime(null);
-
-    // Restore composer draft (text + attachments) for this pending session
-    restoreDraft(pending.sessionId);
-  };
-
-  const handleKillStuckSession = async () => {
-    const mySessionId = viewingTranscriptId;
-    if (!mySessionId) return;
-
-    try {
-      const res = sdkSessionsEnabled
-        ? await fetch('/api/claude-sdk/interrupt', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId: mySessionId }),
-          })
-        : await fetch('/api/health', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId: mySessionId, action: 'stop' }),
-          });
-
-      if (res.ok && activeSessionRef.current === mySessionId) {
-        setIsStuck(false);
-        setStuckReason(undefined);
-        setTranscriptLoading(false);
-        setTranscriptStreaming('');
-      }
-    } catch (error) {
-      console.error('Failed to kill session:', error);
-    }
-  };
-
-  // Paste/drop → normalize+downscale each file → stage as an attachment chip.
-  // Normalization failures (unsupported type, decode error, over the 5MB cap)
-  // skip that file but SURFACE the reason next to the chips — a silent drop
-  // reads as "attached" to the user who just pasted.
-  const handleImagesAdded = async (files: File[]) => {
-    const failures: string[] = [];
-    const results = await Promise.all(
-      files.map(async f => {
-        try {
-          return await normalizeImage(f);
-        } catch (err) {
-          console.warn('[ChatTab] Skipping image:', err);
-          failures.push(err instanceof Error ? err.message : 'unreadable image');
-          return null;
-        }
-      }),
-    );
-    setAttachError(failures.length > 0 ? failures.join('; ') : null);
-    const added = results.filter((r): r is AttachedImage => r !== null);
-    if (added.length === 0) return;
-    // Cap total staged attachments at 8 (matches the server-side cap).
-    setAttachedImages(prev => [...prev, ...added].slice(0, 8));
-  };
-
-  const handleRemoveImage = (id: string) => {
-    setAttachedImages(prev => prev.filter(img => img.id !== id));
-  };
-
-  const handleTranscriptSend = async (userMessage: string, imagesOverride?: AttachedImage[]) => {
-    // `imagesOverride` is set only by the limit-recovery auto-resend, which replays
-    // a prior turn's attachments verbatim (they were never in the composer's
-    // staged state on this attempt).
-    const isResend = imagesOverride !== undefined;
-    if ((!userMessage && (imagesOverride ?? attachedImages).length === 0) || transcriptLoading || !viewingTranscriptId) return;
-
-    // Snapshot + clear the staged attachments for this turn. A resend supplies its
-    // own images and must not disturb (or be disturbed by) the live composer.
-    const imagesToSend = imagesOverride ?? attachedImages;
-    if (!isResend) setAttachedImages([]);
-    setAttachError(null);
-    const optimisticImages: TranscriptImagePart[] = imagesToSend.map(i => ({ dataUrl: i.dataUrl }));
-    const apiImages = imagesToSend.map(i => ({ base64: i.base64, mediaType: i.mediaType }));
-
-    // Stop any TTS playback so the user isn't talked over by the previous turn.
-    ttsCleanup();
-
-    const mySessionId = viewingTranscriptId;
-    const myProject = historyTranscriptProject;
-
-    // Stash this turn's prompt + attachments so a terminal usage limit can resend
-    // it on a different model without retyping. Overwritten each send.
-    lastSendRef.current = { sessionId: mySessionId, prompt: userMessage, images: imagesToSend };
-
-    // Clear the draft and remove from pending sessions since it's being submitted
-    sessionDraftsRef.current.delete(mySessionId);
-    setPendingNewSessions(prev => prev.filter(p => p.sessionId !== mySessionId));
-
-    // If this session isn't in the history sidebar yet, add it optimistically
-    if (!history.some(h => h.sessionId === mySessionId)) {
-      setHistory(prev => [{
-        display: userMessage
-          ? (userMessage.length > 200 ? userMessage.substring(0, 200) + '...' : userMessage)
-          : `📎 ${imagesToSend.length} image${imagesToSend.length === 1 ? '' : 's'}`,
-        timestamp: Date.now(),
-        project: myProject || '',
-        sessionId: mySessionId,
-        messageCount: 1,
-      }, ...prev]);
-    }
-
-    // Optimistically mark this session as live so the badge renders immediately
-    setLiveSessionIds(prev => {
-      const next = new Set(prev);
-      next.add(mySessionId);
-      return next;
-    });
-
-    // Instant feedback — include the local thumbnails so the just-sent bubble
-    // shows the attachment before the transcript round-trips (A6).
-    setTranscriptOverlayMessages(prev => [...prev, {
-      role: 'user' as const,
-      content: userMessage,
-      ...(optimisticImages.length > 0 ? { images: optimisticImages } : {}),
-    }]);
-    setTranscriptLoading(true);
-    setTranscriptStreaming('');
-    setStreamEvents([]);
-    setSessionError(null);
-    setSubmitStartTime(Date.now());
-    setSubmitEndTime(null);
-    setTimeout(() => scrollTranscriptToBottom(), 50);
-    uiLog('info', 'chat.send', 'submit', { sessionId: mySessionId, data: { promptChars: userMessage.length } });
-
-    // Undo the optimistic in-flight UI when a send doesn't actually start — the
-    // user backed out of a takeover. Pull the user bubble back off, drop the
-    // spinner/live badge, and return the text to the composer so they can retry
-    // or edit. (Genuine errors keep the existing assistant-error-bubble path.)
-    const rollbackSend = () => {
-      if (activeSessionRef.current !== mySessionId) return;
-      setTranscriptLoading(false);
-      setSubmitStartTime(null);
-      setTranscriptOverlayMessages(prev => prev.slice(0, -1));
-      setLiveSessionIds(prev => {
-        const next = new Set(prev);
-        next.delete(mySessionId);
-        return next;
-      });
-      // Return the staged attachments + text to the composer so a backed-out
-      // takeover can retry — but NOT for a resend, whose images/prompt were never
-      // in the live composer (they'd clobber the user's in-progress draft).
-      if (!isResend) {
-        if (imagesToSend.length > 0) setAttachedImages(prev => [...imagesToSend, ...prev].slice(0, 8));
-        setTimeout(() => chatEditorRef.current?.setContent(userMessage), 50);
-      }
-    };
-
-    // The POST, factored so the takeover-confirm path can replay it verbatim with
-    // confirmTakeover set. A 409 {needsTakeoverConfirm} parks on a dialog instead
-    // of erroring; the user's choice either replays this (confirm) or rolls back.
-    const submitTurn = async (confirmTakeover: boolean): Promise<void> => {
-      const res = await fetch('/api/claude', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: userMessage,
-          sessionId: mySessionId,
-          projectPath: myProject,
-          ...(apiImages.length > 0 ? { images: apiImages } : {}),
-          ...(confirmTakeover ? { confirmTakeover: true } : {}),
-        }),
-      });
-      if (res.status === 409) {
-        const data = await res.json().catch(() => ({}));
-        if (data.needsTakeoverConfirm) {
-          setTakeoverConfirm({
-            owner: data.owner || {},
-            onConfirm: () => {
-              setTakeoverConfirm(null);
-              submitTurn(true).catch(handleSendError);
-            },
-            onCancel: () => {
-              setTakeoverConfirm(null);
-              rollbackSend();
-            },
-          });
-          return;
-        }
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-      // Done. SSE delivers all stream events + session:health signals completion.
-    };
-
-    const handleSendError = (error: unknown) => {
-      if (activeSessionRef.current === mySessionId) {
-        setTranscriptOverlayMessages(prev => [...prev, {
-          role: 'assistant' as const,
-          content: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        }]);
-        setTranscriptLoading(false);
-        // Return the staged attachments so a retry re-sends them — without
-        // this, a failed send silently discarded the pasted images and the
-        // retry went out text-only (only the takeover-rollback path restored).
-        // Skip for a resend: those images were never staged in the live composer,
-        // so re-injecting them would disturb the user's current draft.
-        if (!isResend && imagesToSend.length > 0) {
-          setAttachedImages(prev => [...imagesToSend, ...prev].slice(0, 8));
-        }
-      }
-    };
-
-    try {
-      await submitTurn(false);
-    } catch (error) {
-      handleSendError(error);
-    }
-  };
-
-  // Resend the prompt that was limited, verbatim, on whatever model is now set.
-  // Guards on the stash belonging to the session still being viewed. Plain
-  // function (NOT useCallback): it must call the CURRENT render's
-  // handleTranscriptSend — a memoized copy would freeze the render-0 closure
-  // whose viewingTranscriptId is null, and the resend would silently early-return.
-  // The limited turn already persisted this prompt (the CLI writes the user
-  // message before the 429). Drop that dangling turn before resending so the model
-  // doesn't see the instruction twice. GUARDED: only truncates when the transcript's
-  // last message is exactly this prompt as a user turn (the limited-turn shape) —
-  // if an assistant reply followed, the turn really ran, so we skip. A duplicate is
-  // acceptable; truncating a real turn is not, so this fails safe toward skipping.
-  const dropLimitedTurnIfMatches = async (sessionId: string, project: string, prompt: string) => {
-    try {
-      const res = await fetch(
-        `/api/transcript?sessionId=${encodeURIComponent(sessionId)}&project=${encodeURIComponent(project)}`,
-      );
-      if (!res.ok) return;
-      const data = await res.json();
-      const msgs: { role: string; content: string; askAnswer?: boolean }[] = data.messages || [];
-      const last = msgs[msgs.length - 1];
-      if (!last || last.role !== 'user' || last.content !== prompt) return;
-      // Count TURNS, not raw user messages: an AskUserQuestion answer is user-role
-      // but doesn't start a turn. Including it over-counts, so turnIndex points
-      // past the last real turn and the server can't find it (the drop no-ops,
-      // leaving the limited prompt in place — the model may then see it twice).
-      const userTurns = msgs.filter(m => m.role === 'user' && !m.askAnswer).length;
-      await fetch('/api/session', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId, project, turnIndex: userTurns - 1, removeLastHistoryEntry: false }),
-      });
-    } catch { /* best effort — see the fail-safe note above */ }
-  };
-
-  // Resend the prompt that was limited, verbatim, on whatever model/provider is now
-  // set. Plain function (NOT useCallback) so it calls the CURRENT render's
-  // handleTranscriptSend. Surfaces feedback when the stash is gone (#11) rather than
-  // silently doing nothing after the dialog promised an auto-resend.
-  const resendLastPrompt = async () => {
-    const st = lastSendRef.current;
-    if (!st || st.sessionId !== activeSessionRef.current) {
-      setSessionError('Model switched, but the message couldn’t be resent automatically — please send it again.');
-      return;
-    }
-    if (historyTranscriptProject) {
-      await dropLimitedTurnIfMatches(st.sessionId, historyTranscriptProject, st.prompt);
-    }
-    // Re-run the normal send path with the stashed attachments as an override.
-    void handleTranscriptSend(st.prompt, st.images);
-  };
-
-  // Limit-recovery: switch the session to `model` (null = provider default), then
-  // auto-resend. The dialog stays OPEN until this resolves — so its "Switching…"
-  // state renders and a rejected switch shows inline instead of silently resending
-  // on the still-limited model.
-  const handleLimitSwitch = async (model: string | null) => {
-    const sessionId = limitInfo?.sessionId;
-    if (!sessionId) { setLimitInfo(null); return; }
-    setLimitError(null);
-    const res = await setSessionModel(sessionId, model);
-    if (!res.ok) {
-      setLimitError(`Couldn’t switch model: ${res.error ?? 'unknown error'}. Try another one.`);
-      return; // keep the dialog open for another choice
-    }
-    if (model) setCurrentModel(model);
-    setLimitInfo(null);
-    await resendLastPrompt();
-  };
-
-  // Limit-recovery: fail the provider over to the configured Bedrock fallback, then
-  // auto-resend on Bedrock. Only reachable when failoverConfigured. Recycles the
-  // warm process (so the next turn spawns under Bedrock env) and the pin-clear it
-  // performs means the resend follows the Bedrock default, not the Anthropic id.
-  const handleLimitBedrock = async () => {
-    const sessionId = limitInfo?.sessionId;
-    if (!sessionId) { setLimitInfo(null); return; }
-    setLimitError(null);
-    try {
-      const res = await fetch('/api/provider', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ provider: 'bedrock' }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      await fetch('/api/claude-sdk/recycle', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId }),
-      });
-    } catch {
-      setLimitError('Failed to switch to the Bedrock fallback. Check the Bedrock settings.');
-      return; // keep the dialog open
-    }
-    setCurrentModel(null); // pin cleared server-side → follow the Bedrock default
-    setLimitInfo(null);
-    await resendLastPrompt();
-  };
-
-  const handleRewind = async (mode: 'conversation' | 'both') => {
-    if (!rewindConfirm) return;
-    if (!viewingTranscriptId || !historyTranscriptProject) return;
-
-    const mySessionId = viewingTranscriptId;
-    const myProject = historyTranscriptProject;
-    const rewindInfo = { ...rewindConfirm };
-    const { turnIndex, fullMessage } = rewindInfo;
-
-    // Immediately truncate the UI: remove all messages from the rewind point
-    // onward. turnIndex counts TURNS (what the rewind button + server use), and
-    // an AskUserQuestion answer is a user-role message that does NOT start a
-    // turn — so it must be skipped, else an earlier turn is cut off too.
-    const cutIdx = findRewindCutIndex(historyTranscript, turnIndex);
-    if (cutIdx >= 0) {
-      setHistoryTranscript(prev => prev.slice(0, cutIdx));
-    }
-    setTranscriptOverlayMessages([]);
-    setOverlayInsertPoint(null);
-    setTranscriptLoading(true);
-    setTranscriptStreaming('');
-    setStreamEvents([]);
-
-    try {
-      // Step 1: If "both", revert the code changes BEFORE truncating history.
-      if (mode === 'both') {
-        if (sdkSessionsEnabled) {
-          // SDK path: native file-checkpoint revert. Deterministic (real
-          // git-style rollback), no extra LLM turn. Targets the user message's
-          // uuid — rewindFiles restores the working tree to that checkpoint.
-          if (!rewindInfo.uuid) throw new Error('Rewind requires the message uuid (SDK path)');
-          const rewindRes = await fetch('/api/claude-sdk/rewind', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              sessionId: mySessionId,
-              messageUuid: rewindInfo.uuid,
-              projectPath: myProject,
-            }),
-          });
-          if (!rewindRes.ok) throw new Error(`SDK rewind failed: ${rewindRes.status}`);
-        } else {
-          // CLI path: prompt Claude to undo code changes BEFORE truncating
-          // (so it still has context of what it did).
-          const undoRes = await fetch('/api/claude', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              prompt: `Undo all file changes you made starting from the message shown below. Restore every modified file to its state before that point. Do not explain, just revert the files.\n\nMessage to rewind to (${rewindInfo.timestamp ? new Date(rewindInfo.timestamp).toISOString() : 'unknown time'}):\n> ${rewindInfo.userMessage}`,
-              sessionId: mySessionId,
-              projectPath: myProject,
-            }),
-          });
-
-          if (!undoRes.ok) throw new Error(`Undo request failed: ${undoRes.status}`);
-
-          // Poll health until the undo processing finishes.
-          // SSE delivers stream progress to the user during this time.
-          await new Promise<void>((resolve) => {
-            const poll = setInterval(async () => {
-              try {
-                const healthRes = await fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`);
-                if (healthRes.ok) {
-                  const healthData = await healthRes.json();
-                  if (!healthData.isProcessing) {
-                    clearInterval(poll);
-                    resolve();
-                  }
-                }
-              } catch { /* retry next interval */ }
-            }, 2000);
-          });
-        }
-      }
-
-      // Step 2: Truncate the JSONL (removes original turns + the undo prompt)
-      const res = await fetch('/api/session', {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId: mySessionId,
-          project: myProject,
-          turnIndex,
-          removeLastHistoryEntry: mode === 'both',
-        }),
-      });
-
-      if (!res.ok) throw new Error(`Rewind failed: ${res.status}`);
-
-      // Step 3: Reload transcript from the truncated JSONL
-      const refreshRes = await fetch(
-        `/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`
-      );
-      if (refreshRes.ok) {
-        const refreshData = await refreshRes.json();
-        if (refreshData.messages) {
-          setHistoryTranscript(refreshData.messages);
-          setTranscriptOverlayMessages([]);
-          setOverlayInsertPoint(null);
-        }
-      }
-
-      // Pre-fill the editor with the rewound message
-      chatEditorRef.current?.setContent(fullMessage);
-    } catch (error) {
-      console.error('[App] Rewind failed:', error);
-    } finally {
-      if (activeSessionRef.current === mySessionId) {
-        setTranscriptLoading(false);
-        setTranscriptStreaming('');
-      }
-    }
-  };
-
-  const handleTranscriptStop = async () => {
-    const mySessionId = viewingTranscriptId;
-    if (!mySessionId) return;
-    try {
-      if (sdkSessionsEnabled) {
-        // SDK path: interrupt the in-flight turn without tearing down the
-        // persistent session (keeps the warm process + checkpoints alive).
-        await fetch('/api/claude-sdk/interrupt', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId: mySessionId }),
-        });
-      } else {
-        await fetch('/api/health', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId: mySessionId, action: 'stop' }),
-        });
-      }
-    } catch (error) {
-      console.error('[App] Failed to stop session:', error);
-    } finally {
-      // Stopping kills the CLI, but everything generated up to this point was
-      // cached — re-anchor the freshness window from now. (We clear
-      // transcriptLoading here optimistically, so the session-health "just
-      // ended" stamp won't fire; do it explicitly.)
-      setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
-      // Same reason: the health handler's turn-end branch is gated on
-      // `transcriptLoadingRef.current`, which we're about to clear below, so it
-      // will NOT drop the live context overlay for a stopped turn. Left behind,
-      // the overlay outranks the archive via `??` for the life of the page (it
-      // can never be superseded downward) — stranding a stale-high reading and
-      // defeating rewind. Drop it here too.
-      setLiveContext(prev => {
-        if (!(mySessionId in prev)) return prev;
-        const next = { ...prev };
-        delete next[mySessionId];
-        return next;
-      });
-      if (activeSessionRef.current === mySessionId) {
-        setTranscriptLoading(false);
-        setTranscriptStreaming('');
-      }
-    }
-  };
-
-  const handleSessionArchived = (sessionId: string) => {
-    if (viewingTranscriptId === sessionId) {
-      setViewingTranscriptId(null);
-      setHistoryTranscript([]);
-      setTranscriptOverlayMessages([]);
-      setTranscriptStreaming('');
-      setTranscriptLoading(false);
-    }
-  };
-
-  /**
-   * SDK path: resolve the parked tool call in place. No kill, no re-prompt, no
-   * new turn — Claude is still sitting in canUseTool waiting on this promise, so
-   * the answer lands as the tool's own result and the SAME turn continues.
-   */
-  /**
-   * POST an answer (or a skip) for the parked question, closing the dialog
-   * optimistically and putting it BACK if the post didn't land.
-   *
-   * The optimistic close keeps the common path instant. But if the request fails,
-   * the server is still parked: isProcessing stays true, so the composer stays
-   * locked and the user is left staring at a spinner with no dialog and no error
-   * — the exact stranded turn this design exists to prevent. Restoring the dialog
-   * is the only thing that gives them a retry.
-   *
-   * NOT restored on 409: that means the question was legitimately settled by
-   * someone else (another tab, an abort, a superseding ask). Re-opening it would
-   * put an unanswerable dialog back on screen.
-   */
-  const postAskAnswer = async (
-    body: Record<string, unknown>,
-    label: string,
-  ) => {
-    const current = askUserQuestion;
-    const toolUseID = current?.toolUseID;
-    const mySessionId = viewingTranscriptId;
-    setAskUserQuestion(null);
-    if (!toolUseID || !mySessionId) return;
-    // Record the answer so a stale still-pending buffer read can't re-open this
-    // dialog before the server resolves it (P18).
-    answeredAskRef.current = { toolUseID, at: Date.now() };
-
-    // Only restore if nothing newer took the slot and we're still on the same
-    // session — a plain set would clobber a question that parked while we waited.
-    const restore = () => {
-      if (activeSessionRef.current !== mySessionId) return;
-      setAskUserQuestion(prev => prev ?? current);
-    };
-
-    try {
-      const res = await fetch('/api/claude-sdk/answer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: mySessionId, toolUseID, ...body }),
-      });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        console.error(`Failed to ${label} question:`, data.error || `HTTP ${res.status}`);
-        // A 409 with code 'no_pending' means the question really is already settled
-        // (answered/superseded) — don't restore. But a 409 'sdk_disabled' means the
-        // answer never landed and the turn is still parked, so restore the dialog so
-        // the user isn't stranded with a locked composer and no dialog. Any other
-        // status also restores.
-        if (res.status !== 409 || data.code === 'sdk_disabled') restore();
-      }
-    } catch (error) {
-      // Network failure — the server never heard us, so it is definitely still parked.
-      console.error(`Failed to ${label} question:`, error);
-      restore();
-    }
-  };
-
-  /** SDK path: resolve the parked tool call in place. */
-  const handleAskUserQuestionStructured = (result: {
-    answers: Record<string, string>;
-    annotations?: Record<string, { notes?: string }>;
-  }) => postAskAnswer(result, 'answer');
-
-  /** SDK path: dismissal denies the tool, which the model handles gracefully. */
-  const handleAskUserQuestionSkipSdk = () => postAskAnswer({ skip: true }, 'skip');
-
-  const handleAskUserQuestionResponse = async (answers: string) => {
-    setAskUserQuestion(null);
-    if (!answers.trim()) return;
-
-    // The CLI was already killed when the dialog opened, but defensively
-    // re-issue stop if loading is still flagged (e.g. session-health hadn't
-    // arrived yet when the user answered quickly) and clear local state so
-    // handleTranscriptSend's `transcriptLoading` early-return doesn't trip.
-    const mySessionId = viewingTranscriptId;
-    if (mySessionId && transcriptLoadingRef.current) {
-      try {
-        await fetch('/api/health', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId: mySessionId, action: 'stop' }),
-        });
-      } catch (error) {
-        console.error('Failed to stop in-flight session before sending answer:', error);
-      }
-      setTranscriptLoading(false);
-      setTranscriptStreaming('');
-    }
-
-    handleTranscriptSend(answers);
-  };
-
-  const handleAskUserQuestionSkip = () => {
-    setAskUserQuestion(null);
-  };
-
-  const handleFileDoubleClick = useCallback((filePath: string) => {
-    const fileName = filePath.replace(/\\/g, '/').split('/').pop() || '';
-    if (isCodeFile(fileName)) setCodeViewerPath(filePath);
-  }, []);
 
   // Archives (soft-deletes) the session: DELETE /api/session kills the process,
   // marks the row 'archived' in SQLite, and removes the on-disk JSONL + history
@@ -2536,7 +266,7 @@ export default function ChatTab({
         setErrorDialog({ title: 'Failed to archive session', message: data.error || `Server returned ${res.status}` });
         return;
       }
-      handleSessionArchived(sessionId);
+      stream.onArchived(sessionId);
       fetchHistory();
     } catch (error) {
       setErrorDialog({ title: 'Failed to archive session', message: error instanceof Error ? error.message : 'An unexpected error occurred' });
@@ -2573,473 +303,175 @@ export default function ChatTab({
   const handleRewindConfirmed = (mode: 'conversation' | 'both') => {
     if (!rewindConfirm) return;
     setRewindConfirm(null);
-    handleRewind(mode);
+    stream.rewind(rewindConfirm, mode);
   };
+
+  const sessions = (
+    <SessionsPane
+      onCreateSession={wizard.open}
+      pendingNewSessions={pendingNewSessions}
+      history={history}
+      liveSessionIds={liveSessionIds}
+      sessionActivity={sessionActivity}
+      liveContext={liveContext}
+      viewingTranscriptId={viewingTranscriptId}
+      transcriptLoading={transcriptLoading}
+      isLoadingHistory={isLoadingHistory}
+      historyHasMore={historyHasMore}
+      isLoadingMoreHistory={isLoadingMoreHistory}
+      onLoadMoreHistory={loadMoreHistory}
+      onSelectSession={(sessionId, project) => { showPane('conversation'); return stream.openSession(sessionId, project); }}
+      onRestorePending={(...args) => { showPane('conversation'); return stream.restorePending(...args); }}
+      onLabelEdit={(sessionId, currentLabel) => setLabelEdit({ sessionId, currentLabel })}
+      onArchiveConfirm={setArchiveConfirm}
+      onContextMenu={(e, entry) => {
+        setContextMenu({
+          x: e.clientX, y: e.clientY,
+          sessionId: entry.sessionId!, project: entry.project, display: entry.display, isLive: entry.isLive,
+        });
+      }}
+    />
+  );
+
+  const composer = (
+    <Composer
+      ref={chatEditorRef}
+      onSubmit={stream.send}
+      placeholder="Continue this conversation..."
+      submitOnEnter={!isCoarsePointer}
+      disabled={historyTranscriptLoading}
+      submitLabel={transcriptLoading ? 'Sending...' : 'Send'}
+      isProcessing={transcriptLoading}
+      onStop={stream.stop}
+      attachments={attachments}
+      // Paste/drop image capture — SDK backend only (the CLI
+      // `--print` path can't carry image blocks).
+      acceptImages={sdkSessionsEnabled}
+      footer={providerLabel ? (
+        // Style is deliberately unchanged from the read-only
+        // label — the only affordance is the pointer cursor.
+        //
+        // Clickable only with a session in view AND the SDK
+        // backend on. The picker drives sdkSessionManager; with
+        // sdkSessionsEnabled off, /api/claude routes turns to the
+        // CLI sessionManager, which has no per-session model —
+        // the switch would report success and change nothing.
+        <div
+          data-testid="model-label"
+          style={{ fontSize: '9px', fontWeight: 100, padding: '0 8px 1px', cursor: modelPickerAvailable ? 'pointer' : 'default' }}
+          className="text-muted-foreground"
+          onClick={modelPickerAvailable ? () => setModelPickerOpen(true) : undefined}
+          title={modelPickerAvailable ? 'Click to change model' : undefined}
+        >
+          {providerLabel}
+        </div>
+      ) : undefined}
+    />
+  );
+
+  const conversation = (
+    <ConversationPane
+      ref={setConversationEl}
+      hasSession={!!viewingTranscriptId}
+      onCreateSession={wizard.open}
+      stuck={isStuck}
+      onKillStuck={() => setShowKillConfirm(true)}
+      loading={historyTranscriptLoading}
+      empty={historyTranscript.length === 0 && transcriptOverlayMessages.length === 0}
+      unavailable={history.some(h => h.sessionId === viewingTranscriptId)}
+      partial={transcriptPartial}
+      transcript={{
+        // SSOT strip (step 3) + logical-task ENVELOPE: the DISPLAYED
+        // transcript is a pure function of (historyTranscript, live),
+        // computed above the return. While the envelope is open the
+        // slice anchors on `live.envelopeStartedAt` — hiding the
+        // task's committed intermediate turns AND the current turn's
+        // in-flight partials, so nothing can render above the dots
+        // (docs/ticket-subagent-notification-turns-intermediate-
+        // bubbles.md); with no envelope it falls back to the
+        // per-turn `live.startedAt` partials strip (step-1 anchor).
+        historyTranscript: displayedTranscript,
+        transcriptOverlayMessages: envelopeUserEcho ?? transcriptOverlayMessages,
+        // The echo is chronologically LAST in the displayed flow by
+        // construction (its messages postdate the envelope cut), so it
+        // must always append at the end — never at overlayInsertPoint,
+        // which was computed against a different (unsliced) transcript
+        // for the rewind overlay and would splice the prompt into a
+        // stale index if it were ever non-null here.
+        overlayInsertPoint: envelopeUserEcho ? null : overlayInsertPoint,
+        sessionId: viewingTranscriptId ?? undefined,
+        transcriptLoading,
+        onRewindConfirm: setRewindConfirm,
+        onIntermediaryView: setIntermediaryMessages,
+        lastAssistantRef,
+        ttsEnabled,
+        ttsPlaying: tts.playing,
+        onTtsToggle: () => tts.toggle(() => lastClaudeBubble(historyTranscript)),
+        onTtsCancel: () => tts.cleanup(),
+      }}
+      activity={{
+        // SSOT dots (step 2b): when opted in and the projection has
+        // arrived, the dots track `live.phase` (self-corrected by the
+        // heartbeat) instead of the legacy OR-of-proxies. Falls back to
+        // legacy while `live` is null or the flag is off.
+        show: (livenessDotsEnabled && live)
+          ? live.phase !== 'idle'
+          : (transcriptLoading || backgroundWorking),
+        awaitingAnswer: !!ask.question,
+        envelopeCount: envelopeHidden.length,
+        onOpen: () => {
+          if (envelopeHidden.length > 0) setEnvelopeModalFor(live?.envelopeStartedAt ?? null);
+          else { setRightPanelView('stream'); showPane('side'); }
+        },
+      }}
+      sessionError={sessionError}
+      transcriptEndRef={transcriptEndRef}
+      composer={composer}
+      splitComposer={!isMobile}
+      verticalLayout={chatVerticalLayout}
+      onVerticalLayoutChange={onVerticalLayoutChange}
+    />
+  );
+
+  const side = (
+    <ChatSidePane
+      projectPath={historyTranscriptProject}
+      view={rightPanelView}
+      onViewChange={setRightPanelView}
+      stream={{ streamEvents, transcriptLoading, submitStartTime, submitEndTime }}
+      notes={notes}
+      mcpFailedServers={mcpFailedServers}
+      compact={isMobile}
+    />
+  );
 
   return (
     <>
-    <PanelGroup direction="horizontal" onLayout={onHorizontalLayoutChange}>
-      {/* Left Panel - Unified Session List */}
-      <Panel defaultSize={chatHorizontalLayout[0]} minSize={15}>
-        <div className="h-full bg-card border-r border-border flex flex-col">
-          <div className="p-4 border-b border-border flex justify-between items-center">
-            <h2 className="text-foreground text-lg font-semibold">Sessions</h2>
-            <Button onClick={handleCreateSession} variant="outline" size="sm">
-              <Plus className="h-4 w-4" />
-            </Button>
-          </div>
-          <SessionSidebar
-            pendingNewSessions={pendingNewSessions}
-            history={history}
-            liveSessionIds={liveSessionIds}
-            sessionActivity={sessionActivity}
-            liveContext={liveContext}
-            viewingTranscriptId={viewingTranscriptId}
-            transcriptLoading={transcriptLoading}
-            isLoadingHistory={isLoadingHistory}
-            historyHasMore={historyHasMore}
-            isLoadingMoreHistory={isLoadingMoreHistory}
-            onLoadMoreHistory={loadMoreHistory}
-            onSelectSession={fetchTranscript}
-            onRestorePending={restorePendingSession}
-            onLabelEdit={(sessionId, currentLabel) => setLabelEdit({ sessionId, currentLabel })}
-            onArchiveConfirm={setArchiveConfirm}
-            onContextMenu={(e, entry) => {
-              setContextMenu({
-                x: e.clientX, y: e.clientY,
-                sessionId: entry.sessionId!, project: entry.project, display: entry.display, isLive: entry.isLive,
-              });
-            }}
-          />
-        </div>
-      </Panel>
-
-      <PanelResizeHandle className="w-2 bg-border hover:bg-primary transition-colors" />
-
-      {/* Middle Panel - Chat Interface / Transcript Viewer */}
-      <Panel defaultSize={chatHorizontalLayout[1]} minSize={30}>
-        <div ref={middlePanelRef} className="relative h-full bg-card border-r border-border flex flex-col">
-          {viewingTranscriptId ? (
-            <>
-              {isStuck && (
-                <div className="p-2 border-b border-border flex justify-end">
-                  <Button variant="destructive" size="sm" className="flex items-center gap-2" onClick={() => setShowKillConfirm(true)}>
-                    <AlertTriangle className="h-4 w-4" />
-                    Process Stuck - Kill
-                  </Button>
-                </div>
-              )}
-              <div className="flex-1 overflow-hidden">
-                <PanelGroup direction="vertical" onLayout={onVerticalLayoutChange}>
-                  <Panel defaultSize={chatVerticalLayout[0]} minSize={30}>
-                    <div className="h-full overflow-y-auto p-4 space-y-4">
-                      {historyTranscriptLoading ? (
-                        <div className="flex items-center justify-center h-full text-muted-foreground">
-                          <div className="flex items-center gap-2">
-                            <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
-                            <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
-                            <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
-                            <span className="ml-2">Loading transcript...</span>
-                          </div>
-                        </div>
-                      ) : historyTranscript.length === 0 && transcriptOverlayMessages.length === 0 ? (
-                        <div className="text-center text-muted-foreground mt-8 space-y-2">
-                          {history.some(h => h.sessionId === viewingTranscriptId) ? (
-                            <>
-                              <p>Transcript unavailable for this session.</p>
-                              <p className="text-xs">The session data may have been created before Claude CLI began persisting transcripts, or the files were removed.</p>
-                            </>
-                          ) : (
-                            <p>Send a message to start the conversation.</p>
-                          )}
-                        </div>
-                      ) : (
-                        <>
-                          {transcriptPartial && (
-                            <div className="rounded-md border border-yellow-600/50 bg-yellow-950/30 px-4 py-3 text-sm text-yellow-200 mb-4">
-                              <p className="font-medium">Partial transcript</p>
-                              <p className="text-xs text-yellow-300/70 mt-1">
-                                Only your prompts are available for this session. Full conversation transcripts were not persisted by Claude CLI at the time this session was created.
-                              </p>
-                            </div>
-                          )}
-                          <TranscriptRenderer
-                            // SSOT strip (step 3) + logical-task ENVELOPE: the DISPLAYED
-                            // transcript is a pure function of (historyTranscript, live),
-                            // computed above the return. While the envelope is open the
-                            // slice anchors on `live.envelopeStartedAt` — hiding the
-                            // task's committed intermediate turns AND the current turn's
-                            // in-flight partials, so nothing can render above the dots
-                            // (docs/ticket-subagent-notification-turns-intermediate-
-                            // bubbles.md); with no envelope it falls back to the
-                            // per-turn `live.startedAt` partials strip (step-1 anchor).
-                            historyTranscript={displayedTranscript}
-                            transcriptOverlayMessages={envelopeUserEcho ?? transcriptOverlayMessages}
-                            // The echo is chronologically LAST in the displayed flow by
-                            // construction (its messages postdate the envelope cut), so it
-                            // must always append at the end — never at overlayInsertPoint,
-                            // which was computed against a different (unsliced) transcript
-                            // for the rewind overlay and would splice the prompt into a
-                            // stale index if it were ever non-null here.
-                            overlayInsertPoint={envelopeUserEcho ? null : overlayInsertPoint}
-                            sessionId={viewingTranscriptId ?? undefined}
-                            transcriptLoading={transcriptLoading}
-                            onRewindConfirm={setRewindConfirm}
-                            onIntermediaryView={setIntermediaryMessages}
-                            lastAssistantRef={lastAssistantRef}
-                            ttsEnabled={ttsEnabled}
-                            ttsPlaying={ttsPlaying}
-                            onTtsToggle={() => {
-                              const audio = ttsAudioRef.current;
-                              if (audio) {
-                                if (audio.paused) {
-                                  audio.currentTime = 0;
-                                  audio.play().catch(err => {
-                                    console.error('[TTS] playback failed:', err);
-                                    setTtsPlaying('idle');
-                                  });
-                                  setTtsPlaying('playing');
-                                } else {
-                                  audio.pause();
-                                  setTtsPlaying('paused');
-                                }
-                              } else {
-                                // Replay: re-generate from last bubble (same turn logic as TranscriptRenderer)
-                                const bubble = lastClaudeBubble(historyTranscript);
-                                if (!bubble?.content) return;
-                                ttsCleanup();
-                                const abort = new AbortController();
-                                ttsAbortRef.current = abort;
-                                setTtsPlaying('loading');
-                                fetch('/api/tts', {
-                                  method: 'POST',
-                                  headers: { 'Content-Type': 'application/json' },
-                                  body: JSON.stringify({ text: bubble.content, turnMeta: bubble.turnMeta }),
-                                  signal: abort.signal,
-                                })
-                                  .then(res => {
-                                    if (ttsAbortRef.current !== abort) return;
-                                    if (!res.ok) throw new Error('TTS failed');
-                                    return res.blob();
-                                  })
-                                  .then(blob => {
-                                    if (!blob || ttsAbortRef.current !== abort) return;
-                                    const url = URL.createObjectURL(blob);
-                                    ttsBlobUrlRef.current = url;
-                                    const a = new Audio(url);
-                                    ttsAudioRef.current = a;
-                                    a.onended = () => setTtsPlaying('idle');
-                                    a.play().catch(err => {
-                                      console.error('[TTS] playback failed:', err);
-                                      setTtsPlaying('idle');
-                                    });
-                                    setTtsPlaying('playing');
-                                  })
-                                  .catch(err => {
-                                    if (ttsAbortRef.current !== abort) return;
-                                    if (err.name !== 'AbortError') console.error('[TTS]', err);
-                                    setTtsPlaying('idle');
-                                  });
-                              }
-                            }}
-                            onTtsCancel={() => ttsCleanup()}
-                          />
-                          {/* SSOT dots (step 2b): when opted in and the projection has
-                              arrived, the dots track `live.phase` (self-corrected by the
-                              heartbeat) instead of the legacy OR-of-proxies. Falls back to
-                              legacy while `live` is null or the flag is off. */}
-                          {((livenessDotsEnabled && live)
-                            ? live.phase !== 'idle'
-                            : (transcriptLoading || backgroundWorking)) && (
-                            <div className="flex justify-start">
-                              {/*
-                                While parked on a question the turn IS live and
-                                isProcessing IS true — correct, but the thinking
-                                dots would spin for as long as the human takes
-                                and read as a hang. The turn is not blocked on
-                                Claude; it's blocked on the user. Say that.
-                                Waiting on the DIALOG (not just isAwaitingAnswer)
-                                so this only shows while the question is on screen
-                                to answer.
-                              */}
-                              {askUserQuestion ? (
-                                <div
-                                  data-testid="awaiting-answer"
-                                  className="max-w-[80%] rounded-lg px-4 py-2 bg-muted text-foreground border border-border text-left"
-                                >
-                                  <div className="text-xs opacity-70 mb-1">Claude</div>
-                                  <div className="text-sm">Waiting for your answer…</div>
-                                </div>
-                              ) : (
-                                <button
-                                  // With hidden envelope updates, the bubble's click
-                                  // opens the intermediary-messages modal (agreed
-                                  // product direction, docs/ticket-subagent-
-                                  // notification-turns-intermediate-bubbles.md);
-                                  // otherwise it keeps the legacy behavior (live
-                                  // stream panel).
-                                  onClick={() => {
-                                    if (envelopeHidden.length > 0) setEnvelopeModalOpen(true);
-                                    else setRightPanelView('stream');
-                                  }}
-                                  className="max-w-[80%] rounded-lg pl-4 pr-2 py-2 bg-muted text-foreground border border-border cursor-pointer hover:border-ring transition-colors text-left"
-                                  title={envelopeHidden.length > 0 ? 'View progress updates' : 'View live stream'}
-                                >
-                                  <div className="text-xs mb-1 flex items-center gap-2">
-                                    <span className="opacity-70">Claude</span>
-                                    {/* Same chip TranscriptRenderer puts on settled bubbles
-                                        ("+N intermediary"), minus the word — just "+N" (user
-                                        direction 2026-09-09; replaced the earlier full-width
-                                        "N updates — click to view" line). Count live-updates:
-                                        envelopeHidden derives per render as notification turns
-                                        commit. A span, not a nested button — the whole dots
-                                        bubble is already the click target that opens the
-                                        intermediary-messages modal when updates exist. */}
-                                    {envelopeHidden.length > 0 && (
-                                      <span
-                                        data-testid="envelope-updates-chip"
-                                        className="text-[10px] text-muted-foreground bg-background border border-border rounded px-1.5 py-0.5 cursor-pointer hover:border-ring hover:text-foreground transition-colors"
-                                      >
-                                        +{envelopeHidden.length}
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div data-testid="processing-dots" className="flex items-center gap-1 py-2">
-                                    <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
-                                    <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
-                                    <div className="dot w-2 h-2 bg-foreground rounded-full"></div>
-                                  </div>
-                                </button>
-                              )}
-                            </div>
-                          )}
-                          {sessionError && (
-                            <div className="flex justify-start" data-testid="session-error">
-                              <div className="max-w-[80%] rounded-lg px-4 py-2 bg-destructive/10 text-foreground border border-destructive/40 text-left">
-                                <div className="text-xs text-destructive mb-1 flex items-center gap-1">
-                                  <AlertTriangle className="h-3 w-3" />
-                                  Session error
-                                </div>
-                                <div className="text-sm whitespace-pre-wrap">{sessionError}</div>
-                              </div>
-                            </div>
-                          )}
-                          {/* MCP connection failures are intentionally NOT surfaced in the
-                              main chat panel — they read as a chat message about the user's
-                              work. The MCP panel is the home for server status: `mcpFailedServers`
-                              still flows to <McpPanel runtimeFailed=… /> below, which flags the
-                              failed row there. (Removed the in-transcript banner per product
-                              direction; the state is retained purely to drive the panel.) */}
-                          <div ref={transcriptEndRef} />
-                        </>
-                      )}
-                    </div>
-                  </Panel>
-                  <PanelResizeHandle className="h-2 bg-border hover:bg-primary transition-colors" />
-                  <Panel defaultSize={chatVerticalLayout[1]} minSize={20}>
-                    <div className="h-full p-4">
-                      <RichTextEditor
-                        ref={chatEditorRef}
-                        onSubmit={handleTranscriptSend}
-                        placeholder="Continue this conversation... (Enter to send, Shift+Enter for new line)"
-                        disabled={historyTranscriptLoading}
-                        submitLabel={transcriptLoading ? 'Sending...' : 'Send'}
-                        isProcessing={transcriptLoading}
-                        onStop={handleTranscriptStop}
-                        // Paste/drop image capture — SDK backend only (the CLI
-                        // `--print` path can't carry image blocks).
-                        onImagesAdded={sdkSessionsEnabled ? handleImagesAdded : undefined}
-                        hasAttachments={attachedImages.length > 0}
-                        statusBar={(attachedImages.length > 0 || attachError || providerLabel) ? (
-                          <div>
-                            {attachedImages.length > 0 && (
-                              <div className="flex flex-wrap gap-2 px-2 pt-2" data-testid="image-attachments">
-                                {attachedImages.map(img => (
-                                  <div key={img.id} className="relative group/attach">
-                                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                                    <img
-                                      src={img.dataUrl}
-                                      alt="attachment"
-                                      className="h-14 w-14 object-cover rounded border border-border"
-                                    />
-                                    <button
-                                      type="button"
-                                      onClick={() => handleRemoveImage(img.id)}
-                                      className="absolute -top-1.5 -right-1.5 h-4 w-4 rounded-full bg-black/70 text-white text-[10px] leading-none flex items-center justify-center opacity-0 group-hover/attach:opacity-100 transition-opacity"
-                                      title="Remove attachment"
-                                    >
-                                      ✕
-                                    </button>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                            {attachError && (
-                              <div
-                                data-testid="attach-error"
-                                className="px-2 pt-1 text-[11px] text-red-500"
-                              >
-                                ⚠ {attachError}
-                              </div>
-                            )}
-                            {providerLabel && (
-                          // Style is deliberately unchanged from the read-only
-                          // label — the only affordance is the pointer cursor.
-                          //
-                          // Clickable only with a session in view AND the SDK
-                          // backend on. The picker drives sdkSessionManager; with
-                          // sdkSessionsEnabled off, /api/claude routes turns to the
-                          // CLI sessionManager, which has no per-session model —
-                          // the switch would report success and change nothing.
-                          <div
-                            data-testid="model-label"
-                            style={{ fontSize: '9px', fontWeight: 100, padding: '0 8px 1px', cursor: modelPickerAvailable ? 'pointer' : 'default' }}
-                            className="text-muted-foreground"
-                            onClick={modelPickerAvailable ? () => setModelPickerOpen(true) : undefined}
-                            title={modelPickerAvailable ? 'Click to change model' : undefined}
-                          >
-                            {providerLabel}
-                          </div>
-                            )}
-                          </div>
-                        ) : undefined}
-                      />
-                    </div>
-                  </Panel>
-                </PanelGroup>
-              </div>
-            </>
-          ) : (
-            <div className="h-full flex flex-col items-center justify-center text-center px-8">
-              <div className="text-muted-foreground space-y-4">
-                <h2 className="text-xl font-semibold text-foreground">Welcome to Fury</h2>
-                <p className="text-sm max-w-md">
-                  Select a session from the list to view its conversation, or create a new session to start chatting with Claude.
-                </p>
-                <Button onClick={handleCreateSession} variant="outline" className="mt-4">
-                  <Plus className="h-4 w-4 mr-2" />
-                  New Session
-                </Button>
-              </div>
-            </div>
-          )}
-        </div>
-      </Panel>
-
-      <PanelResizeHandle className="w-2 bg-border hover:bg-primary transition-colors" />
-
-      {/* Right Panel - Multi-View */}
-      <Panel defaultSize={chatHorizontalLayout[2]} minSize={20}>
-        <div className="h-full bg-card flex flex-col">
-          <div className="p-2 border-b border-border flex items-center gap-2">
-            <Button variant={rightPanelView === 'stream' ? 'default' : 'ghost'} size="sm" onClick={() => setRightPanelView('stream')} className="flex items-center gap-2">
-              <Activity className="h-4 w-4" />
-              Stream
-              {transcriptLoading && <span className="h-2 w-2 rounded-full bg-green-500 animate-pulse" />}
-            </Button>
-            <Button variant={rightPanelView === 'files' ? 'default' : 'ghost'} size="sm" onClick={() => setRightPanelView('files')} className="flex items-center gap-2">
-              <FolderTree className="h-4 w-4" />
-              Files
-            </Button>
-            <Button variant={rightPanelView === 'notes' ? 'default' : 'ghost'} size="sm" onClick={() => setRightPanelView('notes')} className="flex items-center gap-2">
-              <FileText className="h-4 w-4" />
-              Notes
-            </Button>
-            <Button variant={rightPanelView === 'mcp' ? 'default' : 'ghost'} size="sm" onClick={() => setRightPanelView('mcp')} className="flex items-center gap-2">
-              <Plug className="h-4 w-4" />
-              MCP
-            </Button>
-          </div>
-          <div className={`flex-1 overflow-hidden ${rightPanelView === 'files' ? '' : 'hidden'}`}>
-            <FileTree projectPath={historyTranscriptProject} onFileDoubleClick={handleFileDoubleClick} onOpenSourceControl={() => setSourceControlOpen(true)} />
-          </div>
-          {rightPanelView === 'stream' && (
-            <StreamEventsPanel
-              streamEvents={streamEvents}
-              transcriptLoading={transcriptLoading}
-              submitStartTime={submitStartTime}
-              submitEndTime={submitEndTime}
-            />
-          )}
-          {rightPanelView === 'notes' && (
-            <div className="flex-1 overflow-hidden p-4">
-              {isLoadingNotes ? (
-                <div className="flex items-center justify-center h-full text-muted-foreground">Loading notes...</div>
-              ) : (
-                <RichTextEditor
-                  key={historyTranscriptProject || 'no-project'}
-                  initialContent={notes}
-                  onChange={handleNotesChange}
-                  onSubmit={() => {}}
-                  placeholder={historyTranscriptProject ? "Write your notes here..." : "Select a session with a project directory to use notes"}
-                  disabled={!historyTranscriptProject}
-                  persistContent={true}
-                  showButtonBar={false}
-                  debounceMs={2000}
-                />
-              )}
-            </div>
-          )}
-          {rightPanelView === 'mcp' && <McpPanel projectPath={historyTranscriptProject} runtimeFailed={mcpFailedServers} />}
-        </div>
-      </Panel>
-    </PanelGroup>
-
-    {/* --- Dialogs (all owned by ChatTab) --- */}
-    <ModelPickerDialog
-      open={modelPickerOpen}
-      onOpenChange={setModelPickerOpen}
-      sessionId={viewingTranscriptId}
-      activeModel={currentModel}
-    />
-    <LimitReachedDialog
-      open={!!limitInfo}
-      onOpenChange={(o) => {
-        if (!o) {
-          // "Not now" / backdrop / escape — remember the dismissal so a buffer
-          // restore doesn't re-pop it. (Switch/Bedrock clear limitInfo directly,
-          // bypassing this, and clear the server's pendingLimit on the next turn.)
-          if (limitInfo) limitDismissedRef.current.add(limitInfo.sessionId);
-          setLimitInfo(null);
-        }
-      }}
-      info={limitInfo}
-      bedrockConfigured={failoverConfigured}
-      onSwitchAndRetry={handleLimitSwitch}
-      onUseBedrock={handleLimitBedrock}
-      error={limitError}
-    />
-    <IntermediaryMessagesDialog messages={intermediaryMessages} onClose={() => setIntermediaryMessages([])} />
-    {/* The dots-bubble modal for an OPEN logical-task envelope. Content is
-        derived per render (envelopeHidden), so it live-updates as notification
-        turns commit and empties (auto-closing: the dialog opens on
-        messages.length > 0) when the envelope closes and the main flow reveals
-        the committed history. Distinct instance from the settled-transcript
-        dialog above — that one shows a FINISHED turn's intermediaries on demand. */}
-    <IntermediaryMessagesDialog
-      messages={envelopeModalOpen ? envelopeHidden : []}
-      onClose={() => setEnvelopeModalOpen(false)}
-    />
-    <CodeViewerDialog filePath={codeViewerPath} onClose={() => setCodeViewerPath(null)} />
-    <SourceControlDialog open={sourceControlOpen} projectPath={historyTranscriptProject} onClose={() => setSourceControlOpen(false)} />
-
-    {askUserQuestion && (
-      <AskUserQuestionDialog
-        // Remount on question identity so an in-place question swap (server supersede
-        // / applyPendingAskFromBuffer on reconnect) resets the selection state — else
-        // question Y renders with question X's stale pre-checked answers.
-        key={askUserQuestion.toolUseID ?? 'cli'}
-        open={true}
-        // Draft identity: in-progress selections/text survive the unmount a
-        // session switch causes (P17 clears askUserQuestion unconditionally)
-        // and are restored when the question re-parks on switch-back. The CLI
-        // path (null) falls back to a question-text signature inside.
-        draftKey={askUserQuestion.toolUseID}
-        // Anchor the modal to the Chat tab's middle panel instead of the
-        // whole viewport, so it dims/centers within the conversation column.
-        portalContainer={middlePanelRef.current}
-        questions={askUserQuestion.input.questions}
-        context={
+      {isMobile ? (
+        <MobileChatLayout
+          sessions={sessions}
+          conversation={conversation}
+          side={side}
+          pane={mobilePane}
+          onPaneChange={(pane) => onMobilePaneChange?.(pane)}
+        />
+      ) : (
+        <DesktopChatLayout
+          sessions={sessions}
+          conversation={conversation}
+          side={side}
+          horizontalLayout={chatHorizontalLayout}
+          onHorizontalLayoutChange={onHorizontalLayoutChange}
+        />
+      )}
+      <ChatDialogs
+        modelPicker={{ open: modelPickerOpen, onOpenChange: setModelPickerOpen, sessionId: viewingTranscriptId, activeModel: currentModel }}
+        limit={limits.dialog}
+        intermediary={{ messages: intermediaryMessages, onClose: () => setIntermediaryMessages([]) }}
+        envelope={{ messages: envelopeModalOpen ? envelopeHidden : [], onClose: () => setEnvelopeModalFor(null) }}
+        ask={{
+          question: ask.question,
+          portalContainer: conversationEl,
           // The text Claude wrote leading up to the question — the same
           // content rendered in the chat panel, surfaced here because the
           // modal obstructs it and the panel can't scroll while it's open.
@@ -3047,142 +479,29 @@ export default function ChatTab({
           // assistant message, so the preamble is the last assistant text:
           // mid-turn it lives in the streaming buffer; once the turn ends
           // (the CLI is killed when the tool fires) it's the last assistant
-          // bubble in the refreshed transcript.
-          transcriptStreaming.trim() ||
-          // (skipping an earlier exchange's question messages, which aren't prose)
-          [...historyTranscript].reverse().find(m => m.role === 'assistant' && !m.askQuestion)?.content ||
-          ''
-        }
-        onSubmit={handleAskUserQuestionResponse}
-        // Only pass the structured path when there is a live tool call to
-        // resolve. A CLI-sourced question has toolUseID null and MUST fall
-        // through to the prose path, which re-sends the answer as a new turn.
-        onSubmitStructured={
-          sdkSessionsEnabled && askUserQuestion.toolUseID
-            ? handleAskUserQuestionStructured
-            : undefined
-        }
-        onSkip={
-          sdkSessionsEnabled && askUserQuestion.toolUseID
-            ? handleAskUserQuestionSkipSdk
-            : handleAskUserQuestionSkip
-        }
+          // bubble in the refreshed transcript. Only computed while open.
+          context: ask.question
+            ? (transcriptStreaming.trim() ||
+              // (skipping an earlier exchange's question messages, which aren't prose)
+              [...historyTranscript].reverse().find(m => m.role === 'assistant' && !m.askQuestion)?.content ||
+              '')
+            : '',
+          ...ask.handlers,
+        }}
+        contextMenu={{ state: contextMenu, onArchive: setArchiveConfirm, onClose: () => setContextMenu(null) }}
+        kill={{
+          open: showKillConfirm,
+          onOpenChange: setShowKillConfirm,
+          reason: stuckReason,
+          onConfirm: () => { setShowKillConfirm(false); stream.killStuck(); },
+        }}
+        takeover={takeoverConfirm}
+        rewind={{ request: rewindConfirm, onCancel: () => setRewindConfirm(null), onConfirm: handleRewindConfirmed }}
+        archive={{ request: archiveConfirm, onCancel: () => setArchiveConfirm(null), onConfirm: handleArchiveSession }}
+        label={{ request: labelEdit, onSave: handleSaveLabel, onCancel: () => setLabelEdit(null) }}
+        error={{ dialog: errorDialog, onClose: () => setErrorDialog(null) }}
+        wizard={wizard.dialogs}
       />
-    )}
-
-    {contextMenu && (
-      <SessionContextMenu
-        {...contextMenu}
-        onArchive={setArchiveConfirm}
-        onClose={() => setContextMenu(null)}
-      />
-    )}
-
-    <ConfirmDialog
-      open={showKillConfirm}
-      onOpenChange={setShowKillConfirm}
-      title="Kill stuck process?"
-      message={<>{stuckReason}<br /><br />This will terminate the Claude CLI process. The current response will be lost.</>}
-      confirmLabel="Kill Process"
-      confirmVariant="destructive"
-      onConfirm={() => { setShowKillConfirm(false); handleKillStuckSession(); }}
-    />
-
-    <ConfirmDialog
-      open={!!takeoverConfirm}
-      onOpenChange={(open) => { if (!open) takeoverConfirm?.onCancel(); }}
-      title="Take over this session?"
-      message={
-        <>
-          This session is currently live in a terminal
-          {takeoverConfirm?.owner?.name ? <> (<span className="font-mono">{takeoverConfirm.owner.name}</span>)</> : ''}.
-          <br /><br />
-          Taking it over in Fury will end that terminal session so Fury can
-          continue it here. Any unsaved context only in the terminal will be lost.
-        </>
-      }
-      confirmLabel="Take Over"
-      confirmVariant="destructive"
-      cancelLabel="Cancel"
-      onConfirm={() => takeoverConfirm?.onConfirm()}
-      onCancel={() => takeoverConfirm?.onCancel()}
-    />
-
-    <Dialog
-      open={!!rewindConfirm}
-      onOpenChange={(open) => { if (!open) setRewindConfirm(null); }}
-      title="Rewind conversation?"
-      defaultWidth={460}
-      defaultHeight={280}
-      minWidth={360}
-      minHeight={220}
-      resizable={false}
-      buttons={[
-        { label: 'Cancel', onClick: () => setRewindConfirm(null), variant: 'ghost' as const },
-        { label: 'Conversation only', onClick: () => handleRewindConfirmed('conversation'), variant: 'secondary' as const },
-        { label: 'Conversation + Code', onClick: () => handleRewindConfirmed('both') },
-      ]}
-    >
-      <div className="text-sm text-muted-foreground">
-        Rewind the conversation to before this message:
-        <br /><br />
-        <span className="text-xs font-mono break-all">&ldquo;{rewindConfirm?.userMessage}&rdquo;</span>
-        {rewindConfirm?.timestamp && (
-          <><br /><span className="text-xs">{new Date(rewindConfirm.timestamp).toLocaleString()}</span></>
-        )}
-      </div>
-    </Dialog>
-
-    <ConfirmDialog
-      open={!!archiveConfirm}
-      onOpenChange={(open) => { if (!open) setArchiveConfirm(null); }}
-      title="Archive session?"
-      message={<>
-        {archiveConfirm?.isLive && (
-          <>
-            <span className="text-yellow-500 font-semibold">This session is currently live.</span> The running process will be terminated.
-            <br /><br />
-          </>
-        )}
-        This removes the session from your list. Its usage history is preserved and it will still count in Stats.
-      </>}
-      confirmLabel="Archive"
-      onConfirm={() => { if (archiveConfirm) handleArchiveSession(archiveConfirm.sessionId, archiveConfirm.project); }}
-      onCancel={() => setArchiveConfirm(null)}
-    />
-
-    {labelEdit && (
-      <LabelEditDialog
-        initialValue={labelEdit.currentLabel}
-        onSave={handleSaveLabel}
-        onCancel={() => setLabelEdit(null)}
-      />
-    )}
-
-    <AlertDialog
-      open={!!errorDialog}
-      onOpenChange={(open) => { if (!open) setErrorDialog(null); }}
-      title={errorDialog?.title || 'Error'}
-      message={errorDialog?.message}
-    />
-
-    {/* New-session wizard — step (a): choose a directory, then Next → model */}
-    <DirectoryPicker
-      open={showDirectoryPicker}
-      onOpenChange={setShowDirectoryPicker}
-      onSelect={handleDirectoryNext}
-      recentDirectories={recentDirectories}
-      confirmLabel="Next →"
-    />
-
-    {/* New-session wizard — step (b): choose the model, then create */}
-    <NewSessionModelStep
-      open={showModelStep}
-      onOpenChange={(open) => { if (!open) { setShowModelStep(false); setWizardPath(null); } }}
-      onBack={handleModelStepBack}
-      onCreate={handleModelStepCreate}
-      directory={wizardPath ?? undefined}
-    />
     </>
   );
 }

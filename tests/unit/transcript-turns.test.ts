@@ -5,7 +5,7 @@
  * question text, and rewinding after an answered question cuts at the right turn.
  */
 import { describe, it, expect } from 'vitest';
-import { groupTurns, findRewindCutIndex } from '../../lib/transcriptTurns';
+import { groupTurns, findRewindCutIndex, lastClaudeBubble } from '../../lib/transcriptTurns';
 import type { TranscriptMsg } from '../../lib/types';
 
 const u = (content: string): TranscriptMsg => ({ role: 'user', content, timestamp: '' });
@@ -109,5 +109,21 @@ describe('findRewindCutIndex', () => {
   it('matches a naive user-count only when there are no answers', () => {
     const clean: TranscriptMsg[] = [u('T0'), a('r0'), u('T1'), a('r1')];
     expect(findRewindCutIndex(clean, 1)).toBe(2);
+  });
+});
+
+describe('lastClaudeBubble (what TTS announces)', () => {
+  it('is the last turn\'s visible bubble, not an intermediary', () => {
+    expect(lastClaudeBubble([u('T0'), a('step'), a('final')])?.content).toBe('final');
+  });
+
+  it('never announces a question message, and an answer does not start a turn', () => {
+    // Turn ends on an answer with no continuation: the preamble is the bubble.
+    expect(lastClaudeBubble([u('T0'), a('preamble'), q('Q?'), ans('A')])?.content).toBe('preamble');
+  });
+
+  it('falls back to the previous turn\'s bubble when the last turn has none', () => {
+    expect(lastClaudeBubble([u('T0'), a('r0'), u('T1')])?.content).toBe('r0');
+    expect(lastClaudeBubble([u('T0')])).toBeNull();
   });
 });
