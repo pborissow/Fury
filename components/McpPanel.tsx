@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import Dialog, { ConfirmDialog } from '@/components/Dialog';
 import { DirectoryPicker } from '@/components/DirectoryPicker';
 import { isServerRuntimeFailed } from '@/lib/mcpRuntimeStatus';
+import { subscribeAppEvents } from '@/lib/appEventStream';
 
 interface McpServer {
   name: string;
@@ -195,23 +196,19 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
     [mcpServers],
   );
 
-  // Live updates: refetch when the backend cache changes for our projectPath
-  useEffect(() => {
-    const es = new EventSource('/api/events');
-    const handler = (e: MessageEvent) => {
-      try {
-        const data = JSON.parse(e.data);
+  // Live updates: refetch when the backend cache changes for our projectPath.
+  // Shares the one global `/api/events` socket (lib/appEventStream.ts) — a second
+  // EventSource here helped exhaust the browser's per-origin connection pool and
+  // left ordinary fetches, notably /api/transcript, queued indefinitely.
+  useEffect(() => subscribeAppEvents({
+    on: {
+      'mcp-updated': (data) => {
         const eventPath = data?.projectPath ?? null;
         const ourPath = projectPath ?? null;
         if (eventPath === ourPath) fetchMcpServers();
-      } catch { /* ignore */ }
-    };
-    es.addEventListener('mcp-updated', handler as EventListener);
-    return () => {
-      es.removeEventListener('mcp-updated', handler as EventListener);
-      es.close();
-    };
-  }, [projectPath, fetchMcpServers]);
+      },
+    },
+  }), [projectPath, fetchMcpServers]);
 
   // Wizard state
   const [showAddMcp, setShowAddMcp] = useState(false);

@@ -9,6 +9,7 @@ import { subagentUsageCacheStats } from '@/lib/subagentUsage';
 import { sessionPathsCacheStats } from '@/lib/sessionPaths';
 import { archiverLockStats } from '@/lib/transcriptArchiver';
 import { codemoggerStats } from '@/lib/codemoggerServer';
+import { eventSubscriptionStats } from '@/lib/eventSubscriptions';
 import { buildManagerReport, collectSample } from '@/lib/memoryReport';
 import { memorySampler, summarizeGrowth } from '@/lib/memorySampler';
 
@@ -60,6 +61,7 @@ export async function GET(request: NextRequest) {
     sessionPathsCacheStats,
     archiverLockStats,
     codemoggerStats,
+    eventSubscriptionStats,
   });
 
   // Idempotent: the first request after a (re)start begins sampling.

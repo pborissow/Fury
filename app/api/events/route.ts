@@ -7,14 +7,35 @@ import { mcpCache } from '@/lib/mcpCache';
 import { sessionManager } from '@/lib/sessionManager';
 import { sdkSessionManager } from '@/lib/sdkSessionManager';
 import { computeLiveSessionIds } from '@/lib/liveSessions';
+import { eventSubscriptions, isValidSessionWatch } from '@/lib/eventSubscriptions';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
+const KEEPALIVE_MS = 30_000;
+/** Cap on chunks queued for a client that has stopped reading. */
+const MAX_QUEUED_CHUNKS = 256;
+/** Consecutive undrained keep-alives before we declare the peer gone.
+ *  At KEEPALIVE_MS this is ~2 minutes of a reader that never pulls. */
+const MAX_STALLED_PINGS = 4;
+
+/**
+ * GET /api/events — the app-wide SSE stream. Each window holds ONE of these
+ * (lib/appEventStream.ts).
+ *
+ * Session-scoped events (session-stream/-health/-model/-usage/-limit,
+ * transcript-updated) are delivered only for sessions this stream WATCHES. The
+ * `connected` event carries a `subscriptionId`, and the client adds or removes
+ * watched sessions via `POST /api/events` (below). Keeping them on this stream,
+ * rather than a second per-session stream, is what keeps a window within the
+ * browser's ~6-connections-per-origin budget.
+ *
+ * Legacy: `?sessionId=…&project=…` seeds the watch set for that one session.
+ */
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
-  const watchSessionId = searchParams.get('sessionId');
-  const watchProject = searchParams.get('project');
+  const legacySessionId = searchParams.get('sessionId');
+  const legacyProject = searchParams.get('project');
 
   // Ensure global services are running (idempotent)
   liveSessionScanner.start();
@@ -22,34 +43,71 @@ export async function GET(request: NextRequest) {
   startArchiveListener();
   mcpCache.start();
 
-  // If the client wants transcript updates for a specific session, start watching
-  if (watchSessionId && watchProject) {
-    fileWatchers.watchTranscript(watchSessionId, watchProject);
+  const subscriptionId = eventSubscriptions.create();
+  const legacyWatch = { sessionId: legacySessionId, project: legacyProject };
+  if (isValidSessionWatch(legacyWatch)) {
+    eventSubscriptions.watch(subscriptionId, legacyWatch.sessionId, legacyWatch.project);
   }
+  const watching = (sessionId: string) => eventSubscriptions.isWatching(subscriptionId, sessionId);
 
   const encoder = new TextEncoder();
-  let closed = false;
+  let teardown: (() => void) | null = null;
 
   const stream = new ReadableStream({
     start(controller) {
+      let keepAlive: ReturnType<typeof setInterval> | null = null;
+      let torn = false;
+      /** Detaches the eventBus subscription; set once it exists, so `release`
+       *  never depends on `handler` being defined yet. */
+      let detach: () => void = () => {};
+
+      /**
+       * Idempotent teardown — reachable from `abort`, the stream's `cancel()`,
+       * and the liveness probe below.
+       *
+       * Defensive hardening. This route used to clean up ONLY on
+       * `request.signal`'s abort, so a consumer that vanished without one — a
+       * half-open socket (laptop sleep, Wi-Fi drop, NAT eviction) never emits a
+       * FIN — would keep its eventBus listener, keep-alive timer and transcript
+       * watch forever. Not observed causing the 2026-09-30 transcript hang (that
+       * was live streams across two windows filling the browser's per-origin
+       * connection pool; see lib/appEventStream.ts), but the same gap
+       * /api/tree/watch's release() already closes.
+       */
+      const release = () => {
+        if (torn) return;
+        torn = true;
+        if (keepAlive) clearInterval(keepAlive);
+        detach();
+        // Releases EVERY session this stream watched (their transcript watchers).
+        eventSubscriptions.close(subscriptionId);
+        try { controller.close(); } catch { /* already closed */ }
+      };
+      teardown = release;
+
       const send = (eventType: string, data: any) => {
-        if (closed) return;
+        if (torn) return;
         try {
+          // enqueue() does NOT throw when nobody is reading — it silently grows
+          // an internal queue. Without this cap a client that stops draining is
+          // an unbounded sink that also pins this route's eventBus listener.
+          if (controller.desiredSize !== null && controller.desiredSize < -MAX_QUEUED_CHUNKS) {
+            console.warn('/api/events: client stopped draining; closing');
+            release();
+            return;
+          }
           controller.enqueue(
             encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`)
           );
         } catch {
-          closed = true;
+          release();
         }
       };
 
       // Send initial connection confirmation
-      send('connected', { ts: Date.now() });
-
-      // Keep-alive ping every 30s to prevent HTTP timeout
-      const keepAlive = setInterval(() => {
-        send('ping', { ts: Date.now() });
-      }, 30_000);
+      // The subscriptionId drives the POST control channel. A reconnect gets a
+      // NEW id, so the client must re-register its watched sessions.
+      send('connected', { ts: Date.now(), subscriptionId });
 
       // Track the latest PID-scanner output and the last merged list we
       // sent. We re-merge whenever either source changes, and only push if
@@ -98,13 +156,13 @@ export async function GET(request: NextRequest) {
             break;
 
           case 'session:stream':
-            if (watchSessionId && payload.sessionId === watchSessionId) {
+            if (watching(payload.sessionId)) {
               send('session-stream', payload);
             }
             break;
 
           case 'session:health':
-            if (watchSessionId && payload.sessionId === watchSessionId) {
+            if (watching(payload.sessionId)) {
               send('session-health', payload);
             }
             // A Fury-managed session flipping isProcessing changes the live
@@ -114,19 +172,19 @@ export async function GET(request: NextRequest) {
             break;
 
           case 'session:model':
-            if (watchSessionId && payload.sessionId === watchSessionId) {
+            if (watching(payload.sessionId)) {
               send('session-model', payload);
             }
             break;
 
           case 'session:usage':
-            if (watchSessionId && payload.sessionId === watchSessionId) {
+            if (watching(payload.sessionId)) {
               send('session-usage', payload);
             }
             break;
 
           case 'transcript:updated':
-            if (watchSessionId && payload.sessionId === watchSessionId) {
+            if (watching(payload.sessionId)) {
               send('transcript-updated', payload);
             }
             break;
@@ -138,7 +196,7 @@ export async function GET(request: NextRequest) {
           case 'session:limit':
             // Terminal usage/rate limit — only the tab watching this session
             // should raise the recovery dialog.
-            if (watchSessionId && payload.sessionId === watchSessionId) {
+            if (watching(payload.sessionId)) {
               send('session-limit', payload);
             }
             break;
@@ -150,17 +208,34 @@ export async function GET(request: NextRequest) {
       };
 
       eventBus.onApp(handler);
+      detach = () => eventBus.offApp(handler);
 
-      // Clean up on disconnect
-      request.signal.addEventListener('abort', () => {
-        closed = true;
-        clearInterval(keepAlive);
-        eventBus.offApp(handler);
-        if (watchSessionId) {
-          fileWatchers.unwatchTranscript(watchSessionId);
+      // Keep-alive ping every 30s to prevent HTTP timeout — and double as a
+      // liveness probe. A half-open socket never aborts the request, so if our
+      // own pings stop being drained the peer is gone regardless of what the
+      // socket claims, and this stream (plus its eventBus listener and its slot
+      // in the browser's connection pool) must not outlive it.
+      let stalledPings = 0;
+      keepAlive = setInterval(() => {
+        if (controller.desiredSize !== null && controller.desiredSize < 0) {
+          if (++stalledPings >= MAX_STALLED_PINGS) {
+            console.warn(`/api/events: no reader across ${MAX_STALLED_PINGS} pings; closing`);
+            release();
+            return;
+          }
+        } else {
+          stalledPings = 0;
         }
-        try { controller.close(); } catch { /* already closed */ }
-      });
+        send('ping', { ts: Date.now() });
+      }, KEEPALIVE_MS);
+
+      // Clean up on disconnect (and if the client was gone before we got here).
+      if (request.signal.aborted) release();
+      else request.signal.addEventListener('abort', release);
+    },
+    // The consumer went away without aborting the request.
+    cancel() {
+      teardown?.();
     },
   });
 
@@ -170,5 +245,59 @@ export async function GET(request: NextRequest) {
       'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
     },
+  });
+}
+
+/**
+ * POST /api/events — the control channel for a stream's watched sessions.
+ *
+ * Body: `{ subscriptionId, add?: [{ sessionId, project }], remove?: [sessionId] }`
+ *
+ * 404 means the subscription is gone (its stream closed or the server
+ * restarted); the client reconnects and re-registers under a new id.
+ * 422 means some adds were refused (invalid, or over the per-stream cap) and
+ * lists them in `rejected`; everything else in the request was applied.
+ */
+export async function POST(request: NextRequest) {
+  let body: { subscriptionId?: unknown; add?: unknown; remove?: unknown };
+  try {
+    body = await request.json();
+  } catch {
+    return new Response('Invalid JSON', { status: 400 });
+  }
+
+  const { subscriptionId, add, remove } = body || {};
+  if (typeof subscriptionId !== 'string' || !subscriptionId) {
+    return new Response('subscriptionId is required', { status: 400 });
+  }
+  if (!eventSubscriptions.has(subscriptionId)) {
+    return new Response('Unknown subscriptionId', { status: 404 });
+  }
+
+  if (Array.isArray(remove)) {
+    for (const sessionId of remove) {
+      if (typeof sessionId === 'string') eventSubscriptions.unwatch(subscriptionId, sessionId);
+    }
+  }
+  // A refused add must not look like success: the client would mark it
+  // confirmed and wait forever for events that will never come.
+  const rejected: { sessionId: unknown; reason: 'invalid' | 'limit' }[] = [];
+  if (Array.isArray(add)) {
+    for (const w of add) {
+      if (!isValidSessionWatch(w)) {
+        rejected.push({ sessionId: (w as { sessionId?: unknown } | null)?.sessionId ?? null, reason: 'invalid' });
+        continue;
+      }
+      if (eventSubscriptions.watch(subscriptionId, w.sessionId, w.project) === 'full') {
+        rejected.push({ sessionId: w.sessionId, reason: 'limit' });
+      }
+    }
+  }
+
+  // 422: the request was processed, but some adds were refused. Every other
+  // add and remove in it WAS applied; `rejected` names the ones that weren't.
+  return new Response(JSON.stringify(rejected.length ? { success: false, rejected } : { success: true }), {
+    status: rejected.length ? 422 : 200,
+    headers: { 'Content-Type': 'application/json' },
   });
 }

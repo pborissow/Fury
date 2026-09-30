@@ -1,3 +1,5 @@
+import v8 from 'node:v8';
+
 /**
  * Retention sizing for the memory diagnostic (`GET /api/diagnostics/memory`).
  *
@@ -270,11 +272,11 @@ export interface SnapshotDeps {
   sessionPathsCacheStats?: () => Record<string, number>;
   archiverLockStats?: () => Record<string, number>;
   codemoggerStats?: () => Record<string, number>;
+  eventSubscriptionStats?: () => Record<string, number>;
 }
 
 export function collectSample(deps: SnapshotDeps): MemorySample {
   const mem = process.memoryUsage();
-  const v8 = require('node:v8') as typeof import('v8');
 
   const spacesMb: Record<string, number> = {};
   try {
@@ -324,6 +326,9 @@ export function collectSample(deps: SnapshotDeps): MemorySample {
   if (deps.sessionPathsCacheStats) probe(deps.sessionPathsCacheStats, 'sessionPaths', counters);
   if (deps.archiverLockStats) probe(deps.archiverLockStats, 'archiver', counters);
   if (deps.codemoggerStats) probe(deps.codemoggerStats, 'codemogger', counters);
+  // Open /api/events streams and the sessions they watch. Should track the
+  // number of open windows; a climb means streams outlive their clients.
+  if (deps.eventSubscriptionStats) probe(deps.eventSubscriptionStats, 'eventSubs', counters);
 
   let heapLimitMb = 0;
   try { heapLimitMb = toMb(v8.getHeapStatistics().heap_size_limit); } catch { /* ignore */ }

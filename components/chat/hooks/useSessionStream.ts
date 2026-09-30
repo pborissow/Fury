@@ -13,6 +13,7 @@ import type { useSessionHistory } from './useSessionHistory';
 import type { useAskUserQuestion } from './useAskUserQuestion';
 import type { useLimitHandling } from './useLimitHandling';
 import { uiLog } from '@/lib/clientTelemetry';
+import { subscribeAppEvents } from '@/lib/appEventStream';
 import { stripInFlightPartials } from '@/lib/transcriptStrip';
 import {
   reduceSessionStream, appendStreamEvent, applyContextUsage, clearContextUsage,
@@ -175,9 +176,6 @@ export function useSessionStream({
 
   // True when the transcript was reconstructed from history.jsonl (user prompts only, no responses)
   const [transcriptPartial, setTranscriptPartial] = useState(false);
-
-  // Session-scoped SSE ref
-  const sessionEsRef = useRef<EventSource | null>(null);
 
   // Parked when a send hits a session that's live in an external terminal. The
   // backend answers with a 409 {needsTakeoverConfirm}; this holds the owner info
@@ -540,28 +538,28 @@ export function useSessionStream({
     }
   }, [viewingTranscriptId, lastSendRef]);
 
-  // --- Session-scoped SSE for stream, health, and transcript events ---
+  // --- Session-scoped events for stream, health, and transcript ---
+  // Delivered over the window's ONE shared /api/events socket
+  // (lib/appEventStream.ts) by watching the session through its control
+  // channel. A dedicated per-session EventSource here was one permanent
+  // connection too many: a browser tab plus the PWA exhausted Chrome's
+  // 6-per-origin pool and every fetch hung (docs/ticket-sse-pool-exhaustion-
+  // and-memory-floor.md §1).
   useEffect(() => {
-    // Close previous session-scoped connection
-    if (sessionEsRef.current) {
-      sessionEsRef.current.close();
-      sessionEsRef.current = null;
-    }
-
     if (!viewingTranscriptId || !historyTranscriptProject) return;
 
     const mySessionId = viewingTranscriptId;
     const myProject = historyTranscriptProject;
 
-    const es = new EventSource(
-      `/api/events?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`
-    );
-    sessionEsRef.current = es;
-
     const isStillActive = () => activeSessionRef.current === mySessionId;
     // Skip expensive state updates when the tab is hidden; catch-up happens
     // when isActive flips back to true (see effect below).
     const shouldProcess = () => isStillActive() && isActiveRef.current;
+    // The shared socket carries every session this window watches, so each
+    // handler must check the event is for THIS session.
+    const forMe = (data: object | null | undefined) =>
+      !!data && (data as { sessionId?: unknown }).sessionId === mySessionId && shouldProcess();
+    const on: Record<string, (data: any) => void> = {};
 
     // --- SSOT liveness projection (step 2b) ---
     // Reset on session switch so a prior session's phase can't leak into this view.
@@ -570,11 +568,24 @@ export function useSessionStream({
     setLive(null);
     liveRef.current = null;
 
-    // On SSE connect, re-fetch the stream buffer to close the gap between the
-    // initial restore in fetchTranscript and when the EventSource connected.
-    // Events emitted during that window would otherwise be lost.
-    es.addEventListener('connected', () => {
+    // Once the server confirms the watch, re-fetch the stream buffer to close
+    // the gap between the initial restore in fetchTranscript and the point the
+    // session's events started flowing. Events emitted in that window were
+    // never delivered.
+    //
+    // This also fires after EVERY reconnect of the shared socket (`resumed`),
+    // which is the recovery path: the server is reachable again by then. The
+    // old per-session stream did its catch-up in `onerror`, at the moment of
+    // the DROP, while the server might still be down, and nothing refetched on
+    // recovery.
+    const onWatching = (resumed: boolean) => {
       if (!shouldProcess()) return;
+      if (resumed) {
+        uiLog('info', 'chat.sse', 'resyncing after reconnect', {
+          sessionId: mySessionId,
+          data: { loading: transcriptLoadingRef.current },
+        });
+      }
 
       const bufIssuedAt = Date.now();
       fetch(`/api/stream-buffer?sessionId=${encodeURIComponent(mySessionId)}`)
@@ -637,18 +648,32 @@ export function useSessionStream({
                 }
               })
               .catch(() => {});
+          } else if (resumed && !transcriptLoadingRef.current) {
+            // Idle across the outage, but a `transcript-updated` (e.g. from an
+            // external CLI writing the JSONL) may have been missed while the
+            // socket was down. Never while a turn is in flight: the JSONL then
+            // holds that turn's partials, which would render as bubbles above
+            // the dots (re-checked on resolve, since loading can flip meanwhile).
+            fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
+              .then(res => res.json())
+              .then(refreshData => {
+                if (!refreshData.messages || !shouldProcess() || transcriptLoadingRef.current) return;
+                setHistoryTranscript(refreshData.messages);
+                setTranscriptOverlayMessages([]);
+                setOverlayInsertPoint(null);
+              })
+              .catch(() => {});
           }
         })
         .catch(() => {});
-    });
+    };
 
     // Handle session:stream events — the single path for all stream data.
     // NOTE: These events only fire for sessions managed by Fury's sessionManager.
     // External CLI sessions rely on transcript-updated (file watcher) for updates.
-    es.addEventListener('session-stream', (e: MessageEvent) => {
-      if (!shouldProcess()) return;
+    on['session-stream'] = (data: SessionStreamPayload) => {
+      if (!forMe(data)) return;
 
-      const data: SessionStreamPayload = JSON.parse(e.data);
       const out = reduceSessionStream(data, {
         loading: transcriptLoadingRef.current,
         sdkSessionsEnabled,
@@ -698,23 +723,21 @@ export function useSessionStream({
           data: { error: String(out.error).slice(0, 300) },
         });
       }
-    });
+    };
 
     // The CLI tells us which model it spun up in its `system.init` line —
     // capture it so the status bar can show the real model name even when
     // ANTHROPIC_MODEL isn't set (the direct-Anthropic case).
-    es.addEventListener('session-model', (e: MessageEvent) => {
-      if (!shouldProcess()) return;
-      const data = JSON.parse(e.data);
+    on['session-model'] = (data) => {
+      if (!forMe(data)) return;
       if (data.model) setCurrentModel(data.model);
-    });
+    };
 
     // Terminal usage/rate limit on this session's model. Drop the in-flight
     // spinner (the turn is over, it produced nothing) and raise the recovery
     // dialog. Refresh provider status so the Bedrock button reflects config.
-    es.addEventListener('session-limit', (e: MessageEvent) => {
-      if (!shouldProcess()) return;
-      const data = JSON.parse(e.data);
+    on['session-limit'] = (data) => {
+      if (!forMe(data)) return;
       setTranscriptLoading(false);
       setSubmitEndTime(Date.now());
       raiseLimit(mySessionId, data.limitedModel ?? null, String(data.message || ''), true);
@@ -722,13 +745,12 @@ export function useSessionStream({
         sessionId: mySessionId,
         data: { limitedModel: data.limitedModel ?? null },
       });
-    });
+    };
 
     // Live context occupancy for the in-flight turn. An absolute level, so it
     // replaces rather than accumulates — no baseline, no arithmetic.
-    es.addEventListener('session-usage', (e: MessageEvent) => {
-      if (!shouldProcess()) return;
-      const data = JSON.parse(e.data);
+    on['session-usage'] = (data) => {
+      if (!forMe(data)) return;
       if (typeof data.contextTokens !== 'number') return;
       // Anchor the freshness leaf's countdown on ACTUAL API-call activity, not on
       // the transcriptLoading-gated turn boundary. Each session-usage event
@@ -747,12 +769,11 @@ export function useSessionStream({
       setSessionActivity(prev => ({ ...prev, [mySessionId]: Date.now() }));
       // Absolute level, last value wins; keeps the last non-zero window.
       setLiveContext(prev => applyContextUsage(prev, mySessionId, data));
-    });
+    };
 
     // Handle session:health events (replaces health polling)
-    es.addEventListener('session-health', (e: MessageEvent) => {
-      if (!shouldProcess()) return;
-      const data: HealthPayload = JSON.parse(e.data);
+    on['session-health'] = (data: HealthPayload) => {
+      if (!forMe(data)) return;
       const out = reduceHealth(data, { loading: transcriptLoadingRef.current });
       setIsStuck(!!out.isStuck);
       setStuckReason(out.stuckReason);
@@ -834,46 +855,11 @@ export function useSessionStream({
           })
           .catch(() => {});
       }
-    });
-
-    es.onerror = () => {
-      if (es.readyState === EventSource.CONNECTING && shouldProcess()) {
-        uiLog('warn', 'chat.sse', 'reconnecting', {
-          sessionId: mySessionId,
-          data: { loading: transcriptLoadingRef.current },
-        });
-        // SSE reconnecting — check if session completed while disconnected
-        fetch(`/api/health?sessionId=${encodeURIComponent(mySessionId)}`)
-          .then(res => res.json())
-          .then(data => {
-            if (!shouldProcess()) return;
-            if (!data.isProcessing && transcriptLoadingRef.current) {
-              setTranscriptLoading(false);
-              setTranscriptStreaming('');
-            }
-          })
-          .catch(() => {});
-        // Also refresh transcript to pick up any missed messages — but never
-        // while a turn is in flight: the JSONL holds that turn's partial
-        // assistant messages, which would render as intermediary bubbles above
-        // the bouncing dots. Same guard as the transcript-updated handler below.
-        // (Re-checked inside .then(), since loading can flip while in flight.)
-        fetch(`/api/transcript?sessionId=${encodeURIComponent(mySessionId)}&project=${encodeURIComponent(myProject)}`)
-          .then(res => res.json())
-          .then(data => {
-            if (!data.messages || !shouldProcess()) return;
-            if (transcriptLoadingRef.current) return;
-            setHistoryTranscript(data.messages);
-            setTranscriptOverlayMessages([]);
-            setOverlayInsertPoint(null);
-          })
-          .catch(() => {});
-      }
     };
 
     // Handle transcript:updated events (replaces transcript polling for external live sessions)
-    es.addEventListener('transcript-updated', () => {
-      if (!shouldProcess()) return;
+    on['transcript-updated'] = (data) => {
+      if (!forMe(data)) return;
       // Legacy guard: don't refresh while a turn is in flight — the JSONL contains
       // partial assistant messages that would render as intermediary bubbles.
       //
@@ -902,7 +888,7 @@ export function useSessionStream({
           }
         })
         .catch(() => {});
-    });
+    };
 
     // Fallback health poll: if SSE drops or a session:health event is lost,
     // the UI can get stuck showing "processing" forever. Poll every 15s while
@@ -992,12 +978,15 @@ export function useSessionStream({
         .catch(() => {});
     }, 15_000);
 
+    const unsubscribe = subscribeAppEvents({
+      on,
+      watchSession: { sessionId: mySessionId, project: myProject },
+      onWatching,
+    });
+
     return () => {
-      es.close();
+      unsubscribe();
       clearInterval(healthPoll);
-      if (sessionEsRef.current === es) {
-        sessionEsRef.current = null;
-      }
     };
     // sdkSessionsEnabled is read inside the handlers here (applyAskFromBuffer, the
     // AskUserQuestion routing guard); include it (P19) so toggling the setting at

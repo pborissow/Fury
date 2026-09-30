@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { subscribeAppEvents } from '@/lib/appEventStream';
 import type { HistoryEntry } from '@/lib/types';
 
 const HISTORY_PAGE_SIZE = 25;
@@ -137,36 +138,35 @@ export function useSessionHistory(isActive: boolean, options: SessionHistoryOpti
     fetchHistory();
     optionsRef.current.onProviderStale?.('activate');
 
-    const es = new EventSource('/api/events');
-
-    es.addEventListener('live-sessions', (e: MessageEvent) => {
-      const data = JSON.parse(e.data);
-      const ids = new Set<string>(data.liveSessionIds || []);
-      const finished = [...prevLiveIdsRef.current].filter(id => !ids.has(id));
-      if (finished.length > 0) optionsRef.current.onTurnsFinished?.(finished);
-      prevLiveIdsRef.current = ids;
-      setLiveSessionIds(ids);
-    });
-
-    es.addEventListener('history-updated', () => {
-      fetchHistory();
-    });
-
-    es.addEventListener('provider-switched', () => {
-      optionsRef.current.onProviderStale?.('switched');
-    });
-
-    es.onerror = () => {
-      if (es.readyState === EventSource.CONNECTING) {
-        // Re-fetch state to cover any events we missed while the SSE connection
-        // was dropped (e.g. provider switch-back fired during a server restart).
+    // Shares ONE socket with every other `/api/events` consumer — a per-consumer
+    // EventSource here helped exhaust the browser's 6-connection-per-origin pool
+    // and left ordinary fetches (notably /api/transcript) queued forever. See
+    // lib/appEventStream.ts.
+    return subscribeAppEvents({
+      on: {
+        'live-sessions': (data) => {
+          const ids = new Set<string>(data.liveSessionIds || []);
+          const finished = [...prevLiveIdsRef.current].filter(id => !ids.has(id));
+          if (finished.length > 0) optionsRef.current.onTurnsFinished?.(finished);
+          prevLiveIdsRef.current = ids;
+          setLiveSessionIds(ids);
+        },
+        'history-updated': () => {
+          fetchHistory();
+        },
+        'provider-switched': () => {
+          optionsRef.current.onProviderStale?.('switched');
+        },
+      },
+      // Re-fetch state to cover any events we missed while the SSE connection
+      // was dropped (e.g. provider switch-back fired during a server restart).
+      // Fires once the stream is back open, so the server is reachable.
+      onReconnect: () => {
         baselineLiveSessions();
         fetchHistory();
         optionsRef.current.onProviderStale?.('reconnect');
-      }
-    };
-
-    return () => es.close();
+      },
+    });
   }, [isActive, fetchHistory]);
 
   return {

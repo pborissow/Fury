@@ -15,6 +15,7 @@ import { dirname, join } from 'path';
 import { mkdirSync } from 'fs';
 import { readdir, readFile, stat } from 'fs/promises';
 import { furyDbPath } from './furyHome';
+import { isUnchanged, loadScanCache, saveScanCache, type ScanCache } from './scanCache';
 import { parseTranscriptJsonl } from './transcriptParser';
 import { PRICING, PRICING_AS_OF } from './pricing';
 import { hasAnyConfirmedWindow, enrichWindowsFromHistory } from './modelWindows';
@@ -901,6 +902,15 @@ async function scanAndArchiveAll(client: Client): Promise<void> {
   const projectsBase = join(homedir(), '.claude', 'projects');
   const historyMap = await buildHistoryMap();
 
+  // size+mtime → content hash, so an unchanged transcript is skipped WITHOUT
+  // being read (lib/scanCache.ts: 575 MB / ~2.3 s of reads per boot on a large
+  // archive, down to a few ms of stat() calls).
+  const cache = await loadScanCache();
+  /** Rebuilt as we go rather than mutated, so vanished files prune themselves. */
+  const nextCache: ScanCache = {};
+  let reads = 0;
+  let cacheHits = 0;
+
   let dirs: string[];
   try {
     dirs = await readdir(projectsBase);
@@ -930,10 +940,37 @@ async function scanAndArchiveAll(client: Client): Promise<void> {
 
       try {
         const filePath = join(slugDir, file);
+        const cacheKey = `${slug}/${file}`;
+
+        // Cheap gate FIRST: when size+mtime are unchanged we already know this
+        // file's hash, so the DB check below needs no file read at all. The DB
+        // remains authoritative — a session whose row was deleted still fails
+        // isCurrentlyArchived and falls through to the full read path.
+        let fileStats: { size: number; mtimeMs: number };
+        try {
+          const st = await stat(filePath);
+          fileStats = { size: st.size, mtimeMs: st.mtimeMs };
+        } catch {
+          continue; // vanished between readdir and stat
+        }
+        const cached = cache[cacheKey];
+        if (isUnchanged(cached, fileStats)) {
+          if (await isCurrentlyArchived(sessionId, cached.hash)) {
+            nextCache[cacheKey] = cached;
+            cacheHits++;
+            skipped++;
+            continue;
+          }
+        }
+
         const content = await readFile(filePath, 'utf-8');
+        reads++;
         if (!content.trim()) continue;
 
         const hash = computeHash(content);
+        // Record what we just hashed even if the archive write below fails: the
+        // hash describes the FILE, and the DB check stays the gate on re-archiving.
+        nextCache[cacheKey] = { ...fileStats, hash };
 
         if (await isCurrentlyArchived(sessionId, hash)) {
           skipped++;
@@ -965,8 +1002,11 @@ async function scanAndArchiveAll(client: Client): Promise<void> {
     }
   }
 
+  await saveScanCache(nextCache);
+
   console.log(
     `[DB] Startup scan complete: ${archived} archived, ${skipped} already current` +
+    ` (${cacheHits} skipped unread, ${reads} files read)` +
     (errors > 0 ? `, ${errors} errors` : '')
   );
 }

@@ -8,6 +8,7 @@ import { subagentUsageCacheStats } from './subagentUsage';
 import { sessionPathsCacheStats } from './sessionPaths';
 import { archiverLockStats } from './transcriptArchiver';
 import { codemoggerStats } from './codemoggerServer';
+import { eventSubscriptionStats } from './eventSubscriptions';
 import { collectSample } from './memoryReport';
 import { memorySampler } from './memorySampler';
 
@@ -39,5 +40,6 @@ export function startMemorySampling(): void {
     sessionPathsCacheStats,
     archiverLockStats,
     codemoggerStats,
+    eventSubscriptionStats,
   }));
 }
