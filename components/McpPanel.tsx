@@ -578,11 +578,11 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
                       <AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" />
                     </span>
                   ) : server.status === 'connected' ? (
-                    <span title={server.statusDetail}><Check className="h-4 w-4 text-green-500 flex-shrink-0" /></span>
+                    <span title={server.statusDetail}><Check className="h-4 w-4 text-green-700 dark:text-green-500 flex-shrink-0" /></span>
                   ) : server.status === 'needs_auth' ? (
-                    <span title={server.statusDetail}><AlertTriangle className="h-4 w-4 text-yellow-500 flex-shrink-0" /></span>
+                    <span title={server.statusDetail}><AlertTriangle className="h-4 w-4 text-amber-700 dark:text-yellow-500 flex-shrink-0" /></span>
                   ) : server.status === 'pending' ? (
-                    <span title={server.statusDetail}><Clock className="h-4 w-4 text-orange-400 flex-shrink-0" /></span>
+                    <span title={server.statusDetail}><Clock className="h-4 w-4 text-orange-700 dark:text-orange-400 flex-shrink-0" /></span>
                   ) : server.status === 'error' ? (
                     <span title={server.statusDetail}><AlertTriangle className="h-4 w-4 text-red-500 flex-shrink-0" /></span>
                   ) : (
@@ -648,7 +648,7 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
               }`}
             >
               <div className="h-10 w-10 rounded-lg bg-orange-500/10 flex items-center justify-center flex-shrink-0">
-                <Search className="h-5 w-5 text-orange-400" />
+                <Search className="h-5 w-5 text-orange-700 dark:text-orange-400" />
               </div>
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-foreground">This project</div>
@@ -680,7 +680,7 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
               className="w-full flex items-center gap-3 p-4 rounded-lg border border-border bg-muted/30 hover:bg-muted/60 hover:border-foreground/20 transition-colors text-left group"
             >
               <div className="h-10 w-10 rounded-lg bg-green-500/10 flex items-center justify-center flex-shrink-0">
-                <Globe className="h-5 w-5 text-green-400" />
+                <Globe className="h-5 w-5 text-green-700 dark:text-green-400" />
               </div>
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-medium text-foreground">Remote server</div>
@@ -786,7 +786,7 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
                         <div key={i} className={`flex items-center gap-2 text-xs px-2 py-1 rounded ${isDuplicate ? 'bg-muted/20 opacity-50' : 'bg-muted/40'}`}>
                           <span className="font-medium text-foreground">{s.name}</span>
                           <span className="text-muted-foreground truncate flex-1">{s.url}</span>
-                          {isDuplicate && <span className="text-yellow-500 flex-shrink-0">exists</span>}
+                          {isDuplicate && <span className="text-amber-700 dark:text-yellow-500 flex-shrink-0">exists</span>}
                         </div>
                       );
                     })}
@@ -861,8 +861,8 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
         {wizardStep === 'instructions' && (
           <div className="space-y-4">
             <div className="flex items-start gap-2 p-3 rounded-lg bg-green-500/10 border border-green-500/20">
-              <Check className="h-4 w-4 text-green-500 flex-shrink-0 mt-0.5" />
-              <div className="text-sm text-green-400">
+              <Check className="h-4 w-4 text-green-700 dark:text-green-500 flex-shrink-0 mt-0.5" />
+              <div className="text-sm text-green-700 dark:text-green-400">
                 {addedServers.length === 1 ? (
                   <><span className="font-medium">{addedServers[0].name}</span> added successfully.</>
                 ) : (
@@ -883,7 +883,7 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
               className={`${inputClass} resize-none font-mono text-xs`}
             />
             {!projectPath && (
-              <div className="text-xs text-yellow-400">
+              <div className="text-xs text-amber-700 dark:text-yellow-400">
                 No project path available. Open a session to enable saving to CLAUDE.md.
               </div>
             )}
@@ -893,7 +893,7 @@ export default function McpPanel({ projectPath, runtimeFailed }: McpPanelProps) 
               </div>
             )}
             {mcpAddWarning && (
-              <div data-testid="mcp-approve-warning" className="text-sm text-yellow-400 p-2 bg-yellow-500/10 rounded whitespace-pre-wrap">
+              <div data-testid="mcp-approve-warning" className="text-sm text-amber-700 dark:text-yellow-400 p-2 bg-yellow-500/10 rounded whitespace-pre-wrap">
                 {mcpAddWarning}
               </div>
             )}

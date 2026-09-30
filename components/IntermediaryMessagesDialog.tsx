@@ -42,8 +42,8 @@ export default function IntermediaryMessagesDialog({ messages, onClose }: Interm
                 label={isUser ? 'You' : 'Claude'}
                 className={`max-w-[85%] rounded-lg pl-4 pr-2 py-2 border ${
                   isUser
-                    ? 'bg-blue-900 text-white border-blue-700'
-                    : 'bg-muted text-foreground border-border'
+                    ? 'bg-bubble-user text-bubble-user-foreground border-bubble-user-border'
+                    : 'bg-elevated text-foreground border-border'
                 }`}
                 rawContent={msg.content}
                 isMarkdown

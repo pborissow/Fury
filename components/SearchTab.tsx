@@ -564,7 +564,7 @@ export default function SearchTab({ isActive, onOpenSession, initialPrefs, onPre
                 <div className="px-4 py-2.5 bg-muted/60 flex items-baseline gap-2 min-w-0">
                   <span className="text-sm font-semibold truncate shrink-0 max-w-[60%]">{s.display}</span>
                   {isLive && (
-                    <span className="shrink-0 text-[10px] text-green-500 flex items-center gap-1 self-center">
+                    <span className="shrink-0 text-[10px] text-green-700 dark:text-green-500 flex items-center gap-1 self-center">
                       <span className="h-1.5 w-1.5 rounded-full bg-green-500 inline-block" /> Live
                     </span>
                   )}

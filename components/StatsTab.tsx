@@ -669,7 +669,7 @@ export default function StatsTab({ isActive, onOpenSession, initialPrefs, onPref
         {error && <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>}
         {data?.unpriced.events ? (
           <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-xs text-muted-foreground">
-            <TriangleAlert className="h-3.5 w-3.5 text-amber-500" />
+            <TriangleAlert className="h-3.5 w-3.5 text-amber-700 dark:text-amber-500" />
             {formatTokens(data.unpriced.tokens)} from {data.unpriced.events} events use a model with no pricing entry — excluded from cost.
           </div>
         ) : null}

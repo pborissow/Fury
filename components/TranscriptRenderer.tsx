@@ -211,7 +211,7 @@ export default function TranscriptRenderer({
               )}
               <ChatBubble
                 label="You"
-                className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-blue-900 text-white border-blue-700"
+                className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-bubble-user text-bubble-user-foreground border-bubble-user-border"
                 rawContent={turn.user.content}
                 isMarkdown
                 // A text-less question turn has no Claude bubble to carry the chip;
@@ -237,7 +237,7 @@ export default function TranscriptRenderer({
             <div className="flex justify-start" data-testid="claude-turn" data-msg-index={turn.assistantIndex ?? undefined} ref={i === lastAssistantTurnIndex ? lastAssistantRef : undefined}>
               <ChatBubble
                 label="Claude"
-                className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-muted text-foreground border-border transition-colors"
+                className="max-w-[85%] rounded-lg pl-4 pr-2 py-2 border bg-elevated text-foreground border-border transition-colors"
                 rawContent={turn.assistant.content}
                 isMarkdown
                 headerExtra={<>

@@ -103,7 +103,7 @@ const ConversationPane = forwardRef<HTMLDivElement, ConversationPaneProps>(funct
               {activity.awaitingAnswer ? (
                 <div
                   data-testid="awaiting-answer"
-                  className="max-w-[80%] rounded-lg px-4 py-2 bg-muted text-foreground border border-border text-left"
+                  className="max-w-[80%] rounded-lg px-4 py-2 bg-elevated text-foreground border border-border text-left"
                 >
                   <div className="text-xs opacity-70 mb-1">Claude</div>
                   <div className="text-sm">Waiting for your answer…</div>
@@ -117,7 +117,7 @@ const ConversationPane = forwardRef<HTMLDivElement, ConversationPaneProps>(funct
                   // otherwise it keeps the legacy behavior (live
                   // stream panel).
                   onClick={activity.onOpen}
-                  className="max-w-[80%] rounded-lg pl-4 pr-2 py-2 bg-muted text-foreground border border-border cursor-pointer hover:border-ring transition-colors text-left"
+                  className="max-w-[80%] rounded-lg pl-4 pr-2 py-2 bg-elevated text-foreground border border-border cursor-pointer hover:border-ring transition-colors text-left"
                   title={activity.envelopeCount > 0 ? 'View progress updates' : 'View live stream'}
                 >
                   <div className="text-xs mb-1 flex items-center gap-2">
@@ -205,8 +205,10 @@ const ConversationPane = forwardRef<HTMLDivElement, ConversationPaneProps>(funct
           )}
         </>
       ) : (
-        <div className="h-full flex flex-col items-center justify-center text-center px-8">
+        <div className="h-full flex flex-col items-center text-center px-8 pt-[12vh]">
           <div className="text-muted-foreground space-y-4">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/fury-mark.svg" alt="" className="h-44 w-44 mx-auto select-none" draggable={false} />
             <h2 className="text-xl font-semibold text-foreground">Welcome to Fury</h2>
             <p className="text-sm max-w-md">
               Select a session from the list to view its conversation, or create a new session to start chatting with Claude.

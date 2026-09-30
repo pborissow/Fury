@@ -97,7 +97,7 @@ export default function ModelFamilyRows({
                 <div className="text-sm font-medium flex items-center gap-2">
                   {fam.displayName}
                   {isActive && (
-                    <span className="text-[10px] font-semibold uppercase tracking-wider text-green-400 bg-green-950/60 border border-green-700/50 rounded px-1.5 py-0.5">
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-green-700 dark:text-green-400 bg-green-950/60 border border-green-700/50 rounded px-1.5 py-0.5">
                       active
                     </span>
                   )}

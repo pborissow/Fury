@@ -259,8 +259,8 @@ export function DiffView({ rows }: { rows: DiffRow[] }) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   // Dark canvas matches the global .hljs background override (globals.css)
-  const CANVAS_BG = isDark ? '#171717' : '#ffffff';
-  const GUTTER_BG = isDark ? '#171717' : '#f6f8fa';
+  const CANVAS_BG = 'var(--code-bg)';
+  const GUTTER_BG = isDark ? 'var(--code-bg)' : '#ececea';
 
   const ROW_BG: Record<string, string> = {
     removed: isDark ? 'rgb(56 36 39)' : '#fce8e8',
@@ -327,7 +327,7 @@ export function DiffView({ rows }: { rows: DiffRow[] }) {
           {rows.map((row, i) => (
             <div key={i} className="leading-5 flex items-center justify-end" style={{ backgroundColor: ROW_BG[row.rightType] }}>
               <span>{row.rightNum ?? ' '}</span>
-              <span className={`w-3 text-center ${row.rightType === 'added' ? 'text-green-400/90' : ''}`}>
+              <span className={`w-3 text-center ${row.rightType === 'added' ? 'text-green-700 dark:text-green-400/90' : ''}`}>
                 {row.rightType === 'added' ? '+' : ' '}
               </span>
             </div>

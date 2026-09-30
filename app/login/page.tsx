@@ -60,8 +60,17 @@ export default function LoginPage() {
   return (
     <div className="h-screen w-screen bg-background flex items-center justify-center">
       <div className="w-full max-w-sm border border-border rounded-lg p-6 bg-card shadow-lg">
-        <h1 className="text-lg font-semibold text-foreground mb-1">Fury</h1>
-        <p className="text-sm text-muted-foreground mb-6">Sign in to continue</p>
+        <div className="flex flex-col items-center mb-6 select-none">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/fury-mark.svg" alt="" className="h-28 w-28 mb-1" draggable={false} />
+          <h1
+            className="text-4xl leading-none text-foreground"
+            style={{ fontFamily: 'var(--font-kaushan)' }}
+          >
+            Fury
+          </h1>
+          <p className="text-sm text-muted-foreground mt-3">Sign in to continue</p>
+        </div>
 
         <div className="space-y-3">
           <Input

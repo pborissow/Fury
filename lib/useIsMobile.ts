@@ -49,6 +49,14 @@ export function useMediaQuery(query: string): boolean {
   );
 }
 
+/** Launched from an install (Chrome/Edge app window, Android/iOS home screen)
+ *  rather than a browser tab. The OS window then carries the app's icon and
+ *  name, so page.tsx drops its own header. */
+export const PWA_QUERY = '(display-mode: standalone), (display-mode: window-controls-overlay), (display-mode: minimal-ui)';
+export function useIsPwa(): boolean {
+  return useMediaQuery(PWA_QUERY);
+}
+
 /**
  * Whether the phone layout applies.
  *

@@ -80,7 +80,7 @@ export default function StreamEventsPanel({
           return (
             <div key={i} data-testid="stream-event" className="px-3 py-1.5 border-b border-border/50 flex items-center gap-2">
               {transcriptLoading ? (
-                <span className="text-yellow-500 animate-pulse">{'▶'}</span>
+                <span className="text-amber-700 dark:text-yellow-500 animate-pulse">{'▶'}</span>
               ) : (
                 <span className="text-muted-foreground">{'▶'}</span>
               )}
@@ -113,7 +113,7 @@ export default function StreamEventsPanel({
           return (
             <div key={i} data-testid="stream-event" className="px-3 py-1.5 border-b border-border/50">
               <div className="flex items-center gap-2">
-                <span className="text-green-500">{'✓'}</span>
+                <span className="text-green-700 dark:text-green-500">{'✓'}</span>
                 <span className="text-primary font-semibold">{evt.name}</span>
                 {detail && (
                   <span className="text-muted-foreground truncate">{detail}</span>
@@ -129,7 +129,7 @@ export default function StreamEventsPanel({
                   <div className="bg-red-500/10 text-red-400 px-2 py-0.5 rounded whitespace-pre-wrap max-h-24 overflow-y-auto">
                     {input.old_string.length > 300 ? input.old_string.substring(0, 300) + '...' : input.old_string}
                   </div>
-                  <div className="bg-green-500/10 text-green-400 px-2 py-0.5 rounded whitespace-pre-wrap max-h-24 overflow-y-auto">
+                  <div className="bg-green-500/10 text-green-700 dark:text-green-400 px-2 py-0.5 rounded whitespace-pre-wrap max-h-24 overflow-y-auto">
                     {input.new_string.length > 300 ? input.new_string.substring(0, 300) + '...' : input.new_string}
                   </div>
                 </div>

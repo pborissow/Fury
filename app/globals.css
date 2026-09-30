@@ -1,13 +1,11 @@
 @import "tailwindcss";
 @import "tw-animate-css";
-@import "highlight.js/styles/github-dark.css";
+@import "./hljs-themes.css"; /* github light / github-dark, scoped per theme (generated) */
 
-/* Override the github-dark theme's blue-black background (#0d1117) with a
-   neutral near-black across all highlighted code (code viewer, diff view,
-   markdown code blocks). Keep in sync with DiffView's CANVAS_BG and the
-   .prose-chat pre fallback below. */
+/* Code surfaces (code viewer, diff view, markdown code blocks) share one
+   background token per theme instead of the highlight.js theme's own. */
 .hljs {
-  background: #171717;
+  background: var(--code-bg);
 }
 
 @custom-variant dark (&:is(.dark *));
@@ -48,6 +46,11 @@
   --color-card: var(--card);
   --color-highlight: var(--highlight);
   --color-highlight-foreground: var(--highlight-foreground);
+  --color-elevated: var(--elevated);
+  --color-titlebar: var(--titlebar);
+  --color-bubble-user: var(--bubble-user);
+  --color-bubble-user-foreground: var(--bubble-user-foreground);
+  --color-bubble-user-border: var(--bubble-user-border);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -55,38 +58,51 @@
 }
 
 :root {
+  /* Light = "paper" (design/themes/cursor.png): an off-white paper canvas for the
+     panels, slightly darker chrome around them, and cards that sit LIGHTER than
+     the paper with barely-there borders. Blue primary instead of black. */
   --radius: 0.625rem;
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
+  --background: oklch(0.935 0 0);                 /* chrome: tab bar, gutters */
+  --foreground: oklch(0.2 0 0);
+  --card: oklch(0.97 0.002 80);                   /* paper: header, panes */
+  --card-foreground: oklch(0.2 0 0);
+  --popover: oklch(0.99 0 0);
+  --popover-foreground: oklch(0.2 0 0);
+  --elevated: oklch(0.99 0 0);                    /* composer, bubbles: lifted OFF the paper */
+  --titlebar: oklch(0.93 0.002 200);              /* dialog title bars */
+  --dialog-shadow: 0 8px 40px rgba(0, 0, 0, 0.22), 0 2px 12px rgba(0, 0, 0, 0.12);
+  --code-bg: oklch(0.955 0.003 80);               /* code blocks: a shade below the paper */
+  --code-border: oklch(0.88 0.003 80);
+  --code-inline-bg: oklch(0.92 0.004 80);         /* inline chips */
+  --code-inline-foreground: oklch(0.3 0.02 300);
+  --primary: oklch(0.55 0.16 255);                /* blue: pills, underline, selection */
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.93 0.002 80);
+  --secondary-foreground: oklch(0.2 0 0);
+  --muted: #edece8;                               /* session cards, result rows, chips: set INTO the paper */
+  --muted-foreground: oklch(0.5 0 0);
+  --accent: oklch(0.92 0.002 80);                 /* hover surfaces */
+  --accent-foreground: oklch(0.2 0 0);
   --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  --border: oklch(0.9 0.002 80);
+  --input: oklch(0.88 0.002 80);
+  --ring: oklch(0.7 0 0);
+  --bubble-user: oklch(0.955 0.02 255);           /* pale blue card */
+  --bubble-user-foreground: oklch(0.25 0.05 260);
+  --bubble-user-border: oklch(0.88 0.04 255);
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
   --chart-4: oklch(0.828 0.189 84.429);
   --chart-5: oklch(0.769 0.188 70.08);
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --sidebar: oklch(0.93 0.002 200);
+  --sidebar-foreground: oklch(0.2 0 0);
+  --sidebar-primary: oklch(0.55 0.16 255);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.92 0.002 80);
+  --sidebar-accent-foreground: oklch(0.2 0 0);
+  --sidebar-border: oklch(0.9 0.002 80);
+  --sidebar-ring: oklch(0.7 0 0);
   /* Search-match highlight — amber, the one hue not already spoken for
      (blue = user, green = live). Soft amber wash + dark amber text. */
   --highlight: oklch(0.924 0.12 95.746 / 65%);
@@ -125,6 +141,16 @@
   --sidebar-accent-foreground: oklch(0.985 0 0);
   --sidebar-border: oklch(1 0 0 / 10%);
   --sidebar-ring: oklch(0.556 0 0);
+  --elevated: oklch(0.205 0 0);
+  --titlebar: #313131;
+  --dialog-shadow: 0 8px 40px rgba(0, 0, 0, 0.8), 0 2px 12px rgba(0, 0, 0, 0.6);
+  --code-bg: #171717;
+  --code-border: oklch(1 0 0 / 10%);
+  --code-inline-bg: var(--muted);
+  --code-inline-foreground: var(--muted-foreground);
+  --bubble-user: #1e3a8a;                           /* tailwind blue-900 */
+  --bubble-user-foreground: #ffffff;
+  --bubble-user-border: #1d4ed8;                    /* blue-700 */
   /* Search-match highlight (dark): translucent amber wash + bright amber text. */
   --highlight: oklch(0.828 0.189 84.429 / 18%);
   --highlight-foreground: oklch(0.879 0.169 91.605);
@@ -347,37 +373,48 @@
 
 /* Fallback background for code blocks that highlight.js doesn't detect.
    Outside @layer so it overrides Tailwind Preflight. When highlight.js does
-   apply .hljs, the overridden theme background (#171717, see top of file)
+   apply .hljs, the overridden theme background (--code-bg, see top of file)
    wins on the inner code element. */
 .prose-chat pre {
-  background: #171717;
-  border: 1px solid oklch(1 0 0 / 10%);
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
 }
 
-/* Blue-themed code blocks for user bubbles (prose-invert context) */
-.prose-chat.prose-invert code {
+/* Inline code chips. Unlayered and more specific than .hljs, which the
+   markdown preview adds to inline code too. */
+.prose-chat :not(pre) > code {
+  background-color: var(--code-inline-bg);
+  color: var(--code-inline-foreground);
+}
+
+/* Blue-themed code blocks and tables inside user bubbles (prose-invert context).
+   Dark: navy set on the blue-900 bubble. Light: pale-blue set on the paper card. */
+.dark .prose-chat.prose-invert code {
   background-color: rgba(147, 197, 253, 0.15);
   color: #bfdbfe;
 }
-
-.prose-chat.prose-invert pre {
+.dark .prose-chat.prose-invert pre {
   background: #172554;
   border-color: rgba(147, 197, 253, 0.2);
 }
+.dark .prose-chat.prose-invert th { background-color: #576eb1; }
+.dark .prose-chat.prose-invert td { background-color: #162c78; }
 
+.prose-chat.prose-invert code {
+  background-color: rgba(59, 130, 246, 0.12);
+  color: #1e3a8a;
+}
+.prose-chat.prose-invert pre {
+  background: #e3ecf9;
+  border-color: rgba(59, 130, 246, 0.25);
+  color: #1e293b;
+}
 .prose-chat.prose-invert pre code {
   background-color: transparent;
   color: inherit;
 }
-
-/* Blue-themed table cells for user bubbles */
-.prose-chat.prose-invert th {
-  background-color: #576eb1;
-}
-
-.prose-chat.prose-invert td {
-  background-color: #162c78;
-}
+.prose-chat.prose-invert th { background-color: #c7d7f2; }
+.prose-chat.prose-invert td { background-color: #e6eefb; }
 
 /* TipTap editor — restore list styles stripped by Tailwind Preflight */
 .tiptap ul,
@@ -415,8 +452,8 @@
    Scoped to inline code only so code blocks (pre > code) keep their own styling.
    (styling for typed inline code in the composer) */
 .tiptap :not(pre) > code {
-  background-color: var(--muted);
-  color: var(--muted-foreground);
+  background-color: var(--code-inline-bg);
+  color: var(--code-inline-foreground);
   border-radius: 0.25rem;
   padding: 0.125rem 0.25rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;

@@ -77,7 +77,7 @@ const ChatBubble = ({ label, children, headerExtra, className, rawContent, isMar
           title="Copy to clipboard (Ctrl+Click for HTML)"
         >
           {copied ? (
-            <Check className="h-3.5 w-3.5 text-green-500" />
+            <Check className="h-3.5 w-3.5 text-green-700 dark:text-green-500" />
           ) : (
             <Copy className="h-3.5 w-3.5 opacity-70" />
           )}

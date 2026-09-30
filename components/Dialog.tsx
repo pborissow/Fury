@@ -302,14 +302,13 @@ export default function Dialog({
               width: size.width, height: size.height,
               maxWidth: contained ? '100%' : (maximized ? '100vw' : '95vw'),
               maxHeight: contained ? '100%' : (maximized ? '100vh' : '95vh'),
-              boxShadow: '0 8px 40px rgba(0, 0, 0, 0.8), 0 2px 12px rgba(0, 0, 0, 0.6)',
+              boxShadow: 'var(--dialog-shadow)',
             }}
           >
             {/* Draggable header (fixed while maximized) */}
             <div
               data-dialog-header
-              className={`flex items-center gap-2 px-4 py-3 border-b border-border shrink-0 select-none${maximized ? '' : ' cursor-grab active:cursor-grabbing'}`}
-              style={{ backgroundColor: '#313131' }}
+              className={`bg-titlebar flex items-center gap-2 px-4 py-3 border-b border-border shrink-0 select-none${maximized ? '' : ' cursor-grab active:cursor-grabbing'}`}
               onPointerDown={handleDragStart}
               onPointerMove={handleDragMove}
               onPointerUp={handleDragEnd}

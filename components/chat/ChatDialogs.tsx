@@ -199,7 +199,7 @@ export default function ChatDialogs({
         message={<>
           {archive.request?.isLive && (
             <>
-              <span className="text-yellow-500 font-semibold">This session is currently live.</span> The running process will be terminated.
+              <span className="text-amber-700 dark:text-yellow-500 font-semibold">This session is currently live.</span> The running process will be terminated.
               <br /><br />
             </>
           )}

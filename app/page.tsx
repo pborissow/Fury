@@ -4,12 +4,13 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import ChatTab, { type MobileChatStatus } from '@/components/ChatTab';
 import MobileHeader from '@/components/chat/MobileHeader';
+import ThemeToggle from '@/components/ThemeToggle';
 import type { MobilePane } from '@/components/chat/MobileChatLayout';
-import { useIsMobileSsr } from '@/lib/useIsMobile';
+import { useIsMobileSsr, useIsPwa } from '@/lib/useIsMobile';
 import CanvasTab from '@/components/CanvasTab';
 import StatsTab, { type StatsPrefs } from '@/components/StatsTab';
 import SearchTab, { type SearchPrefs } from '@/components/SearchTab';
-import { Sun, Moon, EllipsisVertical, CircleUserRound, LogOut } from 'lucide-react';
+import { EllipsisVertical, CircleUserRound, LogOut } from 'lucide-react';
 import Dialog from '@/components/Dialog';
 import SettingsPanel, { type ServiceSettings } from '@/components/SettingsPanel';
 
@@ -160,6 +161,9 @@ export default function Home() {
   // Phone layout (docs/ticket-mobile-pwa.md). The server renders desktop; a
   // phone switches right after hydration.
   const isMobile = useIsMobileSsr();
+  // Installed PWA: no desktop header (the OS window shows the icon and name);
+  // the user / theme / settings buttons move to the tab bar instead.
+  const isPwa = useIsPwa();
   // The Chat carousel's pane. Lifted here because the header (indicator) and
   // ChatTab (carousel) both need it. In memory only — never /api/ui-state,
   // which is server-wide and shared with desktop. Sessions on every load.
@@ -368,7 +372,46 @@ export default function Home() {
     } else {
       document.documentElement.classList.remove('dark');
     }
+    // Installed-PWA title bar / Android status bar follow this tag (layout.tsx sets the default).
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#0a0a0a' : '#ffffff');
   }, [theme]);
+
+  // User menu, theme toggle, settings: in the header (browser tab) or the tab bar (installed PWA).
+  const toolbarActions = (
+    <>
+    {loggedInUser && (
+      <div className="relative" ref={userMenuRef}>
+        <Button
+          variant="ghost"
+          size="sm"
+          title={loggedInUser}
+          className="h-8 w-8 p-0"
+          onClick={() => setUserMenuOpen(!userMenuOpen)}
+        >
+          <CircleUserRound className="h-4 w-4" />
+        </Button>
+        {userMenuOpen && (
+          <div className="absolute right-0 top-full mt-1 w-48 rounded-md border border-border bg-card shadow-lg z-50">
+            <div className="px-3 py-2 border-b border-border">
+              <div className="text-sm font-medium truncate">{loggedInUser}</div>
+            </div>
+            <button
+              onClick={handleLogout}
+              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              Sign out
+            </button>
+          </div>
+        )}
+      </div>
+    )}
+    <ThemeToggle theme={theme} onToggle={() => setTheme(theme === 'dark' ? 'light' : 'dark')} />
+    <Button variant="ghost" size="sm" title="Settings" className="h-8 w-8 p-0" onClick={() => setSettingsOpen(true)}>
+      <EllipsisVertical className="h-4 w-4" />
+    </Button>
+    </>
+  );
 
   return (
     <div className={isMobile ? 'mobile-shell w-full bg-background flex flex-col' : 'h-dvh w-screen bg-background flex flex-col'}>
@@ -402,59 +445,30 @@ export default function Home() {
           user={loggedInUser}
           onSignOut={handleLogout}
         />
-      ) : (
-      <>
-      {/* Toolbar */}
-      <div className="bg-card border-b border-border px-4 py-2 flex items-center justify-end gap-3">
-        {loggedInUser && (
-          <div className="relative" ref={userMenuRef}>
-            <Button
-              variant="ghost"
-              size="sm"
-              title={loggedInUser}
-              className="h-8 w-8 p-0"
-              onClick={() => setUserMenuOpen(!userMenuOpen)}
-            >
-              <CircleUserRound className="h-4 w-4" />
-            </Button>
-            {userMenuOpen && (
-              <div className="absolute right-0 top-full mt-1 w-48 rounded-md border border-border bg-card shadow-lg z-50">
-                <div className="px-3 py-2 border-b border-border">
-                  <div className="text-sm font-medium truncate">{loggedInUser}</div>
-                </div>
-                <button
-                  onClick={handleLogout}
-                  className="w-full flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-                >
-                  <LogOut className="h-3.5 w-3.5" />
-                  Sign out
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-          title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`}
-          className="h-8 w-8 p-0"
-        >
-          {theme === 'dark' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-        </Button>
-        <Button variant="ghost" size="sm" title="Settings" className="h-8 w-8 p-0" onClick={() => setSettingsOpen(true)}>
-          <EllipsisVertical className="h-4 w-4" />
-        </Button>
+      ) : !isPwa && (
+      /* Toolbar (browser tab only). Always the dark palette — the `dark` class scopes every token
+         inside to the dark set — so the logo sits on the black it was drawn for in both themes. */
+      <div className="dark bg-card text-foreground border-b border-border h-[54px] px-4 flex items-center justify-end gap-3">
+        {/* Brand */}
+        <div className="mr-auto flex items-center gap-2 select-none">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/fury-mark-xs.svg" alt="" className="h-12 w-12 -ml-[9px]" draggable={false} />
+          <span
+            className="text-[22px] leading-none text-muted-foreground relative -top-px"
+            style={{ fontFamily: 'var(--font-kaushan)' }}
+          >
+            Fury
+          </span>
+        </div>
+        {toolbarActions}
       </div>
-
-      </>
       )}
 
       {/* Main Content with Tabs */}
       <div className="flex-1 overflow-hidden flex flex-col">
         {/* Primary Tabs (desktop; the phone header's drawer replaces them) */}
         {!isMobile && (
-        <div className="border-b border-border px-4 flex items-center gap-6">
+        <div className={`border-b border-border px-4 flex items-center gap-6 ${isPwa ? 'bg-card' : ''}`}>
           <button
             onClick={() => setActiveTab('chat')}
             className={`relative py-3 text-sm font-medium transition-colors ${
@@ -499,9 +513,10 @@ export default function Home() {
               <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-primary rounded-full" />
             )}
           </button>
+          {/* With the header hidden (installed PWA) the actions live here instead */}
+          {isPwa && <div className="ml-auto flex items-center gap-3">{toolbarActions}</div>}
         </div>
         )}
-
         {/* Tab Content — lazy mount, then CSS hide to preserve state */}
         <div className="flex-1 overflow-hidden relative">
           {layoutsLoaded && mountedTabs.has('chat') && (

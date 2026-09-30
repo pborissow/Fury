@@ -220,7 +220,7 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
     >
       {/* Markdown view tabs */}
       {isMd && !showDiff && (
-        <div className="border-b border-border px-4 flex items-center gap-6 shrink-0" style={{ backgroundColor: '#1e1e1e' }}>
+        <div className="border-b border-border px-4 flex items-center gap-6 shrink-0 bg-card">
           <button
             onClick={() => setMdView('preview')}
             className={`
@@ -270,7 +270,7 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
         )}
 
         {content !== null && !loading && !showDiff && isMd && mdView === 'preview' && (
-          <div className="p-6 prose-chat text-foreground max-w-none overflow-auto h-full" style={{ backgroundColor: '#1b1b1b' }}>
+          <div className="p-6 prose-chat text-foreground max-w-none overflow-auto h-full bg-card">
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               rehypePlugins={[rehypeHighlight]}
@@ -292,9 +292,9 @@ export default React.memo(function CodeViewerDialog({ filePath, onClose }: CodeV
         {content !== null && !loading && !showDiff && (!isMd || mdView === 'raw') && (
           // Metrics kept in sync with the shared DiffView (text-xs / leading-5 /
           // py-3) so the plain view and diff view read as one surface.
-          <div className="flex text-xs font-mono min-h-full" style={{ backgroundColor: '#171717' }}>
+          <div className="flex text-xs font-mono min-h-full" style={{ backgroundColor: 'var(--code-bg)' }}>
             {/* Line numbers */}
-            <div className="select-none shrink-0 py-3 pl-3 pr-2.5 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0" style={{ backgroundColor: '#171717' }}>
+            <div className="select-none shrink-0 py-3 pl-3 pr-2.5 text-right text-muted-foreground/50 border-r border-border/50 sticky left-0" style={{ backgroundColor: 'var(--code-bg)' }}>
               {lines.map((_, i) => (
                 <div key={i} className="leading-5">{i + 1}</div>
               ))}

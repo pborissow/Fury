@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Geist, Geist_Mono, Kaushan_Script } from "next/font/google";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -12,9 +12,23 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+// Brush script for the "Fury" wordmark in the header
+const kaushan = Kaushan_Script({
+  variable: "--font-kaushan",
+  weight: "400",
+  subsets: ["latin"],
+});
+
 export const metadata: Metadata = {
   title: "Fury IDE",
   description: "A powerful IDE for AI-assisted development",
+  // iOS "Add to Home Screen": run standalone, let the shell draw under the status bar
+  // (app/manifest.ts covers Android/desktop; app/apple-icon.png is linked automatically).
+  appleWebApp: {
+    capable: true,
+    title: "Fury",
+    statusBarStyle: "black-translucent",
+  },
 };
 
 // Phones (docs/ticket-mobile-pwa.md §5.5). viewport-fit=cover lets the app draw
@@ -27,10 +41,10 @@ export const viewport: Viewport = {
   initialScale: 1,
   viewportFit: "cover",
   interactiveWidget: "resizes-content",
-  themeColor: [
-    { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" },
-    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
-  ],
+  // A single tag, NOT keyed to prefers-color-scheme: the app's theme is its own
+  // state (page.tsx), which updates this tag when it changes. Two media-keyed
+  // tags made the installed PWA's title bar follow the OS theme instead.
+  themeColor: "#0a0a0a",
 };
 
 export default function RootLayout({
@@ -41,7 +55,7 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
+        className={`${geistSans.variable} ${geistMono.variable} ${kaushan.variable} antialiased`}
       >
         {children}
       </body>

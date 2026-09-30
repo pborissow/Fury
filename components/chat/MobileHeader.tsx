@@ -118,7 +118,11 @@ export default function MobileHeader({
             style={{ paddingLeft: 'env(safe-area-inset-left)', paddingBottom: 'env(safe-area-inset-bottom)' }}
           >
             <div className="h-12 flex items-center justify-between pl-4 pr-1 border-b border-border">
-              <span className="font-semibold">Fury</span>
+              <span className="flex items-center gap-2 select-none">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src="/fury-mark-xs.svg" alt="" className="h-7 w-7" draggable={false} />
+                <span className="text-xl leading-none" style={{ fontFamily: 'var(--font-kaushan)' }}>Fury</span>
+              </span>
               <button
                 type="button"
                 aria-label="Close menu"

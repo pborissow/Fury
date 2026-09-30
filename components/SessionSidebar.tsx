@@ -210,7 +210,7 @@ export default function SessionSidebar({
                     </div>
                   )}
                   {isLive && (
-                    <span className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-green-400 bg-green-950/60 border border-green-700/50 rounded px-1.5 py-0.5">
+                    <span className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-green-700 bg-green-100 border border-green-300 dark:text-green-400 dark:bg-green-950/60 dark:border-green-700/50 rounded px-1.5 py-0.5">
                       <span className="relative flex h-1.5 w-1.5">
                         <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
                         <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-400"></span>
@@ -236,7 +236,7 @@ export default function SessionSidebar({
                         {', '}
                         <AnimatedTokenCount value={contextTokens} format={formatContext} />
                         {contextWindow > 0 && (
-                          <span className={contextHigh ? 'text-yellow-500' : undefined}>
+                          <span className={contextHigh ? 'text-amber-700 dark:text-yellow-500' : undefined}>
                             {' '}({Math.round(fill * 100)}%)
                           </span>
                         )}
@@ -262,7 +262,7 @@ export default function SessionSidebar({
                         `earlier detail may be lost. Start a new session if you need it.`
                       }
                     >
-                      <ShieldAlert className="h-3 w-3 text-orange-500" />
+                      <ShieldAlert className="h-3 w-3 text-orange-700 dark:text-orange-500" />
                     </span>
                   )}
                   {contextHigh && (
@@ -272,7 +272,7 @@ export default function SessionSidebar({
                         `losing detail when it is auto-summarised.`
                       }
                     >
-                      <AlertTriangle className="h-3 w-3 text-yellow-500" />
+                      <AlertTriangle className="h-3 w-3 text-amber-700 dark:text-yellow-500" />
                     </span>
                   )}
                 </div>

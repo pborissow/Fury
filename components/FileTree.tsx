@@ -15,12 +15,12 @@ export type VcsFileStatus = 'M' | 'A' | 'D' | 'R' | '?' | 'C' | '!';
 type VcsStatusMap = Record<string, VcsFileStatus>;
 
 export const VCS_STATUS_COLORS: Record<VcsFileStatus, string> = {
-  'M': 'text-yellow-500',
-  'A': 'text-green-500',
+  'M': 'text-amber-700 dark:text-yellow-500',
+  'A': 'text-green-700 dark:text-green-500',
   'D': 'text-red-500',
   'R': 'text-blue-500',
-  '?': 'text-green-500',
-  'C': 'text-orange-500',
+  '?': 'text-green-700 dark:text-green-500',
+  'C': 'text-orange-700 dark:text-orange-500',
   '!': 'text-red-500',
 };
 
@@ -102,7 +102,7 @@ function FileTreeItem({ node, depth, ctx }: FileTreeItemProps) {
             {isLoading ? (
               <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
             ) : (
-              <Folder className={`h-4 w-4 ${dirHasChanges ? 'text-yellow-500' : 'text-blue-500'}`} />
+              <Folder className={`h-4 w-4 ${dirHasChanges ? 'text-amber-700 dark:text-yellow-500' : 'text-blue-500'}`} />
             )}
           </>
         ) : (
