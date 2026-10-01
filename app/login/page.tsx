@@ -31,7 +31,12 @@ export default function LoginPage() {
   }, []);
 
   const handleLogin = () => {
-    if (!username.trim() || !password.trim()) return;
+    // Trim both fields: a stray leading/trailing space (autocorrect, paste,
+    // mobile keyboards) would otherwise fail auth. Credentials are trimmed
+    // on save too (SettingsPanel + /api/settings), so these always match.
+    const user = username.trim();
+    const pass = password.trim();
+    if (!user || !pass) return;
     setError('');
     setLoading(true);
 
@@ -40,7 +45,7 @@ export default function LoginPage() {
     // 401 + WWW-Authenticate challenge, the browser retries with credentials
     // from xhr.open(), and on success credentials are cached site-wide.
     const xhr = new XMLHttpRequest();
-    xhr.open('GET', '/', true, username, password);
+    xhr.open('GET', '/', true, user, pass);
     xhr.setRequestHeader('Cache-Control', 'no-cache, no-transform');
     xhr.onreadystatechange = () => {
       if (xhr.readyState === 4) {

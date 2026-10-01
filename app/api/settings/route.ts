@@ -68,10 +68,15 @@ export async function POST(request: Request) {
       }
     }
 
+    // Credentials are stored trimmed; the login page trims what it sends.
+    if (typeof updates.authUsername === 'string') {
+      updates.authUsername = updates.authUsername.trim() || null;
+    }
     if (body.authPassword !== undefined) {
-      if (body.authPassword) {
+      const authPassword = typeof body.authPassword === 'string' ? body.authPassword.trim() : '';
+      if (authPassword) {
         const salt = randomBytes(16).toString('hex');
-        const hash = scryptSync(body.authPassword, salt, 64).toString('hex');
+        const hash = scryptSync(authPassword, salt, 64).toString('hex');
         updates.authPasswordHash = `${salt}:${hash}`;
       } else {
         updates.authPasswordHash = null;

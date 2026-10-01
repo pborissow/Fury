@@ -9,6 +9,19 @@ export const config = {
 
 const LOCALHOST_ADDRS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1', 'localhost']);
 
+// Non-sensitive branding/PWA assets requested by /login before the user has
+// credentials (logo <img>, plus the icon/manifest <link>s Next injects from
+// app/layout.tsx metadata, app/icon.svg, app/apple-icon.png, app/manifest.ts).
+// /icons/* (manifest icons) is allowed by prefix below.
+const PUBLIC_ASSETS = new Set([
+  '/fury-mark.svg',
+  '/fury-mark-sm.svg',
+  '/fury-mark-xs.svg',
+  '/icon.svg',
+  '/apple-icon.png',
+  '/manifest.webmanifest',
+]);
+
 export function middleware(request: NextRequest) {
   const settings = settingsPersistence.loadSettingsSync();
 
@@ -37,8 +50,14 @@ export function middleware(request: NextRequest) {
   // External connections allowed with credentials — require BASIC auth
   const pathname = request.nextUrl.pathname;
 
-  // Auth utility endpoints and login page bypass auth
-  if (pathname.startsWith('/api/auth/') || pathname === '/login') {
+  // Auth utility endpoints, the login page, and the public assets the login
+  // page (and root layout metadata) pull in bypass auth
+  if (
+    pathname.startsWith('/api/auth/') ||
+    pathname === '/login' ||
+    PUBLIC_ASSETS.has(pathname) ||
+    pathname.startsWith('/icons/')
+  ) {
     return NextResponse.next();
   }
 
@@ -49,6 +68,17 @@ export function middleware(request: NextRequest) {
     if (accept.includes('text/html')) {
       // Browser page navigation → redirect to login page
       return NextResponse.redirect(new URL('/login', request.url));
+    }
+    // Subresources (<img>, <link rel=manifest|icon>, scripts, fonts, ...) must
+    // never get a WWW-Authenticate challenge — the browser answers it with its
+    // native login dialog on top of whatever page is showing. Only XHR/fetch
+    // (Sec-Fetch-Dest: empty, or absent on older browsers) gets the challenge.
+    const dest = request.headers.get('sec-fetch-dest');
+    if (dest && dest !== 'empty') {
+      return new NextResponse('Unauthorized', {
+        status: 401,
+        headers: { 'Cache-Control': 'no-cache, no-transform' },
+      });
     }
     // XHR/fetch → 401 with WWW-Authenticate so the browser's challenge-response
     // can cache credentials at this path level (critical for root-level caching)

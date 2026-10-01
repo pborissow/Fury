@@ -107,7 +107,7 @@ export default function SettingsPanel({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           authUsername: username.trim(),
-          authPassword: password,
+          authPassword: password.trim(),
           ...(isNewEnable ? { localhostOnly: false } : {}),
         }),
       });
