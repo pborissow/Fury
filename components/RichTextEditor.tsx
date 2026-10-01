@@ -514,7 +514,7 @@ const RichTextEditor = forwardRef<RichTextEditorHandle, RichTextEditorProps>(fun
   );
 
   return (
-    <div className="h-full w-full flex flex-col border border-border rounded bg-elevated focus-within:border-ring transition-colors">
+    <div className="h-full w-full flex flex-col border border-border rounded bg-elevated dark:bg-card focus-within:border-ring transition-colors">
       {/* Toolbar */}
       <div className="border-b border-border p-2 flex gap-1">
         <ToolbarButton
