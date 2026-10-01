@@ -187,7 +187,20 @@ export async function GET(req: NextRequest) {
         }
       }
 
-      const entries = allEntriesFlat.slice(start, start + limit);
+      // Reveal support (`until=<sessionId>`): extend the window so the page
+      // INCLUDES the named session — the sidebar uses this to scroll a session
+      // opened from Search/Stats into view even when it sits several pages
+      // deep. Cheap because the full list is already materialized above; +3
+      // gives the revealed card a little context below it. Unknown session →
+      // behave exactly as without the param.
+      const until = url.searchParams.get('until');
+      let effectiveLimit = limit;
+      if (until) {
+        const idx = allEntriesFlat.findIndex(e => e.sessionId === until);
+        if (idx >= start) effectiveLimit = Math.max(limit, idx - start + 3);
+      }
+
+      const entries = allEntriesFlat.slice(start, start + effectiveLimit);
       const last = entries[entries.length - 1];
       const nextCursor = last ? `${last.timestamp}:${last.cursorId}` : null;
       const hasMore = start + entries.length < total;

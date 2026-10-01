@@ -46,7 +46,7 @@ export function useSessionHistory(isActive: boolean, options: SessionHistoryOpti
   // chatting. To avoid collapsing previously-loaded pages back to the first 25,
   // ask the API for at least as many entries as we already display.
   // Stable: reads only refs and setters.
-  const fetchHistory = useCallback(async (opts?: { append?: boolean }) => {
+  const fetchHistory = useCallback(async (opts?: { append?: boolean; untilSessionId?: string }) => {
     const append = opts?.append === true;
 
     // Append pages by CURSOR, never by offset. The list mutates under us while
@@ -62,9 +62,13 @@ export function useSessionHistory(isActive: boolean, options: SessionHistoryOpti
     const limit = append
       ? HISTORY_PAGE_SIZE
       : Math.max(HISTORY_PAGE_SIZE, historyLengthRef.current);
+    // `until` extends a (non-append) refresh far enough to include the named
+    // session — the deep-link reveal. The server only grows the window when
+    // the session sits beyond `limit`, so when it's already loaded this is an
+    // ordinary refresh.
     const qs = append
       ? `limit=${limit}&cursor=${encodeURIComponent(historyCursorRef.current!)}`
-      : `limit=${limit}`;
+      : `limit=${limit}${opts?.untilSessionId ? `&until=${encodeURIComponent(opts.untilSessionId)}` : ''}`;
 
     if (append) setIsLoadingMoreHistory(true); else setIsLoadingHistory(true);
     try {
@@ -105,6 +109,14 @@ export function useSessionHistory(isActive: boolean, options: SessionHistoryOpti
 
   const loadMoreHistory = useCallback(() => {
     fetchHistory({ append: true });
+  }, [fetchHistory]);
+
+  /** Deep-link reveal (Search/Stats → Chat): make sure the session's entry is
+   *  loaded, extending the list past the current pages if needed. Safe to call
+   *  when it's already loaded — that degenerates to a refresh at the current
+   *  depth, which never shrinks the list (see fetchHistory). */
+  const ensureSessionLoaded = useCallback((sessionId: string) => {
+    return fetchHistory({ untilSessionId: sessionId });
   }, [fetchHistory]);
 
   // Fetch history on mount
@@ -178,6 +190,7 @@ export function useSessionHistory(isActive: boolean, options: SessionHistoryOpti
     isLoadingMoreHistory,
     fetchHistory,
     loadMoreHistory,
+    ensureSessionLoaded,
     liveSessionIds,
     /** Optimistic add on send / removal on a rolled-back send. */
     setLiveSessionIds,

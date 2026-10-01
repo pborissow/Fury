@@ -9,7 +9,7 @@ import type { MobilePane } from '@/components/chat/MobileChatLayout';
 import { useIsMobileSsr, useIsPwa } from '@/lib/useIsMobile';
 import CanvasTab from '@/components/CanvasTab';
 import StatsTab, { type StatsPrefs } from '@/components/StatsTab';
-import SearchTab, { type SearchPrefs } from '@/components/SearchTab';
+import SearchTab, { type SearchPrefs } from '@/components/search/SearchTab';
 import { EllipsisVertical, CircleUserRound, LogOut } from 'lucide-react';
 import Dialog from '@/components/Dialog';
 import SettingsPanel, { type ServiceSettings } from '@/components/SettingsPanel';

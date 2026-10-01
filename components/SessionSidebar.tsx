@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from 'react';
 import { AlertTriangle, ShieldAlert, Pencil, Archive } from 'lucide-react';
+import { scrollIntoViewY } from '@/lib/scrollIntoViewY';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import HistoryTimestamp from '@/components/HistoryTimestamp';
 import type { HistoryEntry, PendingSession } from '@/lib/types';
@@ -32,6 +33,11 @@ interface SessionSidebarProps {
   onLabelEdit: (sessionId: string, currentLabel: string) => void;
   onArchiveConfirm: (entry: { sessionId: string; project: string; display: string; isLive: boolean }) => void;
   onContextMenu: (e: React.MouseEvent, entry: HistoryEntry & { isLive: boolean }) => void;
+  /** Deep-link reveal (a session opened FROM Search/Stats): scroll its card to
+   *  the center of the list once its entry exists. Keyed by the open request's
+   *  nonce so re-opening the same session re-reveals, while ordinary in-sidebar
+   *  clicks (no new nonce) never move the user's scroll position. */
+  reveal?: { sessionId: string; nonce: number } | null;
 }
 
 export default function SessionSidebar({
@@ -51,9 +57,27 @@ export default function SessionSidebar({
   onLabelEdit,
   onArchiveConfirm,
   onContextMenu,
+  reveal,
 }: SessionSidebarProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
+
+  // Scroll the revealed session's card into view. The entry may not be loaded
+  // yet when the request arrives (ChatTab's ensureSessionLoaded extends the
+  // list asynchronously), so this also re-runs as `history` lands and fires
+  // once the card exists. scrollIntoViewY scrolls ONLY this list's own
+  // scroller, so on the phone an off-screen Sessions pane is positioned
+  // without being yanked on screen (same rationale as the transcript anchor).
+  const revealedNonce = useRef(0);
+  useEffect(() => {
+    if (!reveal || reveal.nonce === revealedNonce.current) return;
+    const el = scrollRef.current?.querySelector(
+      `[data-session-id="${CSS.escape(reveal.sessionId)}"]`,
+    );
+    if (!el) return; // not loaded yet — the history dep retries this effect
+    revealedNonce.current = reveal.nonce;
+    scrollIntoViewY(el, { block: 'center', behavior: 'smooth' });
+  }, [reveal, history]);
 
   // Infinite scroll, via a sentinel below the last row.
   //
@@ -149,6 +173,7 @@ export default function SessionSidebar({
           return (
             <div
               key={`history-${index}`}
+              data-session-id={entry.sessionId || undefined}
               className={`group/session relative mb-2 p-3 rounded border transition-colors ${
                 isViewing
                   ? 'bg-primary/10 border-primary'

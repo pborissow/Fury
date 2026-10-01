@@ -99,7 +99,7 @@ export default function ChatTab({
     // so the per-session model can override the model portion once known.
     onProviderStale: (reason) => (reason === 'activate' ? loadProviderStatus() : refreshProviderStatus()),
   });
-  const { history, setHistory, isLoadingHistory, historyHasMore, isLoadingMoreHistory, fetchHistory, loadMoreHistory, liveSessionIds } = sessionHistory;
+  const { history, setHistory, isLoadingHistory, historyHasMore, isLoadingMoreHistory, fetchHistory, loadMoreHistory, ensureSessionLoaded, liveSessionIds } = sessionHistory;
 
   const chatEditorRef = useRef<RichTextEditorHandle>(null);
   // Per-session unsent composer (text + attachments); stash/restore as a pair
@@ -205,9 +205,13 @@ export default function ChatTab({
   // The model picker is an SDK-backend-only affordance — see the status bar.
   const modelPickerAvailable = !!viewingTranscriptId && sdkSessionsEnabled;
 
-  // Open a session requested by another tab (Stats, Search).
+  // Open a session requested by another tab (Stats, Search). Alongside opening
+  // the transcript, make sure the session's SIDEBAR entry is loaded (it may sit
+  // pages beyond the cursor) — the sidebar's `reveal` prop then scrolls it into
+  // view. Fire-and-forget: the reveal is a nicety, the open must not wait.
   useOpenSessionRequest(openSessionRequest, (sessionId, project) => {
     showPane('conversation');
+    void ensureSessionLoaded(sessionId);
     return stream.openSession(sessionId, project);
   });
 
@@ -320,6 +324,7 @@ export default function ChatTab({
       historyHasMore={historyHasMore}
       isLoadingMoreHistory={isLoadingMoreHistory}
       onLoadMoreHistory={loadMoreHistory}
+      reveal={openSessionRequest ? { sessionId: openSessionRequest.sessionId, nonce: openSessionRequest.nonce } : null}
       onSelectSession={(sessionId, project) => { showPane('conversation'); return stream.openSession(sessionId, project); }}
       onRestorePending={(...args) => { showPane('conversation'); return stream.restorePending(...args); }}
       onLabelEdit={(sessionId, currentLabel) => setLabelEdit({ sessionId, currentLabel })}
