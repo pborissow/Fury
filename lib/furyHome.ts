@@ -19,6 +19,7 @@
  *   state/ui-state.json             UI layout/view state
  *   state/prompts/                  prompt templates
  *   state/workflows/                saved workflows
+ *   internal/<name>/                stealth-session cwds (lib/stealthSessions.ts)
  *   .migrated                       one-time migration marker
  *
  * Precedence: specific overrides (FURY_DB_PATH, FURY_IMAGES_PATH) beat the
@@ -40,9 +41,9 @@
  * NOT live here — Fury interoperates with those in place.
  */
 
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
 import { homedir } from 'os';
-import { join } from 'path';
+import { join, resolve, sep } from 'path';
 
 /** Root of Fury's data home. */
 export function furyHome(): string {
@@ -131,4 +132,75 @@ export function furyPromptsDir(): string {
 /** Saved-workflow directory (was $cwd/.claude-workflows). */
 export function furyWorkflowsDir(): string {
   return withLegacyFallback(furyPath('state', 'workflows'), legacyPaths.workflowsDir());
+}
+
+// ---------------------------------------------------------------------------
+// Stealth sessions — the hiding contract (docs/ticket-stealth-sessions.md §2).
+//
+// A stealth session's cwd is `<FURY_HOME>/internal/<name>/`. That path prefix
+// is THE marker every user-facing surface tests (archiver, live set, history,
+// orphan sweep) — no per-surface id lists to keep in sync, and a crashed
+// server's leftovers are re-identifiable from the cwd in their PID file alone.
+// ---------------------------------------------------------------------------
+
+/** Consumer names become a path segment AND a Stats label: keep them boring. */
+const INTERNAL_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+export function isValidInternalName(name: string): boolean {
+  return INTERNAL_NAME_RE.test(name);
+}
+
+/** Root of the reserved subtree: `<FURY_HOME>/internal`. */
+export function furyInternalRoot(): string {
+  return furyPath('internal');
+}
+
+/** The reserved cwd for stealth consumer `name`. Throws on an unsafe name. */
+export function furyInternalPath(name: string): string {
+  if (!isValidInternalName(name)) {
+    throw new Error(`Invalid stealth-session name "${name}" (want ${INTERNAL_NAME_RE})`);
+  }
+  return join(furyInternalRoot(), name);
+}
+
+/** Case-fold where the filesystem usually does (macOS, Windows) so a path that
+ *  differs only in case can't slip past the filter. Over-matching here only
+ *  hides more of Fury's own reserved subtree, so folding is the safe direction. */
+function normForCompare(p: string): string {
+  const abs = resolve(p);
+  return process.platform === 'win32' || process.platform === 'darwin' ? abs.toLowerCase() : abs;
+}
+
+/**
+ * Is `projectPath` inside the reserved internal subtree? Cheap and sync — it is
+ * called per entry on hot paths (PID scan, history listing, archiving).
+ * Null/empty/non-string → false.
+ */
+export function isInternalProject(projectPath: string | null | undefined): boolean {
+  if (typeof projectPath !== 'string' || !projectPath) return false;
+  const root = normForCompare(furyInternalRoot());
+  const p = normForCompare(projectPath);
+  return p === root || p.startsWith(root + sep);
+}
+
+/**
+ * Every comparable form of a path: resolved + case-folded (the form
+ * isInternalProject uses) and, when the path exists, its realpath too (catches
+ * a symlinked FURY_HOME, macOS /var → /private/var, a CLI that canonicalized
+ * the cwd it recorded). For SAFETY checks that must err toward a match.
+ */
+export function pathKeys(p: string): string[] {
+  const keys = new Set([normForCompare(p)]);
+  try { keys.add(normForCompare(realpathSync(p))); } catch { /* missing — lexical key only */ }
+  return [...keys];
+}
+
+/**
+ * Is `child` the same as, or beneath, `parent` under ANY of their comparable
+ * forms? Errs toward true, which is the safe answer when the caller is about
+ * to delete something only if it's NOT in use.
+ */
+export function isSameOrUnderLoose(child: string, parent: string): boolean {
+  const ck = pathKeys(child);
+  return pathKeys(parent).some((pk) => ck.some((c) => c === pk || c.startsWith(pk + sep)));
 }

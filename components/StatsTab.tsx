@@ -30,7 +30,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as echarts from 'echarts';
-import { RefreshCw, TriangleAlert, ShieldAlert, AlertTriangle } from 'lucide-react';
+import { RefreshCw, TriangleAlert, ShieldAlert, AlertTriangle, Bot } from 'lucide-react';
 import { formatTokens } from './AnimatedTokenCount';
 import PricingDialog from './PricingDialog';
 
@@ -50,6 +50,10 @@ interface SessionRow {
   contextWindow: number; peakFill: number;
   numCompactions: number;
   costPerMsg: number; tokensPerMsg: number;
+  /** A background-agent spend roll-up (one Fury stealth consumer for one day,
+   *  titled with its label, e.g. "Search agent"). Not a real session: it has no
+   *  project, doesn't open, and is kept out of the per-session KPIs. */
+  internal?: boolean;
 }
 interface StatsData {
   timezone: string; pricingAsOf: string; generatedAt: number; today: string;
@@ -421,24 +425,39 @@ export default function StatsTab({ isActive, onOpenSession, initialPrefs, onPref
     // session's own rate: a 2-message session at $0.90/msg would otherwise
     // weigh as much as a 300-message one, and the mean would track outliers
     // instead of reality.
-    let msgs = 0;
-    for (const s of sessions) msgs += s.messages;
+    // Background agents (Fury's own hidden sessions) are real spend, so they
+    // stay in the totals above and get their own call-out on the spend tile.
+    // That includes activeDays/perDay: a day with only background spend still
+    // counts, because "per active day" divides TOTAL spend by days — dropping
+    // the day from the denominator while its spend stays in the numerator
+    // would inflate the rate, and dropping both would hide real spend.
+    // They're NOT sessions the user ran, so every per-session figure below
+    // (count, projects, per-message, hot) is computed over user sessions only.
+    let bgCost = 0, bgTokens = 0;
+    const userSessions: SessionRow[] = [];
+    for (const s of sessions) {
+      if (s.internal) { bgCost += s.cost; bgTokens += s.tokens; }
+      else userSessions.push(s);
+    }
+    let msgs = 0, userCost = 0, userTokens = 0;
+    for (const s of userSessions) { msgs += s.messages; userCost += s.cost; userTokens += s.tokens; }
     // "Hot" = the session's peak main-thread prompt crossed HOT_FILL of its
     // window. Only sessions with a KNOWN window can be judged (peakFill is 0
     // when the API couldn't determine a denominator), so they're excluded from
     // both numerator and denominator rather than silently counted as fine.
-    const judgeable = sessions.filter(s => s.contextWindow > 0);
+    const judgeable = userSessions.filter(s => s.contextWindow > 0);
     const hot = judgeable.filter(s => s.peakFill >= HOT_FILL);
-    const compacted = sessions.filter(s => s.numCompactions > 0);
+    const compacted = userSessions.filter(s => s.numCompactions > 0);
     return {
       tokens, cost,
       activeDays: days.size,
       perDay: days.size ? (measure === 'cost' ? cost : tokens) / days.size : 0,
-      sessions: sessions.length,
-      projects: new Set(sessions.map(s => s.projectName || '—')).size,
+      sessions: userSessions.length,
+      projects: new Set(userSessions.map(s => s.projectName || '—')).size,
       messages: msgs,
-      costPerMsg: msgs ? cost / msgs : 0,
-      tokensPerMsg: msgs ? tokens / msgs : 0,
+      costPerMsg: msgs ? userCost / msgs : 0,
+      tokensPerMsg: msgs ? userTokens / msgs : 0,
+      bgCost, bgTokens,
       hot: hot.length,
       judgeable: judgeable.length,
       compacted: compacted.length,
@@ -692,7 +711,10 @@ export default function StatsTab({ isActive, onOpenSession, initialPrefs, onPref
                 hero
                 label="Estimated spend"
                 value={formatUsd(kpi.cost)}
-                sub={range === 'all' ? 'all time' : range.toUpperCase()}
+                sub={
+                  (range === 'all' ? 'all time' : range.toUpperCase()) +
+                  (kpi.bgTokens > 0 ? ` · incl. ${formatUsd(kpi.bgCost)} background agents` : '')
+                }
               />
               <StatTile
                 label="Total tokens"
@@ -796,8 +818,10 @@ export default function StatsTab({ isActive, onOpenSession, initialPrefs, onPref
                       return (
                         <tr
                           key={s.sessionId}
-                          onClick={() => s.project && onOpenSession(s.sessionId, s.project, s.display)}
-                          className="border-b border-border/50 hover:bg-muted/40 cursor-pointer"
+                          onClick={() => !s.internal && s.project && onOpenSession(s.sessionId, s.project, s.display)}
+                          className={`border-b border-border/50 hover:bg-muted/40 ${s.internal ? 'cursor-default' : 'cursor-pointer'}`}
+                          title={s.internal ? `${s.display}: a background agent Fury runs on your behalf. Its sessions stay out of your session list, but its spend counts toward your totals.` : undefined}
+                          data-internal={s.internal ? 'true' : undefined}
                         >
                           <td className="px-3 py-1.5 text-muted-foreground whitespace-nowrap tabular-nums">{s.day.slice(5)}</td>
                           <td className="px-3 py-1.5 text-foreground whitespace-nowrap max-w-[160px] truncate" title={s.project}>{s.projectName}</td>
@@ -830,6 +854,11 @@ export default function StatsTab({ isActive, onOpenSession, initialPrefs, onPref
                                     style={{ color: fillStatus(s.peakFill, t) }}
                                     aria-label={`Peaked at ${pct(s.peakFill)} of context window`}
                                   />
+                                </span>
+                              )}
+                              {s.internal && (
+                                <span className="shrink-0 inline-flex" title="Background agent">
+                                  <Bot className="h-3 w-3" aria-label="Background agent" />
                                 </span>
                               )}
                               <span className="truncate">{s.display}</span>

@@ -3,6 +3,7 @@ import { appendFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { eventBus } from './eventBus';
+import { isInternalProject } from './furyHome';
 import { killProcessTree } from './killProcessTree';
 import { detectUsageLimit, handleUsageLimitDetected } from './providerSwitch';
 import { scrubSessionFile } from './imageScrubber';
@@ -310,8 +311,9 @@ class SessionManager {
         claude.stdin.end();
 
         // Write history entry immediately so the session appears in the sidebar
-        // right away, not after the process completes.
-        try {
+        // right away, not after the process completes. Never for an internal
+        // (stealth) cwd — history.jsonl is the sidebar.
+        if (!isInternalProject(cwd)) try {
           const historyEntry = JSON.stringify({
             display: prompt.length > 200 ? prompt.substring(0, 200) + '...' : prompt,
             pastedContents: {},

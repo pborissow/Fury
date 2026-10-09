@@ -4,6 +4,7 @@ import { readFile, readdir } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { eventBus } from './eventBus';
+import { isInternalProject } from './furyHome';
 
 const execFileAsync = promisify(execFile);
 
@@ -90,6 +91,10 @@ class LiveSessionScanner {
           const content = await readFile(join(sessionsDir, file), 'utf-8');
           const entry: SessionPidEntry = JSON.parse(content);
 
+          // Stealth sessions (lib/stealthSessions.ts) write a PID file like any
+          // CLI, with cwd = ~/.fury/internal/<name>. Never report them live —
+          // they'd surface as a pill for a session the sidebar can't show.
+          if (isInternalProject(entry.cwd)) continue;
           if (entry.pid && entry.sessionId && await this.isProcessAlive(entry.pid, entry.startedAt)) {
             liveSessionIds.add(entry.sessionId);
           }

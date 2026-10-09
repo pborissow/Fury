@@ -194,6 +194,26 @@ export async function GET(req: Request) {
       }
     }
 
+    // Fury's own stealth sessions (lib/stealthSessions.ts): no sessions row by
+    // design, so they're absent above. Their spend still counts — into the daily
+    // chart, model totals and spend KPI — and surfaces as ONE line item per
+    // (consumer, local day), titled with the agent's human-readable label
+    // ("Search agent") under the "Background agents" project. The underlying
+    // session ids never appear. docs/ticket-stealth-sessions.md §5.
+    const internalRows = await loadInternalUsageRows(db, localDay);
+    for (const r of internalRows) {
+      const dk = r.day + '|' + r.model;
+      const d = daily.get(dk);
+      if (d) {
+        d.input += r.input; d.output += r.output; d.cacheWrite += r.cacheWrite; d.cacheRead += r.cacheRead;
+        d.tokens += r.tokens; d.cost += r.cost;
+      } else {
+        daily.set(dk, { day: r.day, model: r.model, input: r.input, output: r.output, cacheWrite: r.cacheWrite, cacheRead: r.cacheRead, tokens: r.tokens, cost: r.cost });
+      }
+      modelCost.set(r.model, (modelCost.get(r.model) || 0) + r.cost);
+      if (!r.priced) { unpricedEvents++; unpricedTokens += r.tokens; }
+    }
+
     // Stable model ordering by total cost desc → fixed color slots on the client.
     const models = [...modelCost.entries()].sort((a, b) => b[1] - a[1]).map(([m]) => m);
 
@@ -229,7 +249,9 @@ export async function GET(req: Request) {
       tokensPerMsg: s.messages > 0
         ? (s.input + s.output + s.cacheWrite + s.cacheRead) / s.messages
         : 0,
-    })).sort((a, b) => b.lastMs - a.lastMs);
+    }));
+    sessionRows.push(...rollUpInternal(internalRows, localDay));
+    sessionRows.sort((a, b) => b.lastMs - a.lastMs);
 
     return NextResponse.json({
       timezone: tz,
@@ -245,4 +267,110 @@ export async function GET(req: Request) {
     console.error('[Stats API] error:', err);
     return NextResponse.json({ error: 'Failed to compute stats' }, { status: 500 });
   }
+}
+
+/** Project column for stealth-consumer spend rows. */
+const INTERNAL_PROJECT_NAME = 'Background agents';
+/** Reserved sessionId namespace for those roll-up rows (never a real session). */
+const INTERNAL_ID_PREFIX = 'fury-internal:';
+
+interface InternalUsageRow {
+  consumer: string; label: string | null; model: string; day: string; ms: number;
+  input: number; output: number; cacheWrite: number; cacheRead: number;
+  tokens: number; cost: number; priced: boolean;
+}
+
+async function loadInternalUsageRows(
+  db: Awaited<ReturnType<typeof getDb>>,
+  localDay: (ms: number) => string,
+): Promise<InternalUsageRow[]> {
+  let res;
+  try {
+    res = await db.execute(`
+      SELECT consumer, label, model, ts, input, output, cache_write_5m, cache_write_1h, cache_read
+      FROM internal_usage ORDER BY ts`);
+  } catch {
+    return []; // table missing on a DB that hasn't run the v4 migration yet
+  }
+  const out: InternalUsageRow[] = [];
+  for (const r of res.rows) {
+    // The registry always writes an ISO ts. A row without a parseable one
+    // can't be placed on a day; defaulting to 0 would draw a phantom bar at
+    // the epoch (1969-12-31 west of UTC), so it's skipped instead.
+    const ms = Date.parse((r.ts as string) || '');
+    if (!Number.isFinite(ms) || ms <= 0) continue;
+    const rawModel = (r.model as string) || '';
+    const input = Number(r.input) || 0;
+    const output = Number(r.output) || 0;
+    const cw5m = Number(r.cache_write_5m) || 0;
+    const cw1h = Number(r.cache_write_1h) || 0;
+    const cacheRead = Number(r.cache_read) || 0;
+    const day = localDay(ms);
+    const { cost, priced } = costForUsage(rawModel, { input, output, cacheWrite5m: cw5m, cacheWrite1h: cw1h, cacheRead }, day);
+    out.push({
+      consumer: String(r.consumer), label: (r.label as string) || null, model: rawModel ? normalizeModelId(rawModel) : 'unknown', day, ms,
+      input, output, cacheWrite: cw5m + cw1h, cacheRead,
+      tokens: input + output + cw5m + cw1h + cacheRead, cost, priced,
+    });
+  }
+  return out;
+}
+
+/**
+ * One session-shaped row per (consumer, day). Shaped like a real row so the
+ * sessions grid, sorting and date filtering need no special path; `internal`
+ * plus an empty `project` make it non-navigable (the grid only opens rows with
+ * a project). Context fields are zero: there is no user-facing context to show.
+ */
+function rollUpInternal(rows: InternalUsageRow[], localDay: (ms: number) => string) {
+  const groups = new Map<string, {
+    consumer: string; label: string | null; labelMs: number; day: string; models: Set<string>;
+    input: number; output: number; cacheWrite: number; cacheRead: number;
+    cost: number; priced: boolean; calls: number; lastMs: number;
+  }>();
+  for (const r of rows) {
+    const key = r.consumer + '|' + r.day;
+    let g = groups.get(key);
+    if (!g) {
+      g = { consumer: r.consumer, label: null, labelMs: -1, day: r.day, models: new Set(), input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0, priced: true, calls: 0, lastMs: 0 };
+      groups.set(key, g);
+    }
+    // The most recent label wins, so renaming an agent relabels its history.
+    if (r.label && r.ms >= g.labelMs) { g.label = r.label; g.labelMs = r.ms; }
+    if (r.model !== 'unknown') g.models.add(r.model);
+    g.input += r.input; g.output += r.output; g.cacheWrite += r.cacheWrite; g.cacheRead += r.cacheRead;
+    g.cost += r.cost; if (!r.priced) g.priced = false;
+    g.calls++; if (r.ms > g.lastMs) g.lastMs = r.ms;
+  }
+  // Latest label per consumer across ALL days, so one agent reads the same on
+  // every row even if an older day's rows predate a rename (or the label column).
+  const latestLabel = new Map<string, { label: string; ms: number }>();
+  for (const g of groups.values()) {
+    const cur = latestLabel.get(g.consumer);
+    if (g.label && (!cur || g.labelMs >= cur.ms)) latestLabel.set(g.consumer, { label: g.label, ms: g.labelMs });
+  }
+  const humanize = (name: string) => {
+    const w = name.replace(/-+/g, ' ').trim();
+    return w.charAt(0).toUpperCase() + w.slice(1);
+  };
+  return [...groups.values()].map((g) => {
+    const tokens = g.input + g.output + g.cacheWrite + g.cacheRead;
+    return {
+      sessionId: `${INTERNAL_ID_PREFIX}${g.consumer}:${g.day}`,
+      project: '',
+      projectName: INTERNAL_PROJECT_NAME,
+      display: latestLabel.get(g.consumer)?.label ?? humanize(g.consumer),
+      models: [...g.models],
+      input: g.input, output: g.output, cacheWrite: g.cacheWrite, cacheRead: g.cacheRead,
+      tokens, cost: g.cost, priced: g.priced,
+      // API calls, not chat messages — the closest honest analogue.
+      messages: g.calls,
+      day: localDay(g.lastMs),
+      lastMs: g.lastMs,
+      peakContext: 0, finalContext: 0, contextWindow: 0, peakFill: 0, numCompactions: 0,
+      costPerMsg: g.calls > 0 ? g.cost / g.calls : 0,
+      tokensPerMsg: g.calls > 0 ? tokens / g.calls : 0,
+      internal: true as const,
+    };
+  });
 }

@@ -35,6 +35,12 @@ export function computeLiveSessionIds(args: {
    *  never counted as live off the scanner even when the session dropped out of the
    *  map (the stale-LIVE-while-idle bug). Optional for back-compat. */
   furyWarmIds?: string[];
+  /** Ids that must NEVER be reported live, whatever the other sources say —
+   *  Fury's own stealth sessions (stealthSessions.getSessionIds()). Applied
+   *  LAST so no add-back can resurrect one. The scanner already drops them by
+   *  cwd; this is the id-keyed belt to that path-keyed brace
+   *  (docs/ticket-stealth-sessions.md §2). Optional for back-compat. */
+  hiddenIds?: string[];
 }): string[] {
   const live = new Set(args.scannerIds);
   // Persistent SDK processes appear in the scanner even at rest — drop every
@@ -55,5 +61,6 @@ export function computeLiveSessionIds(args: {
   for (const id of args.backgroundActiveIds ?? []) live.add(id);
   // Shipping sessions whose conversation id isn't what the PID file carries.
   for (const id of args.shippingActiveIds) live.add(id);
+  for (const id of args.hiddenIds ?? []) live.delete(id);
   return [...live].sort();
 }

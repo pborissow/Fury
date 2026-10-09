@@ -1,8 +1,7 @@
-import { query, type Query, type SDKMessage, type SDKUserMessage, type PermissionResult, type RewindFilesResult, type ModelInfo, type SDKAssistantMessageError } from '@anthropic-ai/claude-agent-sdk';
+import { query, type Query, type SDKMessage, type PermissionResult, type RewindFilesResult, type ModelInfo, type SDKAssistantMessageError } from '@anthropic-ai/claude-agent-sdk';
 import { appendFile } from 'fs/promises';
 import { readdirSync, readFileSync, rmSync, statSync } from 'fs';
-import { spawn, execFile, type ChildProcess, type SpawnOptions } from 'child_process';
-import { promisify } from 'util';
+import { spawn, type ChildProcess, type SpawnOptions } from 'child_process';
 import { homedir } from 'os';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
@@ -26,6 +25,11 @@ import { restoreJsonlFromArchive } from './transcriptArchiver';
 import { scrubSessionFile } from './imageScrubber';
 import { settingsPersistence } from './settingsPersistence';
 import { recordServedWindow } from './modelWindows';
+import { pidAlive, parentPidOf, isProvableOrphan } from './processOwnership';
+import { createInputStream } from './sdkInputStream';
+import { isInternalProject } from './furyHome';
+// Re-exported: tests and callers historically import it from here.
+export { isProvableOrphan };
 // Type-only (erased at compile time) — no runtime coupling to the CLI manager.
 // Reusing its shapes keeps /api/stream-buffer and ChatTab identical for both
 // backends.
@@ -51,45 +55,6 @@ import type { ImageAttachmentInput } from './types';
  * It emits the SAME eventBus events as the shipping manager, so the existing
  * SSE route + frontend render it unchanged.
  */
-
-/**
- * A pushable async-iterable of user messages. This is the `prompt` we hand to
- * query(). The generator AWAITS when the queue is empty rather than returning —
- * returning would end the session and let the CLI exit. That awaiting is what
- * keeps the process alive between turns.
- */
-function createInputStream() {
-  const queue: SDKUserMessage[] = [];
-  let notify: (() => void) | null = null;
-  let ended = false;
-
-  async function* generator(): AsyncGenerator<SDKUserMessage> {
-    while (true) {
-      if (queue.length === 0) {
-        if (ended) return;
-        await new Promise<void>((resolve) => {
-          notify = resolve;
-        });
-      }
-      while (queue.length > 0) yield queue.shift()!;
-      if (ended && queue.length === 0) return;
-    }
-  }
-
-  return {
-    stream: generator(),
-    push(msg: SDKUserMessage) {
-      queue.push(msg);
-      notify?.();
-      notify = null;
-    },
-    end() {
-      ended = true;
-      notify?.();
-      notify = null;
-    },
-  };
-}
 
 type InputStream = ReturnType<typeof createInputStream>;
 
@@ -319,8 +284,6 @@ const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
  *  a previous server life apart from a live, unrelated SDK app. */
 const PROCESS_STARTED_AT = Date.now() - Math.floor(process.uptime() * 1000);
 
-const execFileP = promisify(execFile);
-
 // Don't run the background-reconcile timer under vitest (it imports this module):
 // an unref'd interval would still keep re-scanning the real ~/.claude during tests.
 const IN_TEST = !!process.env.VITEST || process.env.NODE_ENV === 'test';
@@ -378,81 +341,6 @@ const NOTIF_TURN_GRACE_MS = Number(process.env.FURY_NOTIF_TURN_GRACE_MS ?? '1000
  *  edge that follows takes over with the real expected-turn hold. A departure
  *  with NO edge (killed task) costs at most this long of phantom background. */
 const NOTIF_BRIDGE_MS = 2_000;
-
-/** Liveness probe: signal 0 throws iff the pid is gone (or not ours to signal). */
-function pidAlive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
-/**
- * Given a candidate process's parent pid, is it a PROVABLE orphaned leftover —
- * i.e. safe for reapOrphanedProcesses to SIGKILL?
- *
- * ONLY two states prove orphan-hood: the parent is init (Linux re-parents orphans
- * to pid 1) or the parent is dead (Windows leaves a stale ParentProcessId once the
- * spawning server exits). EVERYTHING ELSE is spared:
- *   - `ppid === null` — the OS lookup failed. parentPidOf's contract is explicit:
- *     never kill on a failed lookup. Falling through to SIGKILL here is exactly
- *     how a transient PowerShell failure at boot could take out a user's terminal.
- *   - a live, non-init parent — the process is attached to a real shell/terminal
- *     the user is in (an external session), not our leftover.
- *   - `ppid === selfPid` — a child of THIS server (current life, not a leftover).
- *
- * Pure and injectable (`alive`) so the reap decision is unit-testable without the
- * unscoped sweep, which can't run in a test (it would target real machine sessions).
- */
-export function isProvableOrphan(
-  ppid: number | null,
-  selfPid: number,
-  alive: (pid: number) => boolean,
-): boolean {
-  if (ppid === null || ppid === selfPid) return false;
-  return ppid === 1 || !alive(ppid);
-}
-
-/**
- * The parent pid of an arbitrary process, or null if it can't be determined.
- *
- * Node exposes process.ppid for ITSELF only, so ownership attribution
- * (docs/ticket-resume-live-cli-session-hard-kill.md) has to go to the OS. This is
- * the ancestry signal the ticket's process-model findings settled on: a
- * Fury-spawned CLI is a direct child of this server process, so
- * `parentPidOf(pid) === process.pid` proves ownership when no spawn record exists
- * (e.g. a PID file we never got to record). PID files' kind/entrypoint/startedAt
- * are all proven NON-discriminating — an external terminal is byte-for-byte the
- * same shape — so this is the only field-independent test.
- *
- * Best-effort and defensive: any failure returns null, and callers MUST treat
- * null as "cannot prove ownership" → leave the process alive (never kill on a
- * failed lookup). One short-lived OS query per uncached candidate; the hot path
- * (pid already in spawnedPids) never reaches here.
- */
-async function parentPidOf(pid: number): Promise<number | null> {
-  try {
-    if (process.platform === 'win32') {
-      // Win32_Process.ParentProcessId — exactly what diagnosed this ticket.
-      const { stdout } = await execFileP('powershell.exe', [
-        '-NoProfile', '-NonInteractive', '-Command',
-        `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").ParentProcessId`,
-      ]);
-      const ppid = parseInt(stdout.trim(), 10);
-      return Number.isFinite(ppid) ? ppid : null;
-    }
-    if (process.platform === 'darwin') {
-      const { stdout } = await execFileP('ps', ['-o', 'ppid=', '-p', String(pid)]);
-      const ppid = parseInt(stdout.trim(), 10);
-      return Number.isFinite(ppid) ? ppid : null;
-    }
-    // Linux: field 4 of /proc/<pid>/stat, but comm (field 2) can contain spaces
-    // and parens, so index from the LAST ')' rather than splitting from the start.
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    const ppid = parseInt(rest[1], 10);
-    return Number.isFinite(ppid) ? ppid : null;
-  } catch {
-    return null;
-  }
-}
 
 class SdkSessionManager {
   private sessions = new Map<string, SdkSession>();
@@ -2087,6 +1975,9 @@ class SdkSessionManager {
    * repeated entries are expected by both readers.
    */
   private appendHistoryEntry(s: SdkSession, prompt: string): void {
+    // Stealth sessions must never touch history.jsonl (that file IS the sidebar).
+    // They don't run through this manager, but a misrouted one must not leak.
+    if (isInternalProject(s.projectPath)) return;
     try {
       const entry = JSON.stringify({
         display: prompt.length > 200 ? prompt.slice(0, 200) + '...' : prompt,

@@ -204,6 +204,20 @@ app.prepare().then(() => {
       console.error('[server] Failed to reap orphaned SDK sessions:', err);
     }
 
+    // Reap stealth sessions (Fury's hidden background sessions) left over from a
+    // previous life, identified by their ~/.fury/internal/<name> cwd. Runs before
+    // anything can acquire() one, so the registry owns nothing yet. See
+    // docs/ticket-stealth-sessions.md §3.
+    try {
+      const { sweepStealthOrphans } = await import('./lib/stealthSessions');
+      const r = await sweepStealthOrphans();
+      if (r.killed || r.staleFiles) {
+        console.log(`[server] Stealth sweep: killed ${r.killed} orphan(s), removed ${r.staleFiles} stale PID file(s)`);
+      }
+    } catch (err) {
+      console.error('[server] Stealth-session sweep failed:', err);
+    }
+
     // Boot backstop for the e2e scratch dirs (dev-only): a previous run's server is
     // dead now, so any code-search index.db it held is released and the dirs unlink
     // cleanly — covering a SIGKILL/crash that skipped the shutdown sweep above.
@@ -225,6 +239,9 @@ app.prepare().then(() => {
       const { sdkSessionManager } = await import('./lib/sdkSessionManager');
       const killed = await sdkSessionManager.killAll();
       if (killed > 0) console.log(`[server] ${signal}: killed ${killed} SDK session process(es)`);
+      const { stealthSessions } = await import('./lib/stealthSessions');
+      const stealthKilled = await stealthSessions.killAll();
+      if (stealthKilled > 0) console.log(`[server] ${signal}: killed ${stealthKilled} stealth session(s)`);
       const { codemoggerReindexer } = await import('./lib/codemoggerReindex');
       codemoggerReindexer.stopAll();
       // Close every in-process code-search engine so its index.db handle is released,

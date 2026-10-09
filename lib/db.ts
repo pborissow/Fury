@@ -28,7 +28,7 @@ const REMIGRATE_KEY = '__fury_db_remigrate__';
 // (which reuses the globalThis-cached DB client and would NOT re-run initDb) applies
 // it without a full restart — otherwise the reloaded archiver could INSERT/SELECT a
 // column the live schema still lacks. initDb is idempotent, so re-running it is safe.
-const SCHEMA_VERSION = 3; // 3: messages_fts full-text index (Search tab)
+const SCHEMA_VERSION = 5; // 3: messages_fts full-text index (Search tab); 4: internal_usage (stealth sessions); 5: internal_usage.label
 
 // Under vitest, skip the startup scan (which walks the user's REAL ~/.claude and
 // re-archives sessions) so importing the DB in a test has no side effects. Tests
@@ -119,6 +119,29 @@ async function initDb(client: Client): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_usage_session ON usage_events(session_id);
     CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_events(ts);
     CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_events(model);
+
+    -- Spend by Fury's own hidden background sessions (lib/stealthSessions.ts).
+    -- Deliberately NOT usage_events: those FK to sessions, and a stealth session
+    -- must never have a sessions row (that row is what makes a session visible
+    -- to search, Stats session tables and history). The Stats route rolls these
+    -- up under a reserved per-consumer label — invisible sessions, visible spend
+    -- (docs/ticket-stealth-sessions.md §5). Same column semantics as usage_events.
+    CREATE TABLE IF NOT EXISTS internal_usage (
+      consumer       TEXT NOT NULL,
+      -- Human-readable consumer label ("Search agent") as of the call.
+      label          TEXT,
+      session_id     TEXT NOT NULL,
+      message_id     TEXT NOT NULL,
+      model          TEXT,
+      ts             TEXT,
+      input          INTEGER NOT NULL DEFAULT 0,
+      output         INTEGER NOT NULL DEFAULT 0,
+      cache_write_5m INTEGER NOT NULL DEFAULT 0,
+      cache_write_1h INTEGER NOT NULL DEFAULT 0,
+      cache_read     INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (session_id, message_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_internal_usage_ts ON internal_usage(ts);
 
     -- Append-only history of model pricing. On startup we diff lib/pricing.ts
     -- against the newest row per model and insert a new row whenever a rate
@@ -305,6 +328,13 @@ async function initDb(client: Client): Promise<void> {
   // Per-event rather than per-session because the model can change mid-session.
   try {
     await client.execute('ALTER TABLE usage_events ADD COLUMN context_window INTEGER NOT NULL DEFAULT 0');
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
+  // Migration: human-readable label on stealth-session usage (v4 DBs predate it).
+  try {
+    await client.execute('ALTER TABLE internal_usage ADD COLUMN label TEXT');
   } catch {
     // Column already exists — expected after first migration
   }

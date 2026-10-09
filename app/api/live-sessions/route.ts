@@ -3,6 +3,7 @@ import { liveSessionScanner } from '@/lib/liveSessionScanner';
 import { sessionManager } from '@/lib/sessionManager';
 import { sdkSessionManager } from '@/lib/sdkSessionManager';
 import { computeLiveSessionIds } from '@/lib/liveSessions';
+import { stealthSessions } from '@/lib/stealthSessions';
 
 export const runtime = 'nodejs';
 
@@ -32,6 +33,7 @@ export async function GET() {
     sdkActiveIds: safe(() => sdkSessionManager.getActiveSessionIds()),
     backgroundActiveIds: safe(() => sdkSessionManager.getBackgroundActiveSessionIds()),
     furyWarmIds: safe(() => sdkSessionManager.getFuryWarmSessionIds()),
+    hiddenIds: safe(() => stealthSessions.getSessionIds()),
   });
 
   return NextResponse.json({ liveSessionIds });

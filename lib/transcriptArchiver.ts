@@ -16,6 +16,7 @@ import { sessionJsonlPath } from './sessionPaths';
 import { deleteSessionImages } from './imageStore';
 import { scrubImages } from './imageScrubber';
 import { settingsPersistence } from './settingsPersistence';
+import { isInternalProject } from './furyHome';
 
 export interface SessionMetadata {
   label?: string;
@@ -127,6 +128,12 @@ export async function archiveTranscript(
     contextWindow?: number;
   }
 ): Promise<void> {
+  // Stealth sessions (cwd under ~/.fury/internal/) never get a sessions row. That
+  // one refusal is what keeps them out of search, the Stats session table and the
+  // history DB-merge — every other usage/metadata writer requires the row to
+  // exist. They don't persist a transcript today (persistSession:false); this is
+  // the durable guard for a consumer that ever does. docs/ticket-stealth-sessions.md §2.
+  if (isInternalProject(project)) return;
   const hash = computeHash(jsonlContent);
 
   if (!skipHashCheck && await isCurrentlyArchived(sessionId, hash)) return;

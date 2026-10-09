@@ -7,6 +7,7 @@ import { mcpCache } from '@/lib/mcpCache';
 import { sessionManager } from '@/lib/sessionManager';
 import { sdkSessionManager } from '@/lib/sdkSessionManager';
 import { computeLiveSessionIds } from '@/lib/liveSessions';
+import { stealthSessions } from '@/lib/stealthSessions';
 import { eventSubscriptions, isValidSessionWatch } from '@/lib/eventSubscriptions';
 
 export const dynamic = 'force-dynamic';
@@ -132,6 +133,7 @@ export async function GET(request: NextRequest) {
           sdkActiveIds: safeIds(() => sdkSessionManager.getActiveSessionIds()),
           backgroundActiveIds: safeIds(() => sdkSessionManager.getBackgroundActiveSessionIds()),
           furyWarmIds: safeIds(() => sdkSessionManager.getFuryWarmSessionIds()),
+        hiddenIds: safeIds(() => stealthSessions.getSessionIds()),
         });
         const key = ids.join(',');
         if (key === lastSentKey) return;

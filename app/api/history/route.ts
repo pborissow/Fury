@@ -3,6 +3,7 @@ import { readFile, writeFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
 import { loadArchivedSessions, loadArchivedSessionIds } from '@/lib/transcriptArchiver';
+import { isInternalProject } from '@/lib/furyHome';
 
 export const runtime = 'nodejs';
 
@@ -58,6 +59,9 @@ export async function GET(req: NextRequest) {
           }
         })
         .filter((entry): entry is HistoryEntry => entry !== null)
+        // Stealth sessions never write here (docs/ticket-stealth-sessions.md
+        // §2); drop any internal-cwd entry anyway so a regression stays hidden.
+        .filter((entry) => !isInternalProject(entry.project))
         .reverse(); // Most recent first
 
       // Messages that aren't useful as session summaries
@@ -143,6 +147,10 @@ export async function GET(req: NextRequest) {
 
         for (const archived of archivedSessions) {
           if (existingIds.has(archived.session_id)) continue;
+          // Same stealth guard as the history.jsonl path above. The archiver
+          // refuses internal cwds, so no such row should exist — this keeps a
+          // regression there (or a legacy row) out of the sidebar too.
+          if (isInternalProject(archived.project)) continue;
           if (isSkippableDisplay(archived.display)) continue;
           allEntriesFlat.push({
             display: archived.display,
