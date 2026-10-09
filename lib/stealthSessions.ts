@@ -86,7 +86,12 @@ export interface StealthConfig {
    * name past spend even when the agent isn't running.
    */
   label?: string;
-  /** Model alias or id. Overrides the agent file's `model:` when both are set. */
+  /**
+   * Model alias or id. Overrides the agent file's `model:` when both are set.
+   * A bare family alias ('haiku', 'sonnet', …), here or in the agent file, is
+   * resolved at acquire() to the newest version in Fury's model catalog, and a
+   * newer release recycles the warm session onto it.
+   */
   model?: string;
   /**
    * Main-thread agent: a file name resolved to `<agentsDir>/<agent>.md`
@@ -117,6 +122,13 @@ export interface StealthConfig {
   idleKillMs?: number;
   /** Default per-ask budget. Default 60 s. */
   askTimeoutMs?: number;
+  /**
+   * Structured output: every turn ends by emitting JSON matching this schema
+   * (validated by the CLI, which retries the model on a mismatch). Surfaced as
+   * AskResult.structured. A turn that can't produce valid output fails with
+   * result_error / subtype 'error_max_structured_output_retries'.
+   */
+  outputFormat?: { type: 'json_schema'; schema: Record<string, unknown> };
 }
 
 export type StealthToolEvent =
@@ -150,6 +162,8 @@ export interface AskResult {
   usage: TokenUsage;
   /** Tools the CLI refused (fail-closed evidence; see §4). */
   permissionDenials: { toolName: string; toolUseId: string }[];
+  /** Schema-validated output when the consumer set `outputFormat`; else undefined. */
+  structured?: unknown;
 }
 
 export type StealthErrorCode = 'timeout' | 'aborted' | 'session_died' | 'result_error' | 'disposed';
@@ -216,6 +230,16 @@ const PROVIDER_SETTING_KEYS = [
 ] as const;
 
 const num = (v: unknown) => (typeof v === 'number' && isFinite(v) ? v : 0);
+
+interface ModelUsageTotals { input: number; output: number; cacheRead: number; cacheCreation: number }
+
+/** modelUsage keys carry a context-variant suffix ('claude-opus-4-8[1m]'); messages don't. */
+function modelKey(model: string | null): string {
+  return (model ?? 'unknown').replace(/\[[^\]]*\]$/, '');
+}
+
+/** The CLI's internal tool that carries `outputFormat` results (observed name, CLI 2.1.281). */
+const STRUCTURED_OUTPUT_TOOL = 'StructuredOutput';
 
 /**
  * Parse a Claude Code agent file: `---` YAML-ish frontmatter + markdown body.
@@ -354,17 +378,28 @@ export function buildStealthOptions(args: {
     },
     // Non-interactive: unapproved tools are denied by the CLI, never prompted.
     permissionMode: 'dontAsk',
-    includePartialMessages: false,
+    // ON for accounting, not for UI: an `assistant` message's usage is a
+    // snapshot taken at message START (output_tokens ≈ 1-10). The final output
+    // count only arrives in the `message_delta` stream event. Off, output was
+    // undercounted up to ~400× (observed 2026-10-08).
+    includePartialMessages: true,
   };
   if (agent) {
     const { name, ...def } = agent;
     if (config.model) def.model = config.model;
+    // An agent `tools:` allowlist also hides the CLI's StructuredOutput carrier,
+    // and then the model can't emit the schema'd answer at all; it writes the
+    // fields as prose and the CLI still reports success (observed 2026-10-08).
+    if (config.outputFormat && def.tools && !def.tools.includes(STRUCTURED_OUTPUT_TOOL)) {
+      def.tools = [...def.tools, STRUCTURED_OUTPUT_TOOL];
+    }
     options.agents = { [name]: def };
     options.agent = name;
   } else if (config.systemPrompt) {
     options.systemPrompt = config.systemPrompt;
   }
   if (config.model) options.model = config.model;
+  if (config.outputFormat) options.outputFormat = config.outputFormat;
   if (args.spawnClaudeCodeProcess) options.spawnClaudeCodeProcess = args.spawnClaudeCodeProcess;
   return options;
 }
@@ -383,6 +418,8 @@ export interface RegistryDeps {
   /** Persist usage rows for Stats. Default: INSERT into fury.db internal_usage. */
   recordUsage: (rows: StealthUsageRow[]) => Promise<void>;
   readProviderSettings: () => { env: Record<string, string>; helpers: Record<string, string> };
+  /** Family alias → newest catalog id (default: lib/modelCatalog resolveModelAlias). */
+  resolveModel: (model: string) => Promise<string>;
   /** Whether to spawn via our pid-tracking hook (off in tests: nothing real spawns). */
   trackPids: boolean;
   now: () => number;
@@ -404,6 +441,13 @@ interface ActiveTurn {
   startedAt: number;
   text: string[];
   usageByMsg: Map<string, { model: string | null; usage: TokenUsage }>;
+  /** Final output_tokens per message id, from `message_delta` stream events. */
+  finalOutput: Map<string, number>;
+  /** Message id of the API response currently streaming (from message_start). */
+  streamMsgId: string | null;
+  /** tool_use ids of the CLI's internal StructuredOutput carrier, so their
+   *  tool_result is hidden from onToolEvent along with the call itself. */
+  internalToolIds: Set<string>;
   onToolEvent?: (e: StealthToolEvent) => void;
   settle: (msg: SDKMessage | null, err?: Error) => void;
 }
@@ -419,6 +463,8 @@ interface Live {
   contextTokens: number;
   /** Cumulative SDK cost reported by the last result (for per-ask deltas). */
   costCursor: number;
+  /** Last cumulative result.modelUsage per model (for per-turn deltas). */
+  modelUsageCursor: Map<string, ModelUsageTotals>;
   turn: ActiveTurn | null;
 }
 
@@ -445,6 +491,7 @@ function fingerprintOf(c: StealthConfig): string {
     systemPrompt: c.systemPrompt ?? null,
     allowedTools: c.allowedTools ?? null,
     builtinTools: c.builtinTools ?? null,
+    outputFormat: c.outputFormat ?? null,
   });
 }
 
@@ -463,6 +510,7 @@ export class StealthSessionRegistry {
       query: (a) => sdkQuery(a as Parameters<typeof sdkQuery>[0]) as unknown as QueryLike,
       recordUsage: defaultRecordUsage,
       readProviderSettings: () => readProviderSettings(),
+      resolveModel: async (m) => (await import('./modelCatalog')).resolveModelAlias(m),
       trackPids: true,
       now: () => Date.now(),
       ...deps,
@@ -487,8 +535,14 @@ export class StealthSessionRegistry {
     }
     // Resolve the agent eagerly so a missing/malformed file fails at acquire(),
     // not on some later user's first question.
-    resolveAgent(config);
-    const fp = fingerprintOf(config);
+    const agent = resolveAgent(config);
+    // Pin the concrete model now ('haiku' → 'claude-haiku-5-5'). It feeds the
+    // fingerprint below, so a newer catalog entry recycles the session onto it.
+    const requested = config.model ?? agent?.model;
+    if (requested) config = { ...config, model: await this.deps.resolveModel(requested) };
+    // Fingerprint the agent's CONTENT, not just its file name: editing the
+    // agent file (prompt tuning) must reach a warm session on its next ask.
+    const fp = fingerprintOf(agent ? { ...config, agent } : config);
     let e = this.entries.get(config.name);
     if (!e) {
       e = {
@@ -577,11 +631,14 @@ export class StealthSessionRegistry {
         startedAt: this.deps.now(),
         text: [],
         usageByMsg: new Map(),
+        internalToolIds: new Set(),
+        finalOutput: new Map(),
+        streamMsgId: null,
         onToolEvent: req.opts.onToolEvent,
         settle: (msg, err) => {
           cleanup();
           // Spend is recorded whatever the outcome — an aborted ask still cost money.
-          const usage = this.flushUsage(e, live, turn);
+          const usage = this.flushUsage(e, live, turn, msg);
           const partialText = turn.text.join('');
           if (err || !msg || msg.type !== 'result') {
             reject(stopping
@@ -592,6 +649,7 @@ export class StealthSessionRegistry {
           const r = msg as SDKMessage & {
             subtype: string; is_error: boolean; result?: string; num_turns: number;
             total_cost_usd: number; permission_denials?: { tool_name: string; tool_use_id: string }[];
+            structured_output?: unknown;
           };
           live.turns++;
           const cumulative = num(r.total_cost_usd);
@@ -606,6 +664,15 @@ export class StealthSessionRegistry {
             reject(new StealthAskError('result_error', `Stealth turn failed (${r.subtype})${r.result ? `: ${r.result}` : ''}`, { subtype: r.subtype, partialText }));
             return;
           }
+          // The CLI can report success without ever emitting the structured
+          // output it was asked for. With outputFormat set that's a failure,
+          // not an answer.
+          if (e.config.outputFormat && r.structured_output === undefined) {
+            reject(new StealthAskError('result_error', 'Turn ended without the requested structured output', {
+              subtype: 'missing_structured_output', partialText: typeof r.result === 'string' ? r.result : partialText,
+            }));
+            return;
+          }
           resolve({
             text: typeof r.result === 'string' ? r.result : partialText,
             sessionId: live.sessionId,
@@ -614,6 +681,7 @@ export class StealthSessionRegistry {
             costUsd,
             usage,
             permissionDenials: (r.permission_denials ?? []).map((d) => ({ toolName: d.tool_name, toolUseId: d.tool_use_id })),
+            ...(r.structured_output !== undefined ? { structured: r.structured_output } : {}),
           });
         },
       };
@@ -646,24 +714,76 @@ export class StealthSessionRegistry {
     });
   }
 
-  /** Persist this turn's deduped usage; return its totals. Never throws. */
-  private flushUsage(e: Entry, live: Live, turn: ActiveTurn): TokenUsage {
+  /**
+   * Persist this turn's usage; return its totals. Never throws.
+   *
+   * Two sources, reconciled:
+   *   1. Per API request (one row per message id): input/cache from the
+   *      assistant snapshot (final at message start), output from message_delta.
+   *      Per-request rows keep each prompt's size, which tiered pricing needs.
+   *   2. result.modelUsage, the CLI's own cumulative per-model tally. Its
+   *      per-turn delta also covers calls that never stream to us, e.g. the CLI's
+   *      small auxiliary model call per query. Whatever (2) has beyond (1) is
+   *      recorded as one `aux:` row per model, so recorded totals always match
+   *      what the CLI says was spent. (No result, e.g. a killed turn → (1) only.)
+   */
+  private flushUsage(e: Entry, live: Live, turn: ActiveTurn, resultMsg: SDKMessage | null): TokenUsage {
     const total: TokenUsage = { input: 0, output: 0, cacheWrite5m: 0, cacheWrite1h: 0, cacheRead: 0 };
     const rows: StealthUsageRow[] = [];
     const ts = new Date(this.deps.now()).toISOString();
+    const base = { consumer: e.config.name, label: stealthLabel(e.config), sessionId: live.sessionId, ts };
+    const perModel = new Map<string, ModelUsageTotals>();
     for (const [messageId, { model, usage }] of turn.usageByMsg) {
-      total.input += usage.input; total.output += usage.output;
-      total.cacheWrite5m += usage.cacheWrite5m; total.cacheWrite1h += usage.cacheWrite1h;
-      total.cacheRead += usage.cacheRead;
-      rows.push({ consumer: e.config.name, label: stealthLabel(e.config), sessionId: live.sessionId, messageId, model, ts, ...usage });
+      rows.push({ ...base, messageId, model, ...usage });
+      const k = modelKey(model);
+      const t = perModel.get(k) ?? { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
+      t.input += usage.input; t.output += usage.output; t.cacheRead += usage.cacheRead;
+      t.cacheCreation += usage.cacheWrite5m + usage.cacheWrite1h;
+      perModel.set(k, t);
     }
     turn.usageByMsg.clear();
+
+    const mu = (resultMsg as { modelUsage?: Record<string, Record<string, unknown>> } | null)?.modelUsage;
+    if (mu && typeof mu === 'object') {
+      for (const [rawModel, v] of Object.entries(mu)) {
+        const k = modelKey(rawModel);
+        const cum: ModelUsageTotals = {
+          input: num(v.inputTokens), output: num(v.outputTokens),
+          cacheRead: num(v.cacheReadInputTokens), cacheCreation: num(v.cacheCreationInputTokens),
+        };
+        const prev = live.modelUsageCursor.get(k) ?? { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
+        live.modelUsageCursor.set(k, cum);
+        const seen = perModel.get(k) ?? { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
+        const residual = {
+          input: Math.max(0, cum.input - prev.input - seen.input),
+          output: Math.max(0, cum.output - prev.output - seen.output),
+          cacheRead: Math.max(0, cum.cacheRead - prev.cacheRead - seen.cacheRead),
+          cacheCreation: Math.max(0, cum.cacheCreation - prev.cacheCreation - seen.cacheCreation),
+        };
+        if (residual.input + residual.output + residual.cacheRead + residual.cacheCreation > 0) {
+          rows.push({
+            ...base, messageId: `aux:${live.turns}:${k}`, model: k,
+            input: residual.input, output: residual.output, cacheRead: residual.cacheRead,
+            // modelUsage doesn't split cache writes by TTL; same convention as
+            // the transcript parser for unsplit totals: 1h (CLI default).
+            cacheWrite5m: 0, cacheWrite1h: residual.cacheCreation,
+          });
+        }
+      }
+    }
+
+    for (const r of rows) {
+      total.input += r.input; total.output += r.output;
+      total.cacheWrite5m += r.cacheWrite5m; total.cacheWrite1h += r.cacheWrite1h;
+      total.cacheRead += r.cacheRead;
+    }
     if (rows.length) {
       this.deps.recordUsage(rows).catch((err) =>
         log.warn('stealth', 'usage record failed', { data: { name: e.config.name, error: String(err) } }));
     }
     return total;
   }
+
 
   private maybeRecycleAfterTurn(e: Entry): void {
     const live = e.live;
@@ -702,7 +822,7 @@ export class StealthSessionRegistry {
     const q = this.deps.query({ prompt: input.stream, options });
     const live: Live = {
       sessionId, q, input, abortController, pids, dead: false,
-      turns: 0, contextTokens: 0, costCursor: 0, turn: null,
+      turns: 0, contextTokens: 0, costCursor: 0, modelUsageCursor: new Map(), turn: null,
     };
     e.live = live;
     e.spawns++;
@@ -737,10 +857,29 @@ export class StealthSessionRegistry {
       parent_tool_use_id?: string | null;
       message?: { id?: string; model?: string; content?: unknown; usage?: Record<string, unknown> };
     };
+    if (m.type === 'stream_event') {
+      // Accounting only (see includePartialMessages): learn each response's
+      // FINAL output_tokens from its message_delta.
+      const ev = (msg as unknown as { event?: { type?: string; message?: { id?: string }; usage?: Record<string, unknown> } }).event;
+      if (ev?.type === 'message_start') turn.streamMsgId = ev.message?.id ?? null;
+      else if (ev?.type === 'message_delta' && turn.streamMsgId && ev.usage) {
+        const id = turn.streamMsgId;
+        const out = Math.max(num(ev.usage.output_tokens), turn.finalOutput.get(id) ?? 0);
+        turn.finalOutput.set(id, out);
+        const rec = turn.usageByMsg.get(id);
+        if (rec) rec.usage.output = Math.max(rec.usage.output, out);
+      }
+      return;
+    }
     if (m.type === 'assistant' && m.message) {
       const content = Array.isArray(m.message.content) ? m.message.content : [];
       for (const b of content as { type: string; id?: string; name?: string; input?: unknown; text?: string }[]) {
-        if (b.type === 'tool_use') safeCall(turn.onToolEvent, { type: 'tool_use', id: b.id ?? '', name: b.name ?? '', input: b.input });
+        if (b.type === 'tool_use') {
+          // outputFormat's carrier tool is plumbing, not work the consumer
+          // asked for: keep it out of progress UIs.
+          if (b.name === STRUCTURED_OUTPUT_TOOL) { if (b.id) turn.internalToolIds.add(b.id); continue; }
+          safeCall(turn.onToolEvent, { type: 'tool_use', id: b.id ?? '', name: b.name ?? '', input: b.input });
+        }
         else if (b.type === 'text' && !m.parent_tool_use_id && b.text) turn.text.push(b.text);
       }
       const u = m.message.usage;
@@ -756,13 +895,19 @@ export class StealthSessionRegistry {
           cacheWrite1h: split ? num(cc!.ephemeral_1h_input_tokens) : flat,
           cacheRead: num(u.cache_read_input_tokens),
         };
-        // Streaming repeats a message's usage per content block — last wins.
+        // Streaming repeats a message's usage per content block, and the
+        // snapshot's output is a START-of-message count: never let it lower a
+        // final count already learned from message_delta.
+        const prior = turn.usageByMsg.get(m.message.id)?.usage.output ?? 0;
+        usage.output = Math.max(usage.output, prior, turn.finalOutput.get(m.message.id) ?? 0);
         turn.usageByMsg.set(m.message.id, { model: m.message.model ?? null, usage });
         if (!m.parent_tool_use_id) live.contextTokens = usage.input + flat + usage.cacheRead;
       }
     } else if (m.type === 'user' && m.message && Array.isArray(m.message.content)) {
       for (const b of m.message.content as { type: string; tool_use_id?: string; is_error?: boolean }[]) {
-        if (b.type === 'tool_result') safeCall(turn.onToolEvent, { type: 'tool_result', toolUseId: b.tool_use_id ?? '', isError: !!b.is_error });
+        if (b.type === 'tool_result' && !turn.internalToolIds.has(b.tool_use_id ?? '')) {
+          safeCall(turn.onToolEvent, { type: 'tool_result', toolUseId: b.tool_use_id ?? '', isError: !!b.is_error });
+        }
       }
     } else if (m.type === 'result') {
       turn.settle(msg);
@@ -1019,7 +1164,7 @@ export async function sweepStealthOrphans(deps?: Partial<SweepDeps>): Promise<{ 
 // Singleton (survives Next.js HMR; same proxy pattern as sdkSessionManager)
 // ---------------------------------------------------------------------------
 
-const SINGLETON_VERSION = 3; // 2: consumer labels; 3: queued-abort listener detach
+const SINGLETON_VERSION = 7; // 2: labels; 3: abort-listener detach; 4: outputFormat; 5: model aliases; 6: exact usage; 7: agent-content fingerprint
 const g = globalThis as unknown as { __furyStealth?: StealthSessionRegistry; __furyStealthV?: number };
 if (!g.__furyStealth || g.__furyStealthV !== SINGLETON_VERSION) {
   const prev = g.__furyStealth;

@@ -20,14 +20,19 @@ scripts/
 .claude-prompts/
 .claude-ui-state/
 
-# claude code
-.claude/
+# claude code — local settings stay private; agent definitions are shared
+# (Fury's stealth sessions load them, e.g. .claude/agents/transcript-searcher.md)
+.claude/*
+!.claude/agents/
 
 # playwright
 test-results/
 
 # Codemogger indexes
 .codemogger/
+
+# Tickets/plans
+docs/
 
 
 # misc

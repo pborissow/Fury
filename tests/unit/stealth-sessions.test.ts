@@ -92,6 +92,11 @@ class FakeQuery implements QueryLike {
       message: { id, model: opts.model ?? 'claude-haiku-4-5-20251001', content, usage: opts.usage ?? { input_tokens: 10, output_tokens: 5 } },
     });
   }
+  /** The stream events that carry a response's FINAL output count. */
+  streamed(id: string, finalOutput: number) {
+    this.emit({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_start', message: { id } } });
+    this.emit({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_delta', usage: { output_tokens: finalOutput } } });
+  }
   toolResult(id: string, isError = false) {
     this.emit({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu-' + id, is_error: isError }] } });
   }
@@ -112,11 +117,12 @@ function echo(q: FakeQuery) {
   };
 }
 
-function makeRegistry(opts: { auto?: boolean } = {}) {
+function makeRegistry(opts: { auto?: boolean; resolveModel?: (m: string) => Promise<string> } = {}) {
   const spawned: FakeQuery[] = [];
   const usage: StealthUsageRow[] = [];
   const reg = new StealthSessionRegistry({
     trackPids: false,
+    resolveModel: opts.resolveModel ?? (async (m) => m),
     readProviderSettings: () => ({ env: {}, helpers: {} }),
     recordUsage: async (rows) => { usage.push(...rows); },
     query: ({ prompt, options }) => {
@@ -187,6 +193,34 @@ describe('buildStealthOptions — safety defaults (§4)', () => {
     expect(o.agent).toBe('lib');
     expect(o.agents?.lib).toEqual({ description: 'd', prompt: 'p', model: 'sonnet', tools: ['mcp__x__y'] });
     expect(o.model).toBe('sonnet');
+  });
+});
+
+describe('buildStealthOptions — structured output', () => {
+  const base = {
+    cwd: '/x', sessionId: 's', abortController: new AbortController(),
+    provider: { env: {}, helpers: {} }, baseEnv: {}, mcpServers: {},
+  };
+  const outputFormat = { type: 'json_schema' as const, schema: { type: 'object' } };
+
+  it('passes outputFormat through and lets an allow-listed agent emit it', () => {
+    const o = buildStealthOptions({
+      ...base, config: { name: 't', outputFormat },
+      agent: { name: 'a', description: 'd', prompt: 'p', tools: ['mcp__x__y'] },
+    });
+    expect(o.outputFormat).toEqual(outputFormat);
+    // Without this the agent's tools: allowlist hides the carrier and the model
+    // writes the fields as prose while the CLI reports success.
+    expect(o.agents?.a.tools).toEqual(['mcp__x__y', 'StructuredOutput']);
+  });
+
+  it('leaves agent tools alone without outputFormat, or when the agent has no allowlist', () => {
+    const agent = { name: 'a', description: 'd', prompt: 'p', tools: ['mcp__x__y'] };
+    expect(buildStealthOptions({ ...base, config: { name: 't' }, agent }).agents?.a.tools).toEqual(['mcp__x__y']);
+    expect(buildStealthOptions({ ...base, config: { name: 't', outputFormat }, agent: { name: 'a', description: 'd', prompt: 'p' } })
+      .agents?.a.tools).toBeUndefined();
+    const dup = buildStealthOptions({ ...base, config: { name: 't', outputFormat }, agent: { ...agent, tools: ['StructuredOutput'] } });
+    expect(dup.agents?.a.tools).toEqual(['StructuredOutput']);
   });
 });
 
@@ -315,6 +349,67 @@ describe('StealthSessionRegistry', () => {
     await reg.killAll();
   });
 
+  it('records FINAL output from message_delta, not the start-of-message snapshot', async () => {
+    const { reg, spawned, usage } = makeRegistry({ auto: false });
+    const s = await reg.acquire({ name: 'out' });
+    const q = spawned[0];
+    const p = s.ask('x');
+    await flush();
+    // Real order: message_start, the assistant snapshot (output 6), message_delta (1837).
+    q.emit({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm1' } } });
+    q.assistant('m1', { text: 'para', usage: { input_tokens: 10, output_tokens: 6 } });
+    q.emit({ type: 'stream_event', event: { type: 'message_delta', usage: { output_tokens: 1837 } } });
+    q.assistant('m1', { text: 'para', usage: { input_tokens: 10, output_tokens: 6 } }); // late repeat
+    // A second response whose delta lands BEFORE its assistant message.
+    q.streamed('m2', 40);
+    q.assistant('m2', { text: 'more', usage: { input_tokens: 20, output_tokens: 2 } });
+    q.result('para more', 0.01);
+    const r = await p;
+    await flush();
+    expect(usage.map((u) => [u.messageId, u.output])).toEqual([['m1', 1837], ['m2', 40]]);
+    expect(r.usage.output).toBe(1877);
+    await reg.killAll();
+  });
+
+  it('reconciles with result.modelUsage: unseen calls become per-model aux rows, per-turn deltas', async () => {
+    const { reg, spawned, usage } = makeRegistry({ auto: false });
+    const s = await reg.acquire({ name: 'aux' });
+    const q = spawned[0];
+    const mu = (haikuOut: number, auxIn: number) => ({
+      'claude-haiku-5-5[1m]': { inputTokens: 10, outputTokens: haikuOut, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      'claude-haiku-4-5-20251001': { inputTokens: auxIn, outputTokens: 12, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    });
+    let p = s.ask('one');
+    await flush();
+    q.streamed('a', 100);
+    q.assistant('a', { model: 'claude-haiku-5-5', usage: { input_tokens: 10, output_tokens: 3 } });
+    q.result('one', 0.01, { modelUsage: mu(100, 903) });
+    let r = await p;
+    await flush();
+    // Streamed call fully accounted; the CLI's hidden aux call recorded as aux.
+    expect(usage.map((u) => [u.messageId, u.model, u.input, u.output])).toEqual([
+      ['a', 'claude-haiku-5-5', 10, 100],
+      ['aux:0:claude-haiku-4-5-20251001', 'claude-haiku-4-5-20251001', 903, 12],
+    ]);
+    expect(r.usage).toMatchObject({ input: 913, output: 112 });
+
+    // Turn 2: modelUsage is CUMULATIVE — only the delta may be recorded.
+    usage.length = 0;
+    p = s.ask('two');
+    await flush();
+    q.streamed('b', 50);
+    q.assistant('b', { model: 'claude-haiku-5-5', usage: { input_tokens: 10, output_tokens: 1 } });
+    q.result('two', 0.02, { modelUsage: {
+      'claude-haiku-5-5[1m]': { inputTokens: 20, outputTokens: 150, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      'claude-haiku-4-5-20251001': { inputTokens: 903, outputTokens: 12, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+    } });
+    r = await p;
+    await flush();
+    expect(usage.map((u) => u.messageId)).toEqual(['b']);       // no aux: nothing unseen
+    expect(r.usage).toMatchObject({ input: 10, output: 50 });
+    await reg.killAll();
+  });
+
   it('streams tool events to the consumer and survives a throwing callback', async () => {
     const { reg, spawned } = makeRegistry({ auto: false });
     const s = await reg.acquire({ name: 'ev' });
@@ -325,6 +420,30 @@ describe('StealthSessionRegistry', () => {
     q.assistant('m', { toolUse: 'mcp__t__search' }); q.toolResult('m', true); q.result('ok', 0);
     expect((await p).text).toBe('ok');
     expect(seen).toEqual(['tool_use', 'tool_result']);
+    await reg.killAll();
+  });
+
+  it('surfaces structured output, hides its carrier tool, and fails when it is missing', async () => {
+    const { reg, spawned } = makeRegistry({ auto: false });
+    const s = await reg.acquire({ name: 'struct', outputFormat: { type: 'json_schema', schema: { type: 'object' } } });
+    const q = spawned[0];
+    const events: string[] = [];
+    const p = s.ask('x', { onToolEvent: (e) => events.push(e.type === 'tool_use' ? e.name : `result:${e.toolUseId}`) });
+    await flush();
+    q.assistant('m1', { toolUse: 'mcp__t__search' }); q.toolResult('m1');
+    q.assistant('m2', { toolUse: 'StructuredOutput' }); q.toolResult('m2');
+    q.result('{"a":1}', 0.01, { structured_output: { a: 1 } });
+    const r = await p;
+    expect(r.structured).toEqual({ a: 1 });
+    expect(events).toEqual(['mcp__t__search', 'result:tu-m1']); // carrier invisible
+
+    // The CLI can say "success" without ever emitting it: that's an error.
+    const p2 = s.ask('y');
+    await flush();
+    q.assistant('m3', { text: '**summary:** prose instead' });
+    q.result('**summary:** prose instead', 0.02);
+    await expect(p2).rejects.toMatchObject({ code: 'result_error', detail: { subtype: 'missing_structured_output', partialText: '**summary:** prose instead' } });
+    expect(reg.getSessionIds()).toHaveLength(1); // still warm
     await reg.killAll();
   });
 
@@ -453,6 +572,43 @@ describe('StealthSessionRegistry', () => {
     await reg.acquire({ name: 'cfg', model: 'sonnet' });
     expect(spawned).toHaveLength(2);
     expect(spawned[0].options.abortController).toHaveProperty('signal.aborted', true);
+    await reg.killAll();
+  });
+
+  it('resolves a family alias to the newest catalog model, and recycles when a newer one ships', async () => {
+    let latest = 'claude-haiku-4-5';
+    const { reg, spawned } = makeRegistry({ resolveModel: async (m) => (m === 'haiku' ? latest : m) });
+    const dir = mkdtempSync(join(TMP, 'agents-'));
+    writeFileSync(join(dir, 'lib.md'), '---\ndescription: d\nmodel: haiku\ntools: mcp__t__s\n---\nPrompt');
+    // Alias from the AGENT FILE (no config.model) is resolved too.
+    await reg.acquire({ name: 'alias', agent: 'lib', agentsDir: dir });
+    expect(spawned[0].options.model).toBe('claude-haiku-4-5');
+    expect((spawned[0].options.agents as Record<string, { model: string }>).lib.model).toBe('claude-haiku-4-5');
+    expect(reg.list()[0].model).toBe('claude-haiku-4-5');
+    await reg.acquire({ name: 'alias', agent: 'lib', agentsDir: dir });
+    expect(spawned).toHaveLength(1);                  // same resolution → reuse
+    latest = 'claude-haiku-5-5';                      // weekly catalog refresh
+    await reg.acquire({ name: 'alias', agent: 'lib', agentsDir: dir });
+    expect(spawned).toHaveLength(2);
+    expect(spawned[1].options.model).toBe('claude-haiku-5-5');
+    // Full ids pass through untouched.
+    await reg.acquire({ name: 'pinned', model: 'claude-sonnet-5' });
+    expect(spawned[2].options.model).toBe('claude-sonnet-5');
+    await reg.killAll();
+  });
+
+  it('an edited agent file recycles the warm session on the next acquire', async () => {
+    const { reg, spawned } = makeRegistry();
+    const dir = mkdtempSync(join(TMP, 'agents-edit-'));
+    const file = join(dir, 'tuned.md');
+    writeFileSync(file, '---\ndescription: d\n---\nPrompt v1');
+    await reg.acquire({ name: 'tuned', agent: 'tuned', agentsDir: dir });
+    await reg.acquire({ name: 'tuned', agent: 'tuned', agentsDir: dir });
+    expect(spawned).toHaveLength(1);
+    writeFileSync(file, '---\ndescription: d\n---\nPrompt v2');
+    await reg.acquire({ name: 'tuned', agent: 'tuned', agentsDir: dir });
+    expect(spawned).toHaveLength(2);
+    expect((spawned[1].options.agents as Record<string, { prompt: string }>).tuned.prompt).toBe('Prompt v2');
     await reg.killAll();
   });
 

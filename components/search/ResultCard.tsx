@@ -1,6 +1,6 @@
 'use client';
 
-import { ChevronDown } from 'lucide-react';
+import { ChevronDown, Sparkles } from 'lucide-react';
 import SmartPath from '@/components/SmartPath';
 import HistoryTimestamp from '@/components/HistoryTimestamp';
 import Snippet from './Snippet';
@@ -19,13 +19,15 @@ interface ResultCardProps {
   /** Open in Chat — with a hit, scrolled to that turn. */
   onOpen: (hit?: SearchHit) => void;
   onExpand: () => void;
+  /** Ask mode: the Search agent's one-line reason this session matches. */
+  note?: string;
 }
 
 /** One session's result card: context header (title, badges, project path)
  *  over clickable hit rows. The header is NOT a click target — opening
  *  happens via the rows, which double as the keyboard-navigation targets. */
 export default function ResultCard({
-  session: s, isLive, isExpanded, selection, navIndexOf, onOpen, onExpand,
+  session: s, isLive, isExpanded, selection, navIndexOf, onOpen, onExpand, note,
 }: ResultCardProps) {
   const visibleHits = isExpanded ? s.hits : s.hits.slice(0, COLLAPSED_HITS);
   const openRowNavIndex = visibleHits.length === 0 ? navIndexOf() : -1;
@@ -65,6 +67,12 @@ export default function ResultCard({
         <div className="hidden max-md:block mt-0.5 text-xs text-muted-foreground/80 min-w-0">
           <SmartPath path={s.project} className="truncate" />
         </div>
+        {note && (
+          <div className="mt-1 flex items-start gap-1.5 text-xs text-foreground/80" data-testid="ask-why">
+            <Sparkles className="h-3 w-3 shrink-0 mt-0.5 text-primary" aria-label="Search agent" />
+            <span>{note}</span>
+          </div>
+        )}
       </div>
 
       {/* Hits → open scrolled to the turn. The p-1.5 gutter insets each row's

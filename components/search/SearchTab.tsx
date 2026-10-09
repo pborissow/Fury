@@ -12,17 +12,28 @@
  * Keyboard: "/" focuses the box, Esc clears it, ↑/↓ move a selection ring
  * across sessions & hits, Enter opens the selection.
  *
+ * ASK MODE (docs/ticket-ask-search.md §5): typing always runs the free,
+ * debounced keyword search. When the input reads as a question
+ * (lib/askIntent.ts isQuestion), Enter instead asks the Search agent (a hidden
+ * Haiku session over the archive); the Ask button does it for any input. The
+ * agent is NEVER called from typing. Its answer renders as ordinary result
+ * cards (useAsk.ts, AskPanel.tsx); editing the query leaves ask mode and
+ * cancels a running ask.
+ *
  * Pieces (components/search/): SearchHero (landing bubbles), SearchFilters
  * (role/archived/project/sort rail), ResultCard (one session's hits),
  * Snippet (highlight-marker renderer), types (shared shapes).
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Search, X } from 'lucide-react';
+import { Search, Sparkles, X } from 'lucide-react';
 import { useIsCoarsePointer } from '@/lib/useIsMobile';
 import SearchHero from './SearchHero';
 import SearchFilters from './SearchFilters';
 import ResultCard from './ResultCard';
+import AskPanel from './AskPanel';
+import { useAsk } from './useAsk';
+import { isQuestion, MAX_QUESTION_CHARS } from '@/lib/askIntent';
 import { COLLAPSED_HITS, type Corpus, type SearchHit, type SearchPrefs, type SearchSessionResult } from './types';
 
 export type { SearchPrefs } from './types';
@@ -51,6 +62,23 @@ export default function SearchTab({ isActive, onOpenSession, initialPrefs, onPre
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [selection, setSelection] = useState(-1);
   const [liveIds, setLiveIds] = useState<Set<string>>(new Set());
+
+  // ---- Ask mode ----
+  const { state: askState, ask, cancel: cancelAsk } = useAsk();
+  const trimmedQuery = query.trim();
+  const questionShaped = useMemo(() => isQuestion(query), [query]);
+  const overLimit = trimmedQuery.length > MAX_QUESTION_CHARS;
+  /** Ask results belong to the exact question asked; any edit leaves ask mode. */
+  const askVisible = !!askState && askState.question === trimmedQuery;
+  useEffect(() => {
+    if (askState && askState.question !== trimmedQuery) cancelAsk();
+  }, [askState, trimmedQuery, cancelAsk]);
+  useEffect(() => { setSelection(-1); setExpanded(new Set()); }, [askState?.status]);
+  const startAsk = useCallback(() => {
+    if (!trimmedQuery || overLimit) return;
+    setSelection(-1);
+    void ask(trimmedQuery);
+  }, [trimmedQuery, overLimit, ask]);
 
   // Touch as primary input: skip autoFocus (it pops the software keyboard
   // over half the viewport the moment the tab opens).
@@ -137,6 +165,12 @@ export default function SearchTab({ isActive, onOpenSession, initialPrefs, onPre
     [results, sort],
   );
 
+  /** What the card list shows: the agent's sessions in ask mode, else keyword results. */
+  const displayed = useMemo<SearchSessionResult[]>(() => {
+    if (!askVisible) return ordered;
+    return askState.status === 'answer' || askState.status === 'fallback' ? askState.sessions : [];
+  }, [askVisible, askState, ordered]);
+
   /** Flattened keyboard-navigation targets: the visible hits of each session.
    *  Index into this array = the selection ring position. Session HEADERS are
    *  not targets — the hit rows are the click-through. A title-only match (no
@@ -144,13 +178,13 @@ export default function SearchTab({ isActive, onOpenSession, initialPrefs, onPre
    *  stays reachable by click and keyboard. */
   const navItems = useMemo(() => {
     const items: { session: SearchSessionResult; hit?: SearchHit }[] = [];
-    for (const s of ordered) {
+    for (const s of displayed) {
       const visible = expanded.has(s.sessionId) ? s.hits : s.hits.slice(0, COLLAPSED_HITS);
       if (visible.length === 0) items.push({ session: s });
       for (const h of visible) items.push({ session: s, hit: h });
     }
     return items;
-  }, [ordered, expanded]);
+  }, [displayed, expanded]);
 
   const openItem = useCallback((item: { session: SearchSessionResult; hit?: SearchHit }) => {
     onOpenSession(item.session.sessionId, item.session.project, item.session.display, item.hit?.turnIndex);
@@ -164,6 +198,9 @@ export default function SearchTab({ isActive, onOpenSession, initialPrefs, onPre
     if (e.key === 'Enter') {
       if (selection >= 0 && selection < navItems.length) {
         openItem(navItems[selection]);
+      } else if (questionShaped && !overLimit) {
+        // A question: Enter asks the agent (a re-Enter while it runs is a no-op).
+        startAsk();
       } else if (debounceRef.current) {
         // Enter = search NOW (skip the debounce tail).
         clearTimeout(debounceRef.current);
@@ -237,7 +274,7 @@ export default function SearchTab({ isActive, onOpenSession, initialPrefs, onPre
             value={query}
             onChange={e => setQuery(e.target.value)}
             onKeyDown={onInputKeyDown}
-            placeholder="Search sessions and messages…"
+            placeholder="Search sessions and messages, or ask a question…"
             autoFocus={!isCoarsePointer}
             data-testid="search-input"
             className="w-full pl-9 pr-9 py-2.5 rounded-lg bg-muted border border-border focus:border-ring focus:outline-none text-sm max-md:text-base"
@@ -258,9 +295,43 @@ export default function SearchTab({ isActive, onOpenSession, initialPrefs, onPre
           )}
         </div>
 
-        {/* Filters — only once there's a query: filters are meaningless with
-            nothing to filter, and the initial screen stays clean. */}
+        {/* Ask affordance: an Enter hint when the input reads as a question, an
+            Ask button always (the detector errs toward keyword, so it can
+            miss), and a length counter near the agent's limit. */}
         {hasQuery && (
+          <div className="mt-2 flex items-center gap-3 text-xs text-muted-foreground min-h-7" data-testid="ask-bar">
+            {questionShaped && !overLimit && !(askVisible && askState.status === 'running') && (
+              <span className="sh-fade-in pointer-coarse:hidden" data-testid="ask-hint">
+                <kbd className="px-1 py-0.5 rounded border border-border bg-background font-mono text-[10px]">↵</kbd> to ask the Search agent
+              </span>
+            )}
+            {trimmedQuery.length > MAX_QUESTION_CHARS - 100 && (
+              <span className={`tabular-nums ${overLimit ? 'text-destructive' : ''}`} data-testid="ask-char-count">
+                {trimmedQuery.length}/{MAX_QUESTION_CHARS}
+              </span>
+            )}
+            <button
+              onClick={startAsk}
+              disabled={overLimit || (askVisible && askState.status === 'running')}
+              className={`ml-auto inline-flex items-center gap-1.5 px-2.5 py-1 pointer-coarse:py-2 rounded-md border cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                questionShaped
+                  ? 'border-primary/60 text-primary hover:bg-primary/10'
+                  : 'border-border hover:text-foreground hover:bg-accent/40'
+              }`}
+              title={overLimit ? `Questions are limited to ${MAX_QUESTION_CHARS} characters` : 'Ask the Search agent (a background Claude session) to find matching sessions'}
+              data-testid="ask-button"
+            >
+              <Sparkles className="h-3.5 w-3.5" /> Ask
+            </button>
+          </div>
+        )}
+
+        {askVisible && <AskPanel state={askState} onCancel={cancelAsk} />}
+
+        {/* Filters — only once there's a query: filters are meaningless with
+            nothing to filter, and the initial screen stays clean. Not in ask
+            mode: they don't steer the agent. */}
+        {hasQuery && !askVisible && (
           <SearchFilters
             role={role}
             onRoleChange={setRole}
@@ -275,7 +346,7 @@ export default function SearchTab({ isActive, onOpenSession, initialPrefs, onPre
         )}
 
         {/* Result count line */}
-        {hasQuery && searched && !loading && (
+        {hasQuery && searched && !loading && !askVisible && (
           <div className="sh-fade-in flex items-baseline justify-between mt-5 mb-3 text-xs text-muted-foreground" data-testid="search-result-count">
             <span>
               {totalHits === 0 && results.length === 0
@@ -287,7 +358,7 @@ export default function SearchTab({ isActive, onOpenSession, initialPrefs, onPre
         )}
 
         {/* Zero-results escape hatches */}
-        {hasQuery && searched && !loading && results.length === 0 && (
+        {hasQuery && searched && !loading && results.length === 0 && !askVisible && (
           <div className="text-center mt-8 text-sm text-muted-foreground" data-testid="search-zero-state">
             <p>Nothing matched.</p>
             {!includeArchived && (
@@ -303,10 +374,11 @@ export default function SearchTab({ isActive, onOpenSession, initialPrefs, onPre
 
         {/* Results */}
         <div ref={listRef} className="space-y-4 pb-10">
-          {hasQuery && ordered.map(s => (
+          {hasQuery && displayed.map(s => (
             <ResultCard
               key={s.sessionId}
               session={s}
+              note={askVisible && askState.status === 'answer' ? askState.notes[s.sessionId] : undefined}
               isLive={liveIds.has(s.sessionId)}
               isExpanded={expanded.has(s.sessionId)}
               selection={selection}

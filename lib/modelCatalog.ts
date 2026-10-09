@@ -476,3 +476,29 @@ export async function triggerModelCatalogCheck(): Promise<CheckResult> {
 export async function rescheduleModelCatalogPoller(): Promise<void> {
   await scheduleNext();
 }
+
+// ---- alias resolution ----
+
+/**
+ * Resolve a bare family alias ('haiku', 'sonnet', 'opus', …) to the NEWEST
+ * version of that family in the catalog (refreshed weekly from the Models API),
+ * e.g. 'haiku' → 'claude-haiku-5-5'. Anything else (a full id, 'inherit', an
+ * unknown family) is returned unchanged, as is the alias itself when the
+ * catalog is empty or unreadable — so the CLI's own alias mapping is the
+ * fallback, never an error.
+ *
+ * Why not just pass the alias: the bundled CLI's alias table lags model
+ * releases (CLI 2.1.281 still maps 'haiku' → claude-haiku-4-5 a day after
+ * Haiku 5.5 shipped). Used by lib/stealthSessions.ts so every background agent
+ * that asks for a family tracks its latest version.
+ */
+export async function resolveModelAlias(model: string): Promise<string> {
+  const family = model.trim().toLowerCase();
+  if (!/^[a-z]+$/.test(family)) return model;
+  try {
+    const group = groupByFamily(await loadCatalog()).find((g) => g.family === family);
+    return group?.versions[0]?.id ?? model;
+  } catch {
+    return model;
+  }
+}
